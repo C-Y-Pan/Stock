@@ -11,6 +11,89 @@ import pytz
 # --- 頁面設定 ---
 st.set_page_config(page_title="量化投資決策系統 (Quant Pro v6.0)", layout="wide")
 
+import sqlite3
+import hashlib
+
+# ==========================================
+# 資料庫管理模組 (SQLite)
+# ==========================================
+DB_NAME = "invest_pro.db"
+
+def init_db():
+    """初始化資料庫與表格"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # 建立使用者表
+    c.execute('''CREATE TABLE IF NOT EXISTS users 
+                 (username TEXT PRIMARY KEY, password TEXT)''')
+    # 建立持股表 (username, ticker, shares)
+    c.execute('''CREATE TABLE IF NOT EXISTS portfolios 
+                 (username TEXT, ticker TEXT, shares INTEGER, 
+                  FOREIGN KEY(username) REFERENCES users(username))''')
+    conn.commit()
+    conn.close()
+
+def make_hashes(password):
+    """密碼加密 (SHA256)"""
+    return hashlib.sha256(str.encode(password)).hexdigest()
+
+def check_hashes(password, hashed_text):
+    """驗證密碼"""
+    if make_hashes(password) == hashed_text: return True
+    return False
+
+def add_user(username, password):
+    """註冊新用戶"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    try:
+        c.execute('INSERT INTO users(username, password) VALUES (?,?)', 
+                  (username, make_hashes(password)))
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False # 用戶名已存在
+    finally:
+        conn.close()
+
+def login_user(username, password):
+    """登入驗證"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('SELECT password FROM users WHERE username = ?', (username,))
+    data = c.fetchall()
+    conn.close()
+    if data:
+        return check_hashes(password, data[0][0])
+    return False
+
+def save_portfolio_to_db(username, df):
+    """儲存持股至資料庫 (覆蓋舊資料)"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    # 先刪除該用戶舊資料
+    c.execute('DELETE FROM portfolios WHERE username = ?', (username,))
+    # 寫入新資料
+    for idx, row in df.iterrows():
+        c.execute('INSERT INTO portfolios (username, ticker, shares) VALUES (?,?,?)',
+                  (username, row['代號'], int(row['持有股數'])))
+    conn.commit()
+    conn.close()
+
+def load_portfolio_from_db(username):
+    """從資料庫讀取持股"""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        df = pd.read_sql_query(f"SELECT ticker as '代號', shares as '持有股數' FROM portfolios WHERE username = '{username}'", conn)
+        return df
+    except:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+# 程式啟動時初始化 DB
+init_db()
+
 # ==========================================
 # CSS 優化：手機與電腦版面響應式適配
 # ==========================================
@@ -780,7 +863,44 @@ def draw_market_dashboard(market_df, start_date, end_date):
 with st.sidebar:
     st.title("⚔️ 台股戰情室")
     st.caption("Pro v6.0: AI-Alpha Edition")
-    
+    # === [新增] 用戶登入系統 ===
+    if 'logged_in' not in st.session_state:
+        st.session_state['logged_in'] = False
+        st.session_state['username'] = ''
+
+    if not st.session_state['logged_in']:
+        st.info("🔒 請登入以啟用雲端儲存")
+        choice = st.selectbox("功能", ["登入", "註冊新帳號"])
+        
+        user = st.text_input("帳號")
+        passwd = st.text_input("密碼", type='password')
+        
+        if choice == "登入":
+            if st.button("登入"):
+                if login_user(user, passwd):
+                    st.session_state['logged_in'] = True
+                    st.session_state['username'] = user
+                    st.success("登入成功！")
+                    st.rerun()
+                else:
+                    st.error("帳號或密碼錯誤")
+        else: # 註冊
+            if st.button("建立帳號"):
+                if add_user(user, passwd):
+                    st.success("註冊成功！請切換至登入頁面。")
+                else:
+                    st.error("此帳號已被使用")
+        
+        st.warning("訪客模式：資料僅暫存於記憶體，重整後將消失。")
+        st.markdown("---")
+    else:
+        st.success(f"👤 歡迎, {st.session_state['username']}")
+        if st.button("登出"):
+            st.session_state['logged_in'] = False
+            st.session_state['username'] = ''
+            st.rerun()
+        st.markdown("---")
+
     # [修改] 加入 "💼 持股健診與建議"
     page = st.radio("導航", ["🌍 市場總覽 (Macro)", "📊 單股深度分析", "🚀 科技股掃描", "💼 持股健診與建議", "📋 全台股清單"])
     st.markdown("---")
@@ -1288,50 +1408,70 @@ elif page == "📋 全台股清單":
             df_show = df_show[df_show['代號'].str.contains(search_term) | df_show['名稱'].str.contains(search_term)]
         st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-# --- 頁面 3.5 (記憶優化版): 持股健診 ---
+# --- 頁面 3.5 (雲端儲存版): 持股健診 ---
 elif page == "💼 持股健診與建議":
     st.markdown("### 💼 智能持股健診 (Portfolio Doctor)")
-    st.markdown("""
-    > **系統說明**：請在下方輸入您的 **持有股數**。系統將自動抓取最新股價計算市值，並透過 **「情境感知演算法 (Context-Aware)」**，區分順勢與逆勢策略，提供最理性的操作建議。
-    """)
+    
+    # 檢查登入狀態，顯示不同提示
+    if st.session_state.get('logged_in'):
+        st.caption(f"✅ 已連線至雲端資料庫 (User: {st.session_state['username']})，您的持股將自動儲存。")
+    else:
+        st.caption("⚠️ 目前為 **訪客模式**。請在左側登入以永久儲存持股清單。")
 
     # ==========================================
-    # 1. 初始化 Session State (記憶體)
+    # 1. 資料載入 (優先從 DB 載入)
     # ==========================================
     if 'portfolio_data' not in st.session_state:
-        # 預設範例資料
-        st.session_state['portfolio_data'] = pd.DataFrame([
-            {"代號": "2330", "持有股數": 1000}, 
-            {"代號": "2317", "持有股數": 2000}, 
-            {"代號": "2603", "持有股數": 5000}, 
-        ])
+        # 如果已登入，嘗試從 DB 抓資料
+        if st.session_state.get('logged_in'):
+            db_df = load_portfolio_from_db(st.session_state['username'])
+            if not db_df.empty:
+                st.session_state['portfolio_data'] = db_df
+            else:
+                # 登入但無資料，給預設值
+                st.session_state['portfolio_data'] = pd.DataFrame([{"代號": "2330", "持有股數": 1000}])
+        else:
+            # 訪客預設值
+            st.session_state['portfolio_data'] = pd.DataFrame([
+                {"代號": "2330", "持有股數": 1000}, 
+                {"代號": "2317", "持有股數": 2000}, 
+                {"代號": "2603", "持有股數": 5000}, 
+            ])
     
     if 'portfolio_report_df' not in st.session_state:
-        st.session_state['portfolio_report_df'] = None # 用來存分析結果
+        st.session_state['portfolio_report_df'] = None
 
     # ==========================================
-    # 2. 建立可編輯的表格 (綁定記憶)
+    # 2. 建立可編輯表格 & 自動存檔
     # ==========================================
     col_input, col_chart = st.columns([1, 1])
     
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
         
-        # 使用 data_editor 並將結果存回 session_state，這樣輸入不會因為切換頁面而不見
         edited_df = st.data_editor(
             st.session_state['portfolio_data'], 
             num_rows="dynamic", 
             use_container_width=True,
-            key="portfolio_editor", # 給定 key 讓 Streamlit 自動追蹤變動
+            key="portfolio_editor",
             column_config={
                 "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號"),
                 "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
         
-        # 每次編輯後，更新記憶體中的輸入資料
+        # === 關鍵修改：當資料變動時 ===
+        # 1. 更新 Session State
         st.session_state['portfolio_data'] = edited_df
         
+        # 2. 如果已登入，同步寫入資料庫 (Auto-Save)
+        if st.session_state.get('logged_in'):
+            save_portfolio_to_db(st.session_state['username'], edited_df)
+        
+        start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True)
+
+    # ... (下方的執行診斷邏輯完全不用動，維持上一版的程式碼即可)
+    #         
         start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True)
 
     # ==========================================
