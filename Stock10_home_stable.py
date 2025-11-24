@@ -6,6 +6,7 @@ import requests
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
+import pytz
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="量化投資決策系統 (Quant Pro v6.0)", layout="wide")
@@ -37,7 +38,7 @@ import urllib3
 # 忽略 SSL 不安全警告，保持介面乾淨
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-@st.cache_data(ttl=86400, show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def get_master_stock_data():
     """
     從證交所與櫃買中心獲取全市場股票清單與基本面數據 (修復上市資料遺失問題)
@@ -106,7 +107,7 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 # ==========================================
 # 1. 數據獲取 (Updated)
 # ==========================================
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     ticker = str(ticker).strip()
     candidates = [ticker]
@@ -122,7 +123,7 @@ def get_stock_data(ticker, start_date, end_date):
         except: continue
     return pd.DataFrame(), ticker
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=1, show_spinner=False)
 def get_market_data(start_date, end_date):
     try:
         market = yf.Ticker("^TWII")
@@ -543,8 +544,13 @@ with st.sidebar:
     st.sidebar.info("🔥 v6.0 更新：Alpha Score 評等系統、融資券監控、蒙地卡羅風險模擬")
     st.markdown("---")
     today = datetime.today()
-    start_date = st.date_input("回測開始", value=today - timedelta(days=365*2))
-    end_date = st.date_input("回測結束", value=today)
+    # 設定台北時區
+    tw_tz = pytz.timezone('Asia/Taipei')
+    today = datetime.now(tw_tz).date() # 強制使用台北時間的今天
+
+    # 修改原本的日期輸入
+    start_date = st.date_input("回測開始", value=today - timedelta(days=365*2+1))
+    end_date = st.date_input("回測結束", value=today) # 這裡會正確顯示台灣的今天
 
 market_df = get_market_data(start_date, end_date)
 
