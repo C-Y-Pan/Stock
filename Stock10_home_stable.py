@@ -1468,11 +1468,13 @@ elif page == "💼 持股健診與建議":
         if st.session_state.get('logged_in'):
             save_portfolio_to_db(st.session_state['username'], edited_df)
         
-        start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True)
+        # 加入 key="btn_start_diag" 以解決 ID 重複衝突
+        start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True, key="btn_start_diag")
 
     # ... (下方的執行診斷邏輯完全不用動，維持上一版的程式碼即可)
     #         
-        start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True)
+        # 加入 key="btn_start_diag" 以解決 ID 重複衝突
+        start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True, key="btn_start_diag")
 
     # ==========================================
     # 3. 執行診斷邏輯 (計算並存入記憶)
