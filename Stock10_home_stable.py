@@ -949,13 +949,14 @@ elif page == "📊 單股深度分析":
         # ==================================================
         tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
         
-        # [Tab 1: K線圖]
+# [Tab 1: K線圖與詳細註記]
         with tab1:
+            # 建立子圖架構
             fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
                                 row_heights=[0.5, 0.15, 0.15, 0.20], 
                                 subplot_titles=("", "成交量", "法人籌碼 (OBV)", "相對強弱指標 (RSI)"))
             
-            # K線 (紅漲綠跌)
+            # --- 1. K線圖 (紅漲綠跌) ---
             fig.add_trace(go.Candlestick(
                 x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
                 low=final_df['Low'], close=final_df['Close'], name='K線',
@@ -968,45 +969,90 @@ elif page == "📊 單股深度分析":
             fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
                                      line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-            # 買賣點標記 (含信心值)
-            final_df['Buy_Y'] = final_df['Low'] * 0.90
-            final_df['Sell_Y'] = final_df['High'] * 1.1
+            # --- 2. 買賣點標記與理由註記 ---
+            final_df['Buy_Y'] = final_df['Low'] * 0.92 # 買點標記位置 (K線下方)
+            final_df['Sell_Y'] = final_df['High'] * 1.08 # 賣點標記位置 (K線上方)
 
-            def get_buy_text(sub_df): return [f"<b>{score}</b>" for score in sub_df['Confidence']]
+            # 輔助函式：產生「信心分數 + 理由」的文字
+            # 為了避免圖表太亂，買進我們顯示「信心值」，顏色代表「理由」
+            def get_buy_text(sub_df):
+                return [f"<b>{score}</b>" for score in sub_df['Confidence']]
 
-            # 買進訊號 (統一繪製以簡化代碼，您也可以保留原有的三種顏色區分)
-            buy_all = final_df[final_df['Action'] == 'Buy']
-            if not buy_all.empty:
-                 fig.add_trace(go.Scatter(
-                    x=buy_all['Date'], y=buy_all['Buy_Y'], mode='markers+text',
-                    text=get_buy_text(buy_all), textposition="bottom center",
+            # 輔助函式：產生「報酬率 + 簡短理由」的文字
+            def get_sell_text(sub_df):
+                labels = []
+                for idx, row in sub_df.iterrows():
+                    ret = row['Return_Label']
+                    reason = row['Reason']
+                    # 簡化理由文字以節省空間
+                    short_reason = reason.replace("觸發", "").replace("操作", "")
+                    labels.append(f"{ret}<br>({short_reason})") # 使用 <br> 換行
+                return labels
+
+            # [買進 A] 動能突破/回測 (金黃色 Triangle)
+            buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
+            if not buy_trend.empty:
+                fig.add_trace(go.Scatter(
+                    x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text',
+                    text=get_buy_text(buy_trend), textposition="bottom center",
                     textfont=dict(color='#FFD700', size=11),
-                    marker=dict(symbol='triangle-up', size=12, color='#FFD700', line=dict(width=1, color='black')), 
-                    name='買進訊號'
+                    marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), 
+                    name='買進 (趨勢)', hovertext=buy_trend['Reason']
+                ), row=1, col=1)
+            
+            # [買進 B] 超賣反彈 (青色 Triangle)
+            buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
+            if not buy_panic.empty:
+                fig.add_trace(go.Scatter(
+                    x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text',
+                    text=get_buy_text(buy_panic), textposition="bottom center",
+                    textfont=dict(color='#00FFFF', size=11),
+                    marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), 
+                    name='買進 (反彈)', hovertext=buy_panic['Reason']
+                ), row=1, col=1)
+            
+            # [買進 C] 籌碼佈局 (淡紫色 Triangle)
+            buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
+            if not buy_chip.empty:
+                fig.add_trace(go.Scatter(
+                    x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text',
+                    text=get_buy_text(buy_chip), textposition="bottom center",
+                    textfont=dict(color='#DDA0DD', size=11),
+                    marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), 
+                    name='買進 (籌碼)', hovertext=buy_chip['Reason']
                 ), row=1, col=1)
 
-            # 賣出訊號
+            # [賣出] 顯示報酬率與理由 (洋紅色 Down Triangle)
             sell_all = final_df[final_df['Action'] == 'Sell']
             if not sell_all.empty:
                 fig.add_trace(go.Scatter(
                     x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', 
-                    text=sell_all['Return_Label'], textposition="top center",
+                    text=get_sell_text(sell_all), # 這裡會顯示如 "+15% (停利)"
+                    textposition="top center",
                     textfont=dict(color='white', size=11),
-                    marker=dict(symbol='triangle-down', size=12, color='#FF00FF', line=dict(width=1, color='black')), 
-                    name='賣出'
+                    marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), 
+                    name='賣出', hovertext=sell_all['Reason']
                 ), row=1, col=1)
             
-            # 副圖指標
+            # --- 副圖指標繪製 ---
             colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
             fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=2, col=1)
-            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange'), name='OBV'), row=3, col=1)
-            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan')), row=4, col=1)
+            
+            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=3, col=1)
+            
+            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=4, col=1)
             fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=4, col=1)
             fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=4, col=1)
             
-            fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20))
+            fig.update_layout(
+                height=800, 
+                template="plotly_dark", 
+                xaxis_rangeslider_visible=False,
+                margin=dict(l=20, r=40, t=30, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
             st.plotly_chart(fig, use_container_width=True)
-
+            
         # [Tab 2: 權益曲線]
         with tab2:
             fig_c = go.Figure()
