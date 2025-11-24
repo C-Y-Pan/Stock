@@ -1288,48 +1288,65 @@ elif page == "📋 全台股清單":
             df_show = df_show[df_show['代號'].str.contains(search_term) | df_show['名稱'].str.contains(search_term)]
         st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-# --- 頁面 3.5 (完整優化版): 持股健診 ---
+# --- 頁面 3.5 (記憶優化版): 持股健診 ---
 elif page == "💼 持股健診與建議":
     st.markdown("### 💼 智能持股健診 (Portfolio Doctor)")
     st.markdown("""
     > **系統說明**：請在下方輸入您的 **持有股數**。系統將自動抓取最新股價計算市值，並透過 **「情境感知演算法 (Context-Aware)」**，區分順勢與逆勢策略，提供最理性的操作建議。
     """)
 
-    # 1. 建立可編輯的表格 (Data Editor) - 輸入股數
-    default_data = pd.DataFrame([
-        {"代號": "2330", "持有股數": 1000}, # 台積電
-        {"代號": "2317", "持有股數": 2000}, # 鴻海
-        {"代號": "2603", "持有股數": 5000}, # 長榮
-    ])
+    # ==========================================
+    # 1. 初始化 Session State (記憶體)
+    # ==========================================
+    if 'portfolio_data' not in st.session_state:
+        # 預設範例資料
+        st.session_state['portfolio_data'] = pd.DataFrame([
+            {"代號": "2330", "持有股數": 1000}, 
+            {"代號": "2317", "持有股數": 2000}, 
+            {"代號": "2603", "持有股數": 5000}, 
+        ])
     
+    if 'portfolio_report_df' not in st.session_state:
+        st.session_state['portfolio_report_df'] = None # 用來存分析結果
+
+    # ==========================================
+    # 2. 建立可編輯的表格 (綁定記憶)
+    # ==========================================
     col_input, col_chart = st.columns([1, 1])
     
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
+        
+        # 使用 data_editor 並將結果存回 session_state，這樣輸入不會因為切換頁面而不見
         edited_df = st.data_editor(
-            default_data, 
+            st.session_state['portfolio_data'], 
             num_rows="dynamic", 
             use_container_width=True,
+            key="portfolio_editor", # 給定 key 讓 Streamlit 自動追蹤變動
             column_config={
-                "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號 (如 2330)"),
-                "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d", help="請輸入實際股數，例如 1 張請輸入 1000")
+                "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號"),
+                "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
+        
+        # 每次編輯後，更新記憶體中的輸入資料
+        st.session_state['portfolio_data'] = edited_df
+        
         start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True)
 
-    # 2. 執行診斷邏輯
+    # ==========================================
+    # 3. 執行診斷邏輯 (計算並存入記憶)
+    # ==========================================
     if start_diag_btn:
         portfolio_results = []
         progress_bar = st.progress(0)
         status_text = st.empty()
         
-        # 遍歷使用者輸入的每一檔股票
         total_rows = len(edited_df)
         for idx, row in edited_df.iterrows():
             ticker = str(row['代號']).strip()
             shares = row['持有股數']
             
-            # 防呆：若無代號或股數為0則跳過
             if not ticker or shares <= 0: continue
             
             status_text.text(f"AI 運算中 ({idx+1}/{total_rows}): {ticker} ...")
@@ -1338,7 +1355,6 @@ elif page == "💼 持股健診與建議":
             raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
             name = get_stock_name(fmt_ticker)
             
-            # 資料異常處理
             if raw_df.empty:
                 portfolio_results.append({
                     "代號": ticker, "名稱": "無資料", "建議": "⚠️ 異常", "持有股數": shares,
@@ -1346,7 +1362,6 @@ elif page == "💼 持股健診與建議":
                 })
                 continue
                 
-            # 執行核心策略 (取得技術面參數與 DataFrame)
             best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_input, tax_input)
             
             if final_df is None or final_df.empty:
@@ -1356,116 +1371,63 @@ elif page == "💼 持股健診與建議":
                 })
                 continue
 
-            # === [Step 1] 自動計算市值 ===
+            # [Step 1-5 邏輯維持不變，與上一版相同]
             current_price = final_df['Close'].iloc[-1]
             market_value = current_price * shares
-            
-            # === [Step 2] 計算基礎 Alpha Score (原始分數) ===
-            # 這裡傳入空的 margin/short df 以節省 API 呼叫時間，主要依賴均線與 RSI 評分
             stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
             base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-            
-            # === [Step 3] 取得技術面訊號與理由 ===
             action, color, tech_reason = analyze_signal(final_df)
             
-            # === [Step 4] 情境感知評分調整 (Context-Aware Adjustment) ===
-            # 目的：根據「策略屬性」動態調整評分標準，避免用順勢的標準去錯殺逆勢的單
             final_score = base_alpha_score
-            adjustment_log = [] # 用於記錄調整理由
-            
-            # 判斷最後一次買進是否為「逆勢/反彈」策略
+            adjustment_log = []
             last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
             is_rebound_strategy = False
-            
             if last_trade is not None:
                 buy_reason = str(last_trade['Reason'])
-                if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]):
-                    is_rebound_strategy = True
+                if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]): is_rebound_strategy = True
             
-            # --- 針對「持有中 (Hold)」的部位進行深度檢視 ---
             if action == "✊ 續抱":
-                # 情境 A: 逆勢策略 (抄底/反彈)
                 if is_rebound_strategy:
-                    # 取得即時指標
                     ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
                     rsi_now = final_df['RSI'].iloc[-1]
                     rsi_prev = final_df['RSI'].iloc[-2]
-                    
-                    # 補償 1: 不看長均線 (因為抄底必定在季線下)
-                    if current_price < final_df['MA60'].iloc[-1]:
-                        final_score += 15 # 補回被 MA60 扣的分數
-                        adjustment_log.append("反彈策略忽略季線")
-                        
-                    # 補償 2: 檢視反彈有效性 (True Test)
-                    # 條件一：站上 5 日線 (短線止穩)
-                    if current_price > ma5:
-                        final_score += 10
-                        adjustment_log.append("站穩MA5")
-                    else:
-                        final_score -= 5 # 連 5 日線都站不上，反彈失敗
-                        adjustment_log.append("未站回MA5")
-                        
-                    # 條件二：RSI 動能
-                    if rsi_now > rsi_prev:
-                        final_score += 10
-                        adjustment_log.append("動能翻揚")
-                    elif rsi_now < 30: 
-                        final_score += 5
-                        adjustment_log.append("低檔鈍化")
-                    else:
-                        final_score -= 5 # RSI 下彎
-                        
-                # 情境 B: 順勢策略 (突破)
+                    if current_price < final_df['MA60'].iloc[-1]: final_score += 15; adjustment_log.append("反彈策略忽略季線")
+                    if current_price > ma5: final_score += 10; adjustment_log.append("站穩MA5")
+                    else: final_score -= 5; adjustment_log.append("未站回MA5")
+                    if rsi_now > rsi_prev: final_score += 10; adjustment_log.append("動能翻揚")
+                    elif rsi_now < 30: final_score += 5; adjustment_log.append("低檔鈍化")
+                    else: final_score -= 5
                 else:
-                    # 順勢交易維持原標準，但若高檔爆量不漲，要扣分
                     vol_now = final_df['Volume'].iloc[-1]
                     vol_ma = final_df['Vol_MA20'].iloc[-1]
                     if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
-                        final_score -= 15
-                        adjustment_log.append("高檔爆量滯漲")
+                        final_score -= 15; adjustment_log.append("高檔爆量滯漲")
 
-            # 確保分數在合理區間
             final_score = max(min(final_score, 100), -100)
 
-            # === [Step 5] 綜合決策輸出 ===
             final_advice = ""; advice_color = ""
-            
             if action == "🚀 買進":
                 if final_score > 30: final_advice = "🔥 強力加碼"; advice_color = "red"
                 else: final_advice = "✅ 買進訊號"; advice_color = "red"
-                
             elif action == "⚡ 賣出":
                 if final_score < -20: final_advice = "💀 清倉/放空"; advice_color = "green"
                 else: final_advice = "📉 獲利了結"; advice_color = "green"
-                
             elif action == "✊ 續抱": 
-                if final_score > 40: 
-                    final_advice = "✨ 抱緊處理"; advice_color = "red"
-                elif final_score > 0: # 只要分數是正的，代表反彈有效或趨勢尚可
-                    final_advice = "✊ 續抱觀察"; advice_color = "gray"
-                elif final_score > -15: # 微幅負分，但有技術單在，不輕易殺低
-                    final_advice = "🛡️ 策略持倉"; advice_color = "blue"
-                else: 
-                    final_advice = "⚠️ 減碼觀望"; advice_color = "orange"
+                if final_score > 40: final_advice = "✨ 抱緊處理"; advice_color = "red"
+                elif final_score > 0: final_advice = "✊ 續抱觀察"; advice_color = "gray"
+                elif final_score > -15: final_advice = "🛡️ 策略持倉"; advice_color = "blue"
+                else: final_advice = "⚠️ 減碼觀望"; advice_color = "orange"
             else: 
                 if final_score > 60: final_advice = "👀 留意買點"; advice_color = "blue"
                 else: final_advice = "💤 觀望"; advice_color = "gray"
 
-            # 產生詳細理由字串
             reason_display = f"Alpha:{int(final_score)} | {tech_reason}"
-            if adjustment_log:
-                reason_display = f"原:{int(base_alpha_score)}➜修:{int(final_score)} ({','.join(adjustment_log)})"
+            if adjustment_log: reason_display = f"原:{int(base_alpha_score)}➜修:{int(final_score)} ({','.join(adjustment_log)})"
 
             portfolio_results.append({
-                "代號": fmt_ticker.split('.')[0],
-                "名稱": name,
-                "持有股數": shares,
-                "收盤價": current_price,
-                "市值": market_value,
-                "綜合評分": int(final_score), 
-                "AI 建議": final_advice,
-                "技術訊號": action,
-                "詳細理由": reason_display
+                "代號": fmt_ticker.split('.')[0], "名稱": name, "持有股數": shares,
+                "收盤價": current_price, "市值": market_value, "綜合評分": int(final_score), 
+                "AI 建議": final_advice, "技術訊號": action, "詳細理由": reason_display
             })
             
             progress_bar.progress((idx + 1) / total_rows)
@@ -1473,76 +1435,67 @@ elif page == "💼 持股健診與建議":
         progress_bar.empty()
         status_text.empty()
         
-        # 3. 呈現結果與儀表板
+        # === 關鍵：將結果存入 Session State ===
         if portfolio_results:
-            res_df = pd.DataFrame(portfolio_results)
-            
-            # 計算權重 (基於自動計算出的總市值)
-            total_market_value = res_df['市值'].sum()
-            if total_market_value > 0:
-                res_df['權重%'] = (res_df['市值'] / total_market_value) * 100
-                portfolio_health = (res_df['綜合評分'] * res_df['市值']).sum() / total_market_value
-            else:
-                res_df['權重%'] = 0
-                portfolio_health = 0
-                
-            with col_chart:
-                st.markdown("#### 2. 組合健康度總覽")
-                st.caption(f"💰 總資產估值: NT$ {int(total_market_value):,}") 
-                
-                # 繪製儀表板
-                fig_gauge = go.Figure(go.Indicator(
-                    mode = "gauge+number",
-                    value = portfolio_health,
-                    title = {'text': "投資組合健康指數"},
-                    gauge = {
-                        'axis': {'range': [-100, 100]},
-                        'bar': {'color': "#00e676" if portfolio_health > 0 else "#ef5350"},
-                        'steps': [
-                            {'range': [-100, -30], 'color': "rgba(255, 0, 0, 0.3)"},
-                            {'range': [-30, 30], 'color': "rgba(128, 128, 128, 0.3)"},
-                            {'range': [30, 100], 'color': "rgba(0, 255, 0, 0.3)"}
-                        ],
-                        'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': portfolio_health}
-                    }
-                ))
-                fig_gauge.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
-                st.plotly_chart(fig_gauge, use_container_width=True)
+            st.session_state['portfolio_report_df'] = pd.DataFrame(portfolio_results)
+        else:
+            st.session_state['portfolio_report_df'] = pd.DataFrame() # 存空值避免報錯
 
-            st.markdown("---")
-            st.markdown("#### 3. 個股操作建議明細")
+    # ==========================================
+    # 4. 顯示結果 (從 Session State 讀取)
+    # ==========================================
+    # 只要記憶體有資料，就顯示 (不管有沒有按按鈕)
+    if st.session_state['portfolio_report_df'] is not None and not st.session_state['portfolio_report_df'].empty:
+        res_df = st.session_state['portfolio_report_df'] # 讀取記憶體
+        
+        # 重新計算權重 (避免顯示時資料不一致)
+        total_market_value = res_df['市值'].sum()
+        if total_market_value > 0:
+            res_df['權重%'] = (res_df['市值'] / total_market_value) * 100
+            portfolio_health = (res_df['綜合評分'] * res_df['市值']).sum() / total_market_value
+        else:
+            res_df['權重%'] = 0; portfolio_health = 0
             
-            # 定義樣式函式
-            def highlight_advice(val):
-                color = 'white'
-                val_str = str(val)
-                if '加碼' in val_str or '買進' in val_str or '抱緊' in val_str: color = '#ffcdd2' # 紅底
-                elif '減碼' in val_str or '賣出' in val_str or '清倉' in val_str: color = '#c8e6c9' # 綠底
-                elif '策略持倉' in val_str: color = '#bbdefb' # 藍底
-                elif '觀望' in val_str: color = '#cfd8dc' # 灰底
-                return f'background-color: {color}; color: black; font-weight: bold'
+        with col_chart:
+            st.markdown("#### 2. 組合健康度總覽")
+            st.caption(f"💰 總資產估值: NT$ {int(total_market_value):,}") 
+            
+            fig_gauge = go.Figure(go.Indicator(
+                mode = "gauge+number", value = portfolio_health, title = {'text': "投資組合健康指數"},
+                gauge = {
+                    'axis': {'range': [-100, 100]},
+                    'bar': {'color': "#00e676" if portfolio_health > 0 else "#ef5350"},
+                    'steps': [{'range': [-100, -30], 'color': "rgba(255, 0, 0, 0.3)"}, {'range': [-30, 30], 'color': "rgba(128, 128, 128, 0.3)"}, {'range': [30, 100], 'color': "rgba(0, 255, 0, 0.3)"}],
+                    'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': portfolio_health}
+                }
+            ))
+            fig_gauge.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
+            st.plotly_chart(fig_gauge, use_container_width=True)
 
-            def highlight_score(val):
-                color = 'red' if val >= 30 else ('green' if val <= -20 else 'gray')
-                return f'color: {color}; font-weight: bold'
+        st.markdown("---")
+        st.markdown("#### 3. 個股操作建議明細")
+        
+        def highlight_advice(val):
+            color = 'white'; val_str = str(val)
+            if '加碼' in val_str or '買進' in val_str or '抱緊' in val_str: color = '#ffcdd2'
+            elif '減碼' in val_str or '賣出' in val_str or '清倉' in val_str: color = '#c8e6c9'
+            elif '策略持倉' in val_str: color = '#bbdefb'
+            elif '觀望' in val_str: color = '#cfd8dc'
+            return f'background-color: {color}; color: black; font-weight: bold'
 
-            # 調整欄位順序與格式
-            final_display_cols = ["代號", "名稱", "持有股數", "收盤價", "市值", "權重%", "綜合評分", "AI 建議", "技術訊號", "詳細理由"]
-            
-            st.dataframe(
-                res_df[final_display_cols].style
-                .applymap(highlight_advice, subset=['AI 建議'])
-                .applymap(highlight_score, subset=['綜合評分'])
-                .format({
-                    "權重%": "{:.1f}%", 
-                    "收盤價": "{:.1f}", 
-                    "市值": "{:,.0f}", 
-                    "持有股數": "{:.0f}"
-                }),
-                use_container_width=True,
-                height=500
-            )
-            
-            # 文字總結
-            health_desc = "偏多" if portfolio_health > 20 else ("轉弱" if portfolio_health < -20 else "震盪")
-            st.info(f"💡 **AI 總結**：目前持有 {len(res_df)} 檔標的，總市值約 **NT$ {int(total_market_value/10000):,} 萬**。組合健康分為 **{portfolio_health:.1f}** ({health_desc})。")
+        def highlight_score(val):
+            color = 'red' if val >= 30 else ('green' if val <= -20 else 'gray')
+            return f'color: {color}; font-weight: bold'
+
+        final_display_cols = ["代號", "名稱", "持有股數", "收盤價", "市值", "權重%", "綜合評分", "AI 建議", "技術訊號", "詳細理由"]
+        
+        st.dataframe(
+            res_df[final_display_cols].style
+            .applymap(highlight_advice, subset=['AI 建議'])
+            .applymap(highlight_score, subset=['綜合評分'])
+            .format({"權重%": "{:.1f}%", "收盤價": "{:.1f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
+            use_container_width=True, height=500
+        )
+        
+        health_desc = "偏多" if portfolio_health > 20 else ("轉弱" if portfolio_health < -20 else "震盪")
+        st.info(f"💡 **AI 總結**：目前持有 {len(res_df)} 檔標的，總市值約 **NT$ {int(total_market_value/10000):,} 萬**。組合健康分為 **{portfolio_health:.1f}** ({health_desc})。")
