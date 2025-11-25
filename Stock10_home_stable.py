@@ -293,7 +293,8 @@ def get_market_data(start_date, end_date):
             df['Market_MA20'] = df['Close'].rolling(20).mean()
             df['Market_MA60'] = df['Close'].rolling(60).mean()
             
-            return df[['Date', 'Market_RSI', 'Market_MA20', 'Market_MA60', 'Close', 'OBV', 'OBV_MA20', 'VIX']]
+            # [修正] 這裡原本漏了 Open, High, Low, Volume，導致後續 Alpha Score 計算 KD 時找不到欄位報錯
+            return df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Market_RSI', 'Market_MA20', 'Market_MA60', 'OBV', 'OBV_MA20', 'VIX']]
     except: pass
     return pd.DataFrame()
 
