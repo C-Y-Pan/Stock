@@ -1952,7 +1952,7 @@ elif page == "💼 持股健診與建議":
         st.caption("⚠️ 訪客模式")
 
     # ==========================================
-    # 1. 準備輸入資料 (主執行緒)
+    # 1. 準備輸入資料與 [關鍵] 控制開關
     # ==========================================
     if 'portfolio_data' not in st.session_state:
         if st.session_state.get('logged_in'):
@@ -1974,8 +1974,6 @@ elif page == "💼 持股健診與建議":
                 "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
-        
-        # 資料同步邏輯
         if not edited_df.equals(st.session_state['portfolio_data']):
             st.session_state['portfolio_data'] = edited_df
             if st.session_state.get('logged_in'):
@@ -1984,236 +1982,226 @@ elif page == "💼 持股健診與建議":
     with col_ctrl:
         st.markdown("#### 2. 監控設定")
         st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 60 秒僅更新圖表數據，不會重載整頁。")
-        # 使用 toggle 來切換「持續監控模式」
+        
+        # [關鍵] 必須先定義這個變數，下面的 @st.fragment 才能讀取到
         enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 60 秒更新)", value=False)
 
-# ==========================================
-# 3. 定義局部刷新片段 (The Fragment)
-# ==========================================
+    # ==========================================
+    # 3. 定義局部刷新片段 (The Fragment)
+    # [注意] 這個函式必須放在 enable_monitor 定義之後
+    # ==========================================
 
-# 初始化：用於記錄上次寄出時的各股分數狀態 (Fingerprint)
-if 'last_sent_scores' not in st.session_state:
-    st.session_state['last_sent_scores'] = {}
+    # 初始化：用於記錄上次寄出時的各股分數狀態 (Fingerprint)
+    if 'last_sent_scores' not in st.session_state:
+        st.session_state['last_sent_scores'] = {}
 
-# 關鍵：這個函式內部的程式碼，會獨立於主程式之外自己循環運行
-# run_every=60 代表這個片段每 60 秒會自己重跑一次 (若開啟監控)
-@st.fragment(run_every=60 if enable_monitor else None)  
-def render_live_dashboard(target_df):
-    if target_df.empty:
-        st.warning("⚠️ 請先輸入持股資料。")
-        return
+    # 初始化上次寄信時間
+    if 'last_email_time' not in st.session_state:
+        st.session_state['last_email_time'] = datetime.min
 
-    # 強制轉換為台北時間顯示
-    tw_tz = pytz.timezone('Asia/Taipei')
-    update_time = datetime.now(tw_tz).strftime("%H:%M:%S")
-    
-    if enable_monitor:
-        st.caption(f"⚡ 實時監控中... (最後更新: {update_time})")
-    else:
-        st.caption(f"Analysis Snapshot (時間: {update_time})")
+    @st.fragment(run_every=60 if enable_monitor else None)  
+    def render_live_dashboard(target_df):
+        if target_df.empty:
+            st.warning("⚠️ 請先輸入持股資料。")
+            return
 
-    portfolio_results = []
-    
-    # 使用 status container 顯示動態進度
-    with st.status(f"正在全方位分析 {len(target_df)} 檔持股結構...", expanded=True) as status:
+        # 強制轉換為台北時間顯示
+        tw_tz = pytz.timezone('Asia/Taipei')
+        update_time = datetime.now(tw_tz).strftime("%H:%M:%S")
         
-        # === 核心迴圈開始 ===
-        for idx, row in target_df.iterrows():
-            ticker = str(row['代號']).strip()
-            shares = row['持有股數']
-            
-            if not ticker or shares <= 0: continue
-            
-            # 1. 獲取即時資料 (利用快取實現盤中更新)
-            raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
-            name = get_stock_name(fmt_ticker)
-            
-            if raw_df.empty or len(raw_df) < 60: continue 
-                
-            # 2. 執行策略回測
-            best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_input, tax_input)
-            
-            if final_df is None or final_df.empty: continue
+        if enable_monitor:
+            st.caption(f"⚡ 實時監控中... (最後更新: {update_time})")
+        else:
+            st.caption(f"Analysis Snapshot (時間: {update_time})")
 
-            # 3. 計算基礎數值
-            current_price = final_df['Close'].iloc[-1]
-            market_value = current_price * shares
+        portfolio_results = []
+        
+        # 使用 status container 顯示動態進度
+        with st.status(f"正在全方位分析 {len(target_df)} 檔持股結構...", expanded=True) as status:
             
-            # 4. 計算 Alpha Score
-            stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
-            base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-            base_score_log = stock_alpha_df['Score_Log'].iloc[-1] 
-            
-            # 5. 取得技術訊號
-            action, color, tech_reason = analyze_signal(final_df)
-            
-            # 6. 情境感知調整 (Context-Aware Adjustment)
-            final_score = base_alpha_score
-            adjustment_log = []
-            
-            # 判斷策略屬性
-            last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
-            is_rebound = False
-            if last_trade is not None:
-                buy_reason = str(last_trade['Reason'])
-                if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]): is_rebound = True
-            
-            # 分數修正邏輯
-            if action == "✊ 續抱" or action == "🚀 買進":
-                if is_rebound:
-                    if current_price < final_df['MA60'].iloc[-1]: 
-                        final_score += 15; adjustment_log.append("反彈無視季線+15")
-                    ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
-                    if current_price > ma5: 
-                        final_score += 10; adjustment_log.append("站穩MA5+10")
-                    else:
-                        final_score -= 5; adjustment_log.append("破MA5-5")
+            # === 核心迴圈開始 ===
+            for idx, row in target_df.iterrows():
+                ticker = str(row['代號']).strip()
+                shares = row['持有股數']
+                
+                if not ticker or shares <= 0: continue
+                
+                # 1. 獲取即時資料
+                raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
+                name = get_stock_name(fmt_ticker)
+                
+                if raw_df.empty or len(raw_df) < 60: continue 
                     
-                    rsi_now = final_df['RSI'].iloc[-1]
-                    rsi_prev = final_df['RSI'].iloc[-2]
-                    if rsi_now > rsi_prev: 
-                        final_score += 10; adjustment_log.append("動能翻揚+10")
-                    elif rsi_now < 30:
-                        final_score += 5; adjustment_log.append("低檔鈍化+5")
-                else:
-                    vol_now = final_df['Volume'].iloc[-1]
-                    vol_ma = final_df['Vol_MA20'].iloc[-1]
-                    if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
-                        final_score -= 15; adjustment_log.append("高檔爆量滯漲-15")
-
-            # 限制分數範圍 (-100 ~ 100)
-            final_score = max(min(final_score, 100), -100)
-
-            # 7. 產生 AI 建議
-            final_advice = ""
-            if action == "🚀 買進": 
-                final_advice = "🔥 強力加碼" if final_score > 30 else "✅ 買進訊號"
-            elif action == "⚡ 賣出": 
-                final_advice = "💀 清倉/放空" if final_score < -20 else "📉 獲利了結"
-            elif action == "✊ 續抱": 
-                if final_score > 40: final_advice = "✨ 抱緊處理"
-                elif final_score > 0: final_advice = "✊ 續抱觀察"
-                elif final_score > -15: final_advice = "🛡️ 策略持倉"
-                else: final_advice = "⚠️ 減碼觀望"
-            else: 
-                final_advice = "👀 留意買點" if final_score > 60 else "💤 觀望"
-
-            # 8. 組合顯示理由
-            display_reason = base_score_log
-            if adjustment_log:
-                display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
-            if not display_reason:
-                display_reason = f"Alpha:{int(final_score)} | {tech_reason}"
-
-            portfolio_results.append({
-                "代號": fmt_ticker.split('.')[0], 
-                "名稱": name, 
-                "持有股數": shares,
-                "收盤價": current_price, 
-                "市值": market_value, 
-                "綜合評分": int(final_score), 
-                "AI 建議": final_advice, 
-                "詳細理由": display_reason
-            })
-        
-        status.update(label="AI 分析完成！", state="complete", expanded=False)
-
-    # ==========================================
-    # [修改版] 自動寄信邏輯：評分變動觸發
-    # ==========================================
-    if enable_monitor and portfolio_results:
-        # 1. 建立當前評分指紋 (Fingerprint)
-        current_scores_fingerprint = {
-            item['代號']: item['綜合評分'] 
-            for item in portfolio_results
-        }
-        
-        # 2. 比對是否與上次寄出時不同
-        # 注意：st.session_state['last_sent_scores'] 初始為 {}
-        has_score_changed = (current_scores_fingerprint != st.session_state['last_sent_scores'])
-        
-        if has_score_changed:
-            st.toast("⚡ 偵測到評分變動，準備發送通知...", icon="📧")
-            
-            # 準備數據
-            res_df = pd.DataFrame(portfolio_results)
-            
-            # 3. 準備市場分析數據 (使用全域變數 market_df)
-            try:
-                # 必須先對大盤計算分數，才能產生正確的 VIX/Alpha 描述
-                market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
-                analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
-            except Exception as e:
-                print(f"市場分析生成失敗: {e}")
-                analysis_html_for_email = "<p>暫無法獲取市場分析數據</p>"
-            
-            # 4. 執行發送
-            with st.spinner("📧 評分異動，正在發送信件..."):
-                # 這裡會呼叫外部定義好的 send_analysis_email
-                success = send_analysis_email(res_df, analysis_html_for_email)
+                # 2. 執行策略回測
+                best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_input, tax_input)
                 
-            if success:
-                # 更新狀態，避免重複發送
-                st.session_state['last_sent_scores'] = current_scores_fingerprint
-                st.toast(f"✅ 已發送變動通知！")
-            else:
-                st.toast("❌ Email 發送失敗", icon="⚠️")
+                if final_df is None or final_df.empty: continue
 
-    # ==========================================
-    # 顯示結果
-    # ==========================================
-    if portfolio_results:
-        res_df = pd.DataFrame(portfolio_results)
-        total_val = res_df['市值'].sum()
-        res_df['權重%'] = (res_df['市值'] / total_val * 100) if total_val > 0 else 0
-        health = (res_df['綜合評分'] * res_df['市值']).sum() / total_val if total_val > 0 else 0
-        
-        # --- 儀表板區塊 ---
-        c_gauge, c_info = st.columns([1, 2])
-        with c_gauge:
-            fig_g = go.Figure(go.Indicator(
-                mode = "gauge+number", value = health, 
-                title = {'text': "組合健康度"},
-                gauge = {'axis': {'range': [-100, 100]}, 'bar': {'color': "#00e676" if health > 0 else "#ef5350"}}
-            ))
-            fig_g.update_layout(height=200, margin=dict(t=30, b=10, l=20, r=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
-            st.plotly_chart(fig_g, use_container_width=True)
-        
-        with c_info:
-            st.metric("💰 總資產估值", f"NT$ {int(total_val):,}", delta=None)
-            st.info(f"💡 若開啟即時監控，當持股評分發生變化時，系統將自動寄發 Email 通知。")
+                # 3. 計算基礎數值
+                current_price = final_df['Close'].iloc[-1]
+                market_value = current_price * shares
+                
+                # 4. 計算 Alpha Score
+                stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
+                base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
+                base_score_log = stock_alpha_df['Score_Log'].iloc[-1] 
+                
+                # 5. 取得技術訊號
+                action, color, tech_reason = analyze_signal(final_df)
+                
+                # 6. 情境感知調整 (Context-Aware Adjustment)
+                final_score = base_alpha_score
+                adjustment_log = []
+                
+                # 判斷策略屬性
+                last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
+                is_rebound = False
+                if last_trade is not None:
+                    buy_reason = str(last_trade['Reason'])
+                    if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]): is_rebound = True
+                
+                # 分數修正邏輯
+                if action == "✊ 續抱" or action == "🚀 買進":
+                    if is_rebound:
+                        if current_price < final_df['MA60'].iloc[-1]: 
+                            final_score += 15; adjustment_log.append("反彈無視季線+15")
+                        ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
+                        if current_price > ma5: 
+                            final_score += 10; adjustment_log.append("站穩MA5+10")
+                        else:
+                            final_score -= 5; adjustment_log.append("破MA5-5")
+                        
+                        rsi_now = final_df['RSI'].iloc[-1]
+                        rsi_prev = final_df['RSI'].iloc[-2]
+                        if rsi_now > rsi_prev: 
+                            final_score += 10; adjustment_log.append("動能翻揚+10")
+                        elif rsi_now < 30:
+                            final_score += 5; adjustment_log.append("低檔鈍化+5")
+                    else:
+                        vol_now = final_df['Volume'].iloc[-1]
+                        vol_ma = final_df['Vol_MA20'].iloc[-1]
+                        if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
+                            final_score -= 15; adjustment_log.append("高檔爆量滯漲-15")
 
-        # --- 表格樣式定義 ---
-        def highlight_advice(val):
-            color = 'white'
-            val_str = str(val)
-            if '加碼' in val_str or '買進' in val_str or '抱緊' in val_str: color = '#ffcdd2' 
-            elif '減碼' in val_str or '賣出' in val_str or '清倉' in val_str: color = '#c8e6c9'
-            elif '策略持倉' in val_str: color = '#bbdefb'
-            elif '觀望' in val_str: color = '#cfd8dc'
-            return f'background-color: {color}; color: black; font-weight: bold'
+                # 限制分數範圍
+                final_score = max(min(final_score, 100), -100)
 
-        def highlight_score(val):
-            try:
-                v = float(val)
-                color = '#ef5350' if v >= 30 else ('#00e676' if v <= -20 else 'gray')
-                return f'color: {color}; font-weight: bold'
-            except: return ''
+                # 7. 產生 AI 建議
+                final_advice = ""
+                if action == "🚀 買進": 
+                    final_advice = "🔥 強力加碼" if final_score > 30 else "✅ 買進訊號"
+                elif action == "⚡ 賣出": 
+                    final_advice = "💀 清倉/放空" if final_score < -20 else "📉 獲利了結"
+                elif action == "✊ 續抱": 
+                    if final_score > 40: final_advice = "✨ 抱緊處理"
+                    elif final_score > 0: final_advice = "✊ 續抱觀察"
+                    elif final_score > -15: final_advice = "🛡️ 策略持倉"
+                    else: final_advice = "⚠️ 減碼觀望"
+                else: 
+                    final_advice = "👀 留意買點" if final_score > 60 else "💤 觀望"
 
-        # --- 顯示表格 ---
-        st.dataframe(
-            res_df.style
-            .map(highlight_advice, subset=['AI 建議']) 
-            .map(highlight_score, subset=['綜合評分']) 
-            .format({"權重%": "{:.1f}%", "收盤價": "{:.2f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
-            use_container_width=True
-        )
+                # 8. 組合顯示理由
+                display_reason = base_score_log
+                if adjustment_log:
+                    display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
+                if not display_reason:
+                    display_reason = f"Alpha:{int(final_score)} | {tech_reason}"
+
+                portfolio_results.append({
+                    "代號": fmt_ticker.split('.')[0], 
+                    "名稱": name, 
+                    "持有股數": shares,
+                    "收盤價": current_price, 
+                    "市值": market_value, 
+                    "綜合評分": int(final_score), 
+                    "AI 建議": final_advice, 
+                    "詳細理由": display_reason
+                })
+            
+            status.update(label="AI 分析完成！", state="complete", expanded=False)
+
+        # ==========================================
+        # 自動寄信邏輯：評分變動觸發
+        # ==========================================
+        if enable_monitor and portfolio_results:
+            current_scores_fingerprint = {
+                item['代號']: item['綜合評分'] 
+                for item in portfolio_results
+            }
+            
+            has_score_changed = (current_scores_fingerprint != st.session_state['last_sent_scores'])
+            
+            if has_score_changed:
+                st.toast("⚡ 偵測到評分變動，準備發送通知...", icon="📧")
+                
+                res_df = pd.DataFrame(portfolio_results)
+                try:
+                    market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
+                    analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
+                except Exception as e:
+                    print(f"市場分析生成失敗: {e}")
+                    analysis_html_for_email = "<p>暫無法獲取市場分析數據</p>"
+                
+                with st.spinner("📧 評分異動，正在發送信件..."):
+                    success = send_analysis_email(res_df, analysis_html_for_email)
+                    
+                if success:
+                    st.session_state['last_sent_scores'] = current_scores_fingerprint
+                    st.toast(f"✅ 已發送變動通知！")
+                else:
+                    st.toast("❌ Email 發送失敗", icon="⚠️")
+
+        # ==========================================
+        # 顯示結果
+        # ==========================================
+        if portfolio_results:
+            res_df = pd.DataFrame(portfolio_results)
+            total_val = res_df['市值'].sum()
+            res_df['權重%'] = (res_df['市值'] / total_val * 100) if total_val > 0 else 0
+            health = (res_df['綜合評分'] * res_df['市值']).sum() / total_val if total_val > 0 else 0
+            
+            # 儀表板
+            c_gauge, c_info = st.columns([1, 2])
+            with c_gauge:
+                fig_g = go.Figure(go.Indicator(
+                    mode = "gauge+number", value = health, 
+                    title = {'text': "組合健康度"},
+                    gauge = {'axis': {'range': [-100, 100]}, 'bar': {'color': "#00e676" if health > 0 else "#ef5350"}}
+                ))
+                fig_g.update_layout(height=200, margin=dict(t=30, b=10, l=20, r=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
+                st.plotly_chart(fig_g, use_container_width=True)
+            
+            with c_info:
+                st.metric("💰 總資產估值", f"NT$ {int(total_val):,}", delta=None)
+                st.info(f"💡 若開啟即時監控，當持股評分發生變化時，系統將自動寄發 Email 通知。")
+
+            # 表格樣式與顯示
+            def highlight_advice(val):
+                color = 'white'
+                val_str = str(val)
+                if '加碼' in val_str or '買進' in val_str or '抱緊' in val_str: color = '#ffcdd2' 
+                elif '減碼' in val_str or '賣出' in val_str or '清倉' in val_str: color = '#c8e6c9'
+                elif '策略持倉' in val_str: color = '#bbdefb'
+                elif '觀望' in val_str: color = '#cfd8dc'
+                return f'background-color: {color}; color: black; font-weight: bold'
+
+            def highlight_score(val):
+                try:
+                    v = float(val)
+                    color = '#ef5350' if v >= 30 else ('#00e676' if v <= -20 else 'gray')
+                    return f'color: {color}; font-weight: bold'
+                except: return ''
+
+            st.dataframe(
+                res_df.style
+                .map(highlight_advice, subset=['AI 建議']) 
+                .map(highlight_score, subset=['綜合評分']) 
+                .format({"權重%": "{:.1f}%", "收盤價": "{:.2f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
+                use_container_width=True
+            )
+
     # ==========================================
     # 4. 呼叫片段 (主程式進入點)
     # ==========================================
-    # 只有當使用者輸入了資料，且按下按鈕或開啟監控時，才顯示這個片段
-    # 這裡我們直接呼叫它，讓它根據 enable_monitor 決定要不要自動刷新
-    
     st.markdown("---")
-    # 這裡傳入 session_state 的資料，讓 Fragment 內部去處理
     render_live_dashboard(st.session_state['portfolio_data'])
