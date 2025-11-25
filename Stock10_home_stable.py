@@ -1506,8 +1506,11 @@ elif page == "💼 持股健診與建議":
             st.warning("⚠️ 請先輸入持股資料。")
             return
 
-        # 顯示最後更新時間 (證明有在動)
-        update_time = datetime.now().strftime("%H:%M:%S")
+        # === [修正] 強制轉換為台北時間 ===
+        # 伺服器預設是 UTC，我們加上時區校正
+        tw_tz = pytz.timezone('Asia/Taipei')
+        update_time = datetime.now(tw_tz).strftime("%H:%M:%S")
+        
         if enable_monitor:
             st.caption(f"⚡ 實時監控中... (最後更新: {update_time})")
         else:
