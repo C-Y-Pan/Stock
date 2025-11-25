@@ -930,14 +930,14 @@ def generate_market_analysis(df, margin_df, short_df):
         else:
             strategy = "👀 建議：趨勢不明，建議區間操作。"
 
-    analysis.append(f"### {status}")
+    analysis.append(f"{status}")
     analysis.append(f"{desc}")
     analysis.append(f"> {strategy}")
     analysis.append("---")
 
     # --- B. 關鍵指標解析 ---
     # 1. 恐慌指數 (VIX)
-    vix_analysis = f"- **恐慌指數 (VIX: {vix:.2f})**："
+    vix_analysis = f"- 恐慌指數 (VIX: {vix:.2f})："
     if vix > 30:
         vix_analysis += "處於極端高檔。歷史經驗顯示，VIX > 30 通常難以維持長久，**短線極高機率出現報復性反彈**。"
     elif vix > 20 and vix_change > 0:
@@ -949,7 +949,7 @@ def generate_market_analysis(df, margin_df, short_df):
     analysis.append(vix_analysis)
 
     # 2. 動能 (RSI)
-    rsi_analysis = f"- **動能指標 (RSI: {rsi:.1f})**："
+    rsi_analysis = f"- 動能指標 (RSI: {rsi:.1f})："
     if rsi < 25:
         rsi_analysis += "進入嚴重超賣區 (鈍化)。若股價再創新低但 RSI 未破底 (底背離)，將是**強烈的止跌訊號**。"
     elif rsi > 75:
@@ -968,13 +968,13 @@ def generate_market_analysis(df, margin_df, short_df):
             p_chg = (close - df['Close'].iloc[-5]) / df['Close'].iloc[-5]
             m_chg = (m_curr - m_prev) / m_prev
             
-            chip_analysis = "- **籌碼結構**："
+            chip_analysis = "- 籌碼結構："
             if p_chg < -0.05 and m_chg < -0.03:
-                chip_analysis += "📉 **清洗浮額 (Washout)** - 股價急跌伴隨融資大減，散戶停損出場，籌碼趨於安定，**有利於築底**。"
+                chip_analysis += "📉 清洗浮額 (Washout) - 股價急跌伴隨融資大減，散戶停損出場，籌碼趨於安定，**有利於築底**。"
             elif p_chg < -0.05 and m_chg > 0.01:
-                chip_analysis += "⚠️ **融資套牢** - 股價下跌但融資逆勢增加，顯示散戶正在「接刀」。上檔賣壓沈重，**反彈空間有限**。"
+                chip_analysis += "⚠️ 融資套牢 - 股價下跌但融資逆勢增加，顯示散戶正在「接刀」。上檔賣壓沈重，**反彈空間有限**。"
             elif p_chg > 0.05 and m_chg > 0.02:
-                chip_analysis += "🔥 **散戶追價** - 融資隨股價大增，過熱訊號，需留意主力出貨。"
+                chip_analysis += "🔥 散戶追價 - 融資隨股價大增，過熱訊號，需留意主力出貨。"
             else:
                 chip_analysis += "資券變化在正常範圍內。"
             analysis.append(chip_analysis)
