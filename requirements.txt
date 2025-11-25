@@ -5,3 +5,4 @@ yfinance
 requests
 plotly
 matplotlib
+extra-streamlit-components
