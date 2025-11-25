@@ -1168,39 +1168,52 @@ def draw_market_dashboard(market_df, start_date, end_date):
 
 def send_analysis_email(df, market_analysis_text):
     """
-    發送持股分析報告 Email
+    發送持股分析報告 Email (含格式優化)
     """
     if df.empty: return
 
-    # 1. 準備內容
-    subject = f"📊 持股健診報告 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    # 1. 準備內容與格式化
+    subject = f"📊 持股評分變動通知 - {datetime.now().strftime('%H:%M')}"
     
-    # 將 DataFrame 轉為 HTML 表格 (美化版)
-    # 選取重要欄位
+    # 建立副本以避免影響原始 DataFrame
+    email_df = df.copy()
+    
+    # [關鍵修改] 格式化收盤價：轉為 float 後保留兩位小數，並加上千分位符號
+    try:
+        email_df["收盤價"] = email_df["收盤價"].apply(lambda x: f"{float(x):,.2f}")
+    except:
+        pass # 若轉換失敗維持原樣
+
+    # 選取並排序欄位
     cols = ["代號", "名稱", "收盤價", "綜合評分", "AI 建議"]
-    html_table = df[cols].to_html(index=False, classes='table table-striped', border=1)
+    # 確保欄位存在
+    final_cols = [c for c in cols if c in email_df.columns]
+    
+    # 轉為 HTML
+    html_table = email_df[final_cols].to_html(index=False, classes='table table-striped', border=1, justify='center')
     
     # 組合 Email 內文
     email_body = f"""
     <html>
-    <body>
-        <h2>💼 智能持股追蹤快報</h2>
-        <p>系統時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <body style="font-family: Arial, sans-serif;">
+        <h2 style="color: #333;">🔔 持股評分變動通知</h2>
+        <p>系統偵測到您的持股組合出現評分變化，最新狀態如下：</p>
+        <p>時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
         <hr>
         <h3>📋 AI 市場前瞻</h3>
-        <div style='background-color: #f0f0f5; padding: 10px; border-radius: 5px;'>
+        <div style='background-color: #f8f9fa; padding: 15px; border-left: 5px solid #007bff; border-radius: 4px;'>
             {market_analysis_text}
         </div>
         <br>
-        <h3>📊 持股分析詳情</h3>
+        <h3>📊 持股最新評級</h3>
         {html_table}
         <br>
-        <p><i>本信件由 Quant Pro v6.0 自動發送，請勿直接回信。</i></p>
+        <p style="font-size: 12px; color: #888;"><i>本信件由 Quant Pro v6.0 自動觸發，請勿直接回信。</i></p>
     </body>
     </html>
     """
 
-    # 2. 執行發送
+    # 2. 執行發送 (維持原本邏輯)
     try:
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
@@ -1218,7 +1231,7 @@ def send_analysis_email(df, market_analysis_text):
     except Exception as e:
         print(f"❌ Email 發送失敗: {e}")
         return False
-    
+        
 # ==========================================
 # 前端介面
 # ==========================================
@@ -2139,37 +2152,56 @@ elif page == "💼 持股健診與建議":
         if enable_monitor and portfolio_results: # 只有在啟動監控且有資料時才檢查
             now = datetime.now()
             
-            # 檢查是否超過 10 分鐘
-            if (now - st.session_state['last_email_time']) > timedelta(minutes=10):
-                
-                # 1. 準備持股分析表格數據
-                res_df = pd.DataFrame(portfolio_results)
-                
-                # 2. [關鍵修正] 準備「大盤市場分析」數據
-                # 我們不能直接傳 final_df (那是個股)，要用全域變數 market_df (大盤)
-                # 並且要先計算大盤的 Alpha Score
-                try:
-                    # 確保 market_df 存在 (由外部傳入或全域變數)
-                    # 為了寄信速度，這裡籌碼面傳空值即可，主要看技術面與 VIX
-                    market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
-                    
-                    # 生成市場前瞻分析文字 (HTML格式)
-                    analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
-                except Exception as e:
-                    print(f"市場分析生成失敗: {e}")
-                    analysis_html_for_email = "<p>暫無法獲取市場分析數據</p>"
-                
-                # 3. 執行發送
-                with st.spinner("📧 正在發送定時報告..."):
-                    # 將「持股列表」與「大盤分析」一起傳入
-                    success = send_analysis_email(res_df, analysis_html_for_email) 
-                    
-                if success:
-                    st.session_state['last_email_time'] = now
-                    st.toast(f"✅ 已於 {now.strftime('%H:%M')} 發送分析報告信件！")
-                else:
-                    st.toast("❌ Email 發送失敗，請檢查後台 Log", icon="⚠️")
+        # 初始化：用於記錄上次寄出時的各股分數狀態
+        # 結構範例: {'2330': 60, '2317': 45}
+        if 'last_sent_scores' not in st.session_state:
+            st.session_state['last_sent_scores'] = {}
 
+        @st.fragment(run_every=60 if enable_monitor else None)  
+        def render_live_dashboard(target_df):
+            # ... (前面的資料獲取與計算邏輯保持不變，直到算出 portfolio_results) ...
+            
+            # ... (假設這時已經有了 portfolio_results 列表) ...
+
+            # ==========================================
+            # [修改版] 自動寄信邏輯：僅在評分變動時觸發
+            # ==========================================
+            if enable_monitor and portfolio_results:
+                
+                # 1. 提取當前的「代號: 分數」指紋 (Fingerprint)
+                # 用於比對是否有變化
+                current_scores_fingerprint = {
+                    item['代號']: item['綜合評分'] 
+                    for item in portfolio_results
+                }
+                
+                # 2. 比對邏輯
+                # 若當前指紋 與 上次寄出的指紋不同，代表有股票分數變了 (或是有新股票加入)
+                has_score_changed = (current_scores_fingerprint != st.session_state['last_sent_scores'])
+                
+                if has_score_changed:
+                    st.toast("⚡ 偵測到評分變動，準備發送通知...", icon="📧")
+                    
+                    # 準備數據
+                    res_df = pd.DataFrame(portfolio_results)
+                    
+                    # 獲取大盤分析 (為節省資源，這邊簡單獲取或沿用)
+                    try:
+                        market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
+                        analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
+                    except:
+                        analysis_html_for_email = "<p>暫無市場數據</p>"
+                    
+                    # 執行發送
+                    with st.spinner("📧 評分異動，正在發送信件..."):
+                        success = send_analysis_email(res_df, analysis_html_for_email)
+                        
+                    if success:
+                        # [關鍵更新] 發送成功後，更新「上次寄出的分數狀態」
+                        st.session_state['last_sent_scores'] = current_scores_fingerprint
+                        st.toast(f"✅ 已發送變動通知！")
+                    else:
+                        st.toast("❌ Email 發送失敗", icon="⚠️")
         # 顯示結果
         if portfolio_results:
             res_df = pd.DataFrame(portfolio_results)
