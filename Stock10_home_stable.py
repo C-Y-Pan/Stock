@@ -15,9 +15,10 @@ from datetime import datetime, timedelta    # [新增] 用於設定過期時間
 # --- 頁面設定 ---
 st.set_page_config(page_title="量化投資決策系統 (Quant Pro v6.0)", layout="wide")
 
-# [新增] 初始化 Cookie 管理器
+# [修改] 初始化 Cookie 管理器 (加入 key 以穩定運作)
+# @st.cache_resource # 註：這裡建議不要用 cache，直接實例化即可，或者用 session_state 控管
 def get_cookie_manager():
-    return stx.CookieManager()
+    return stx.CookieManager(key="invest_cookie_manager")
 
 cookie_manager = get_cookie_manager()
 
@@ -874,24 +875,25 @@ with st.sidebar:
     st.title("⚔️ 機構戰情室")
     
     # ==========================================
-    # [升級版] 登入系統 (含 Cookie 自動記憶)
+    # [修正版] 登入系統 (修正 Cookie 寫入問題)
     # ==========================================
     
-    # 1. 嘗試從 Cookie 獲取使用者 (自動登入關鍵)
-    cookie_user = cookie_manager.get(cookie="invest_user")
+    # 1. 嘗試從 Cookie 獲取使用者
+    # 注意：get_all() 通常比 get() 更穩定，我們改抓全部再取值
+    cookies = cookie_manager.get_all()
+    cookie_user = cookies.get("invest_user") if cookies else None
     
     # 初始化 Session
     if 'logged_in' not in st.session_state:
         st.session_state['logged_in'] = False
         st.session_state['username'] = ''
 
-    # 如果 Cookie 有值，且尚未登入 Session，則執行自動登入
+    # 自動登入邏輯：如果 Cookie 有值，且 Session 還沒登入 -> 同步狀態
     if cookie_user and not st.session_state['logged_in']:
         st.session_state['logged_in'] = True
         st.session_state['username'] = cookie_user
-        # 不用 rerun，讓它自然往下執行即可
 
-    # 2. 登入/註冊介面
+    # 2. 介面顯示
     if not st.session_state['logged_in']:
         st.info("🔒 請登入以啟用雲端儲存")
         choice = st.selectbox("功能", ["登入", "註冊新帳號"])
@@ -902,16 +904,17 @@ with st.sidebar:
         if choice == "登入":
             if st.button("登入"):
                 if login_user(user, passwd):
-                    # A. 設定 Session
+                    # A. 設定 Session (讓介面當下立刻反應)
                     st.session_state['logged_in'] = True
                     st.session_state['username'] = user
                     
-                    # B. 寫入 Cookie (設定 30 天後過期)
+                    # B. 寫入 Cookie
+                    # 注意：這裡不呼叫 st.rerun()！
+                    # 套件會在寫入完成後自動刷新頁面，手動 rerun 會打斷寫入
                     expires = datetime.now() + timedelta(days=30)
                     cookie_manager.set("invest_user", user, expires_at=expires)
                     
-                    st.success("登入成功！")
-                    st.rerun()
+                    st.success("登入成功！(正在寫入記憶...)")
                 else:
                     st.error("帳號或密碼錯誤")
         else: # 註冊
@@ -929,13 +932,13 @@ with st.sidebar:
         st.success(f"👤 歡迎, {st.session_state['username']}")
         
         if st.button("登出"):
-            # A. 刪除 Cookie
+            # A. 刪除 Cookie (套件會自動刷新)
             cookie_manager.delete("invest_user")
             
             # B. 清除 Session
             st.session_state['logged_in'] = False
             st.session_state['username'] = ''
-            st.rerun()
+            # 這裡也不需要 rerun，delete 會觸發刷新
             
         st.markdown("---")
         
