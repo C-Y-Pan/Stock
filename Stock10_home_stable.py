@@ -6,9 +6,9 @@ from email.header import Header
 # --- Email 設定 (請修改這裡) ---
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "peter3.pan@gmail.com" # 您的 Gmail
-SENDER_PASSWORD = "jhch wxpn kldb qmib" # 您的應用程式密碼 (非登入密碼)
-RECEIVER_EMAIL = "peter3.pan@gmail.com" # 接收報告的信箱
+SENDER_EMAIL = "cypan2000@gmail.com" # 您的 Gmail
+SENDER_PASSWORD = "amds ieiu wgqk exir" # 您的應用程式密碼 (非登入密碼)
+RECEIVER_EMAIL = "cypan2000@gmail.com" # 接收報告的信箱
 
 import streamlit as st
 import pandas as pd
@@ -2169,7 +2169,7 @@ elif page == "💼 持股健診與建議":
                     st.toast(f"✅ 已於 {now.strftime('%H:%M')} 發送分析報告信件！")
                 else:
                     st.toast("❌ Email 發送失敗，請檢查後台 Log", icon="⚠️")
-                    
+
         # 顯示結果
         if portfolio_results:
             res_df = pd.DataFrame(portfolio_results)
