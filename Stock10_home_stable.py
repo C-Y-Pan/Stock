@@ -6,9 +6,9 @@ from email.header import Header
 # --- Email 設定 (請修改這裡) ---
 SMTP_SERVER = "smtp.gmail.com"
 SMTP_PORT = 587
-SENDER_EMAIL = "your_email@gmail.com" # 您的 Gmail
-SENDER_PASSWORD = "xxxx xxxx xxxx xxxx" # 您的應用程式密碼 (非登入密碼)
-RECEIVER_EMAIL = "target_email@gmail.com" # 接收報告的信箱
+SENDER_EMAIL = "peter3.pan@gmail.com" # 您的 Gmail
+SENDER_PASSWORD = "jhch wxpn kldb qmib" # 您的應用程式密碼 (非登入密碼)
+RECEIVER_EMAIL = "peter3.pan@gmail.com" # 接收報告的信箱
 
 import streamlit as st
 import pandas as pd
