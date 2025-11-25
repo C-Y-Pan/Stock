@@ -1,3 +1,15 @@
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
+
+# --- Email 設定 (請修改這裡) ---
+SMTP_SERVER = "smtp.gmail.com"
+SMTP_PORT = 587
+SENDER_EMAIL = "your_email@gmail.com" # 您的 Gmail
+SENDER_PASSWORD = "xxxx xxxx xxxx xxxx" # 您的應用程式密碼 (非登入密碼)
+RECEIVER_EMAIL = "target_email@gmail.com" # 接收報告的信箱
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -1153,6 +1165,60 @@ def draw_market_dashboard(market_df, start_date, end_date):
     
     st.plotly_chart(fig, use_container_width=True)
 
+
+def send_analysis_email(df, market_analysis_text):
+    """
+    發送持股分析報告 Email
+    """
+    if df.empty: return
+
+    # 1. 準備內容
+    subject = f"📊 持股健診報告 - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+    
+    # 將 DataFrame 轉為 HTML 表格 (美化版)
+    # 選取重要欄位
+    cols = ["代號", "名稱", "收盤價", "綜合評分", "AI 建議"]
+    html_table = df[cols].to_html(index=False, classes='table table-striped', border=1)
+    
+    # 組合 Email 內文
+    email_body = f"""
+    <html>
+    <body>
+        <h2>💼 智能持股追蹤快報</h2>
+        <p>系統時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <hr>
+        <h3>📋 AI 市場前瞻</h3>
+        <div style='background-color: #f0f0f5; padding: 10px; border-radius: 5px;'>
+            {market_analysis_text}
+        </div>
+        <br>
+        <h3>📊 持股分析詳情</h3>
+        {html_table}
+        <br>
+        <p><i>本信件由 Quant Pro v6.0 自動發送，請勿直接回信。</i></p>
+    </body>
+    </html>
+    """
+
+    # 2. 執行發送
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg['Subject'] = Header(subject, 'utf-8')
+        msg.attach(MIMEText(email_body, 'html', 'utf-8'))
+
+        server = smtplib.SMTP(SMTP_SERVER, SMTP_PORT)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print("✅ Email 發送成功！")
+        return True
+    except Exception as e:
+        print(f"❌ Email 發送失敗: {e}")
+        return False
+    
 # ==========================================
 # 前端介面
 # ==========================================
@@ -1913,6 +1979,10 @@ elif page == "💼 持股健診與建議":
     # ==========================================
     # 關鍵：這個函式內部的程式碼，會獨立於主程式之外自己循環運行
     # run_every=60 代表這個片段每 60 秒會自己重跑一次
+    # 初始化上次寄信時間 (放在 fragment 函式外或 session_state 初始化區)
+    if 'last_email_time' not in st.session_state:
+        st.session_state['last_email_time'] = datetime.min
+
     @st.fragment(run_every=60 if enable_monitor else None) 
     def render_live_dashboard(target_df):
         if target_df.empty:
@@ -2059,6 +2129,29 @@ elif page == "💼 持股健診與建議":
             
             # 更新狀態為完成
             status.update(label="AI 分析完成！", state="complete", expanded=False)
+
+        # ==========================================
+        # [新增] 自動寄信邏輯
+        # ==========================================
+        if enable_monitor and portfolio_results: # 只有在啟動監控且有資料時才檢查
+            now = datetime.now()
+            # 檢查是否超過 10 分鐘
+            if (now - st.session_state['last_email_time']) > timedelta(minutes=10):
+                
+                # 準備數據
+                res_df = pd.DataFrame(portfolio_results)
+                # 這裡我們需要重新生成一次市場分析文字供 Email 使用 (或是您可以傳入)
+                analysis_html_for_email = generate_market_analysis(final_df, pd.DataFrame(), pd.DataFrame()) # 簡化傳入，或是您需要把完整的 plot_df 傳進來
+                
+                # 執行發送
+                with st.spinner("📧 正在發送定時報告..."):
+                    success = send_analysis_email(res_df, "請參考即時儀表板之詳細分析") 
+                    
+                if success:
+                    st.session_state['last_email_time'] = now
+                    st.toast(f"✅ 已於 {now.strftime('%H:%M')} 發送分析報告信件！")
+                else:
+                    st.toast("❌ Email 發送失敗，請檢查後台 Log", icon="⚠️")
 
         # 顯示結果
         if portfolio_results:
