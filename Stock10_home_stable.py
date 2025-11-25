@@ -914,21 +914,21 @@ def generate_market_analysis(df, margin_df, short_df):
     
     # --- A. 體制與趨勢診斷 ---
     if is_panic:
-        status = "🔴 **空頭/恐慌體制 (Panic Regime)**"
+        status = "🔴 空頭/恐慌體制"
         desc = "市場處於高波動與情緒過度反應階段。此時技術支撐易失效，需關注「乖離率」與「VIX」何時收斂。"
         if score > 0:
-            strategy = "💡 **前瞻建議**：數據顯示超跌訊號浮現 (黃金坑)，建議分批逆勢建倉，但需保留現金以防末跌段。"
+            strategy = "💡 建議：數據顯示超跌訊號浮現 (黃金坑)，建議分批逆勢建倉，但需保留現金以防末跌段。"
         else:
-            strategy = "🛡️ **前瞻建議**：跌勢未止且尚未出現足夠的恐慌清洗，建議保留現金，靜待 VIX 見頂轉折。"
+            strategy = "🛡️ 建議：跌勢未止且尚未出現足夠的恐慌清洗，建議保留現金，靜待 VIX 見頂轉折。"
     else:
-        status = "🟢 **多頭/正常體制 (Normal Regime)**"
+        status = "🟢 多頭/正常體制"
         desc = "市場處於理性波動階段，股價主要受趨勢線 (均線) 支撐。"
         if close > ma20 and ma20_slope > 0:
-            strategy = "🚀 **前瞻建議**：均線多頭排列，趨勢穩健。操作應順勢而為，遇月線回測不破為加碼點。"
+            strategy = "🚀 建議：均線多頭排列，趨勢穩健。操作應順勢而為，遇月線回測不破為加碼點。"
         elif close < ma20:
-            strategy = "⚠️ **前瞻建議**：短期趨勢轉弱，跌破月線。若無法在 3 日內站回，需提防向季線尋求支撐，建議縮減多單。"
+            strategy = "⚠️ 建議：短期趨勢轉弱，跌破月線。若無法在 3 日內站回，需提防向季線尋求支撐，建議縮減多單。"
         else:
-            strategy = "👀 **前瞻建議**：趨勢不明，建議區間操作。"
+            strategy = "👀 建議：趨勢不明，建議區間操作。"
 
     analysis.append(f"### {status}")
     analysis.append(f"{desc}")
@@ -1180,7 +1180,7 @@ def draw_market_dashboard(market_df, start_date, end_date):
     fig.update_layout(height=1600, template="plotly_dark", margin=dict(l=50, r=50, t=60, b=40), hovermode="x unified", showlegend=False)
     
     st.plotly_chart(fig, use_container_width=True)
-    
+
 # ==========================================
 # 前端介面
 # ==========================================
