@@ -1602,17 +1602,37 @@ elif page == "💼 持股健診與建議":
                 st.metric("💰 總資產估值", f"NT$ {int(total_val):,}", delta=None)
                 st.info(f"💡 最後更新: {update_time}\n\n若開啟即時監控，此區域數值與下方建議將每分鐘自動變動，不影響上方輸入框。")
 
-            # --- 表格區塊 ---
-            def highlight_score(val):
-                color = '#ffcdd2' if val >= 30 else ('#c8e6c9' if val <= -20 else 'white')
-                return f'background-color: {color}; color: black'
+            # --- 表格區塊 (修正版) ---
+            
+            # 1. 定義針對「文字建議」的樣式 (AI 建議欄位用)
+            def highlight_advice(val):
+                color = 'white'
+                val_str = str(val)
+                # 根據關鍵字給予背景色
+                if '加碼' in val_str or '買進' in val_str or '抱緊' in val_str: color = '#ffcdd2' # 紅底
+                elif '減碼' in val_str or '賣出' in val_str or '清倉' in val_str: color = '#c8e6c9' # 綠底
+                elif '策略持倉' in val_str: color = '#bbdefb' # 藍底
+                elif '觀望' in val_str: color = '#cfd8dc' # 灰底
+                return f'background-color: {color}; color: black; font-weight: bold'
 
+            # 2. 定義針對「數值評分」的樣式 (綜合評分欄位用)
+            def highlight_score(val):
+                try:
+                    # 確保是數字才能比較
+                    v = float(val)
+                    color = '#ef5350' if v >= 30 else ('#00e676' if v <= -20 else 'gray')
+                    return f'color: {color}; font-weight: bold'
+                except:
+                    return ''
+
+            # 3. 套用樣式並顯示
             st.dataframe(
-                res_df.style.map(highlight_score, subset=['AI 建議'])
+                res_df.style
+                .map(highlight_advice, subset=['AI 建議'])  # [修正] 文字欄位用 highlight_advice
+                .map(highlight_score, subset=['綜合評分'])  # [修正] 數字欄位用 highlight_score
                 .format({"權重%": "{:.1f}%", "收盤價": "{:.1f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
                 use_container_width=True
             )
-
     # ==========================================
     # 4. 呼叫片段 (主程式進入點)
     # ==========================================
