@@ -1168,37 +1168,46 @@ def draw_market_dashboard(market_df, start_date, end_date):
 
 def send_analysis_email(df, market_analysis_text):
     """
-    發送持股分析報告 Email (含格式優化)
+    發送持股分析報告 Email (含格式優化與時區校正)
     """
     if df.empty: return
 
+    # [關鍵修正] 設定台北時區
+    tw = pytz.timezone('Asia/Taipei')
+    # 獲取當前台北時間
+    now_tw = datetime.now(tw)
+
     # 1. 準備內容與格式化
-    subject = f"📊 持股評分變動通知 - {datetime.now().strftime('%H:%M')}"
+    subject = f"📊 持股評分變動通知 - {now_tw.strftime('%H:%M')}"
     
-    # 建立副本以避免影響原始 DataFrame
+    # 建立副本
     email_df = df.copy()
     
-    # [關鍵修改] 格式化收盤價：轉為 float 後保留兩位小數，並加上千分位符號
+    # 格式化收盤價
     try:
-        email_df["收盤價"] = email_df["收盤價"].apply(lambda x: f"{float(x):,.2f}")
-    except:
-        pass # 若轉換失敗維持原樣
+        email_df["收盤價"] = pd.to_numeric(email_df["收盤價"], errors='coerce')
+        email_df["收盤價"] = email_df["收盤價"].map('{:,.2f}'.format)
+    except: pass
 
-    # 選取並排序欄位
+    # 選取欄位
     cols = ["代號", "名稱", "收盤價", "綜合評分", "AI 建議"]
-    # 確保欄位存在
     final_cols = [c for c in cols if c in email_df.columns]
     
     # 轉為 HTML
-    html_table = email_df[final_cols].to_html(index=False, classes='table table-striped', border=1, justify='center')
+    html_table = email_df[final_cols].to_html(
+        index=False, 
+        classes='table table-striped', 
+        border=1, 
+        justify='center'
+    )
     
-    # 組合 Email 內文
+    # 組合 Email 內文 (時間改用 now_tw)
     email_body = f"""
     <html>
     <body style="font-family: Arial, sans-serif;">
         <h2 style="color: #333;">🔔 持股評分變動通知</h2>
         <p>系統偵測到您的持股組合出現評分變化，最新狀態如下：</p>
-        <p>時間：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+        <p>時間：{now_tw.strftime('%Y-%m-%d %H:%M:%S')} (Taipei)</p>
         <hr>
         <h3>📋 AI 市場前瞻</h3>
         <div style='background-color: #f8f9fa; padding: 15px; border-left: 5px solid #007bff; border-radius: 4px;'>
@@ -1213,7 +1222,7 @@ def send_analysis_email(df, market_analysis_text):
     </html>
     """
 
-    # 2. 執行發送 (維持原本邏輯)
+    # 2. 執行發送
     try:
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
@@ -1231,7 +1240,7 @@ def send_analysis_email(df, market_analysis_text):
     except Exception as e:
         print(f"❌ Email 發送失敗: {e}")
         return False
-        
+            
 # ==========================================
 # 前端介面
 # ==========================================
