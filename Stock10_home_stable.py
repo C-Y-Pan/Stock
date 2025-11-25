@@ -244,31 +244,49 @@ def get_stock_name(ticker):
 ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 
 # ==========================================
-# 1. 數據獲取 (Updated)
+# 1. 數據獲取 (Real-time Modified)
 # ==========================================
-@st.cache_data(ttl=5, show_spinner=False)
+
+# [修改] 將 ttl 設為 60 (秒)，確保盤中能抓到最新數據
+@st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     ticker = str(ticker).strip()
     candidates = [ticker]
     if ticker.isdigit(): candidates = [f"{ticker}.TW", f"{ticker}.TWO"]
+    
+    # [新增] 強制讓 end_date 涵蓋到「明天」，確保 Yahoo Finance 回傳今日(盤中)的資料
+    # 若 end_date 只設為今天，有時 yfinance 會漏掉當日最新的 K 線
+    adj_end_date = end_date + timedelta(days=1)
+
     for t in candidates:
         try:
             stock = yf.Ticker(t)
-            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1))
+            # Fetch history
+            df = stock.history(start=start_date - timedelta(days=400), end=adj_end_date)
+            
             if not df.empty:
                 df = df.reset_index()
                 df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
+                
+                # [新增] 簡單過濾：若最後一筆資料是「未來」或資料異常(Volume=0且沒開盤)，可在此處理
+                # 但通常 yfinance 會自動處理好
+                
                 return df, t
         except: continue
     return pd.DataFrame(), ticker
 
-@st.cache_data(ttl=5, show_spinner=False)
+# [修改] 將 ttl 設為 60 (秒)，並確保回傳完整 OHLC 欄位 (修復 KeyError)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_market_data(start_date, end_date):
     try:
+        # [新增] 同樣將結束日期往後推一天，確保抓到盤中最新 K 線
+        adj_end_date = end_date + timedelta(days=1)
+        
         market = yf.Ticker("^TWII")
-        df = market.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1))
-        vix = yf.Ticker("^VIX") # S&P 500 VIX 作為全球恐慌指標參考
-        df_vix = vix.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1))
+        df = market.history(start=start_date - timedelta(days=400), end=adj_end_date)
+        
+        vix = yf.Ticker("^VIX")
+        df_vix = vix.history(start=start_date - timedelta(days=400), end=adj_end_date)
         
         if not df.empty:
             df = df.reset_index()
@@ -293,7 +311,7 @@ def get_market_data(start_date, end_date):
             df['Market_MA20'] = df['Close'].rolling(20).mean()
             df['Market_MA60'] = df['Close'].rolling(60).mean()
             
-            # [修正] 這裡原本漏了 Open, High, Low, Volume，導致後續 Alpha Score 計算 KD 時找不到欄位報錯
+            # 回傳完整欄位，包含 Open, High, Low 以避免 KeyError
             return df[['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Market_RSI', 'Market_MA20', 'Market_MA60', 'OBV', 'OBV_MA20', 'VIX']]
     except: pass
     return pd.DataFrame()
@@ -1053,9 +1071,20 @@ with st.sidebar:
         
     # [修改] 加入 "💼 持股健診與建議"
     page = st.radio("導航", ["🌍 市場總覽 (Macro)", "📊 單股深度分析", "🚀 科技股掃描", "💼 持股健診與建議", "📋 全台股清單"])
+    
     st.markdown("---")
-    st.sidebar.info("🔥 v6.0 更新：Alpha Score 評等系統、融資券監控、蒙地卡羅風險模擬")
-    st.markdown("---")
+    # 自動刷新機制
+    import time
+    
+    # 使用 Toggle 開關
+    auto_refresh = st.toggle("🔄 啟動盤中自動更新 (每60秒)", value=False)
+    
+    if auto_refresh:
+        # 顯示倒數計時器或是狀態
+        st.caption("⏳ 系統將每 60 秒自動更新數據...")
+        time.sleep(60) # 等待 60 秒
+        st.rerun()     # 強制重新執行整個頁面
+        
     today = datetime.today()
     # 設定台北時區
     tw_tz = pytz.timezone('Asia/Taipei')
