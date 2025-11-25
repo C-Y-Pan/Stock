@@ -734,57 +734,138 @@ def analyze_signal(final_df):
     else: return "👀 觀望", "gray", "空手"
 
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - 最終修正版
+# 5. [核心演算法] 買賣評等 (Alpha Score) - 實務嚴謹版
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
-    df = df.copy(); df['Alpha_Score'] = 0.0
-    
-    # === 關鍵修正：確保使用個股自身的均線 (MA60, MA20) ===
-    # 防呆：如果資料庫沒有計算到 MA60，先用收盤價填補避免報錯 (雖然 calculate_indicators 應該要有)
+    # 1. 建立副本與初始化
+    df = df.copy()
+    if 'Alpha_Score' not in df.columns: df['Alpha_Score'] = 0.0
+    if 'Score_Log' not in df.columns: df['Score_Log'] = ""
+
+    # 定義計分 Helper (含日誌記錄)
+    def apply_rule(mask, points, reason):
+        if not mask.any(): return
+        df.loc[mask, 'Alpha_Score'] += points
+        sign = "+" if points > 0 else ""
+        # 向量化字串相加，效能較佳
+        df.loc[mask, 'Score_Log'] = df.loc[mask, 'Score_Log'] + f"[{reason}{sign}{points}]"
+
+    # ====================================================
+    # A. 基礎趨勢 (Trend)
+    # ====================================================
     if 'MA60' not in df.columns: df['MA60'] = df['Close']
     if 'MA20' not in df.columns: df['MA20'] = df['Close']
     
-    # 1. 趨勢面 (Trend)
-    # 個股是否站上「它自己的」季線 (+15)
-    df.loc[df['Close'] > df['MA60'], 'Alpha_Score'] += 15
-    df.loc[df['Close'] < df['MA60'], 'Alpha_Score'] -= 15
+    apply_rule(df['Close'] > df['MA60'], 15, "季線")
+    apply_rule(df['Close'] < df['MA60'], -15, "破季線")
+    apply_rule(df['Close'] > df['MA20'], 15, "月線")
+    apply_rule(df['Close'] < df['MA20'], -15, "破月線")
+
+    # ====================================================
+    # B. 個股技術動能 (Technical Momentum)
+    # ====================================================
+    # 1. MACD
+    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['DIF'] = exp12 - exp26
+    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = 2 * (df['DIF'] - df['DEA'])
     
-    # 個股是否站上「它自己的」月線 (+10)
-    df.loc[df['Close'] > df['MA20'], 'Alpha_Score'] += 10
-    df.loc[df['Close'] < df['MA20'], 'Alpha_Score'] -= 15
+    apply_rule(df['DIF'] > df['DEA'], 10, "MACD金叉")
+    apply_rule(df['DIF'] < df['DEA'], -10, "MACD死叉")
+    apply_rule((df['MACD_Hist'] > 0) & (df['MACD_Hist'] > df['MACD_Hist'].shift(1)), 5, "MACD加速")
     
-    # 大盤環境加分 (若大盤月線 > 季線，整體環境偏多，全體加分)
+    # 2. KD (RSV)
+    low_min = df['Low'].rolling(9).min()
+    high_max = df['High'].rolling(9).max()
+    # 防呆：避免分母為 0
+    denom = high_max - low_min
+    denom = denom.replace(0, 1) # 替換 0 為 1 避免報錯
+    df['RSV'] = (df['Close'] - low_min) / denom * 100
+    df['K'] = df['RSV'].ewm(com=2).mean()
+    df['D'] = df['K'].ewm(com=2).mean()
+    
+    apply_rule(df['K'] > df['D'], 10, "KD金叉")
+    apply_rule(df['K'] < df['D'], -10, "KD死叉")
+    apply_rule(df['K'] > 80, 5, "KD鈍化")
+    
+    # 3. RSI
+    apply_rule(df['RSI'] > 55, 5, "RSI強")
+    apply_rule(df['RSI'] < 45, -5, "RSI弱")
+
+    # 4. 成交量
+    if 'Vol_MA20' in df.columns:
+        apply_rule((df['Volume'] > df['Vol_MA20']) & (df['Close'] > df['Open']), 5, "量增價漲")
+
+    # ====================================================
+    # C. 市場環境 (Market Context)
+    # ====================================================
     if 'Market_MA20' in df.columns and 'Market_MA60' in df.columns:
-        df.loc[df['Market_MA20'] > df['Market_MA60'], 'Alpha_Score'] += 5
-
-    # 2. 動能 & 恐慌 (Momentum)
-    df.loc[df['Market_RSI'] < 30, 'Alpha_Score'] += 20
-    df.loc[df['Market_RSI'] < 20, 'Alpha_Score'] += 25
-    df.loc[df['Market_RSI'] > 80, 'Alpha_Score'] -= 10
+        apply_rule(df['Market_MA20'] > df['Market_MA60'], 5, "大盤多")
     
-    # VIX 恐慌加分
-    df.loc[df['VIX'] > 20, 'Alpha_Score'] += 5
-    df.loc[df['VIX'] > 30, 'Alpha_Score'] += 15
-    df.loc[df['VIX'] < 13, 'Alpha_Score'] -= 5
+    apply_rule(df['VIX'] > 25, 15, "恐慌撿鑽")
+    apply_rule(df['VIX'] < 13, -5, "過度樂觀")
 
-    # 3. 籌碼 (Chips)
+    # ====================================================
+    # D. 籌碼面 (Chips) - [嚴格對齊版]
+    # ====================================================
+    # 只有當傳入的 DataFrame 確實有資料時才執行
     if not margin_df.empty and not short_df.empty:
-        temp = pd.merge(df[['Date', 'Close']], margin_df[['date', 'TodayBalance']], left_on='Date', right_on='date', how='left')
-        temp = pd.merge(temp, short_df[['date', 'TodayBalance']], left_on='Date', right_on='date', how='left', suffixes=('_M', '_S'))
-        temp['M_Chg'] = temp['TodayBalance_M'].pct_change(5); temp['S_Chg'] = temp['TodayBalance_S'].pct_change(5); temp['P_Chg'] = temp['Close'].pct_change(5)
-        
-        mask_stable = (temp['P_Chg'] > 0.02) & (temp['M_Chg'] < -0.01)
-        df.loc[mask_stable.values, 'Alpha_Score'] += 15
-        mask_trap = (temp['P_Chg'] < -0.02) & (temp['M_Chg'] > 0.01)
-        normal_rsi = (df['Market_RSI'] > 25)
-        df.loc[mask_trap.values & normal_rsi.values, 'Alpha_Score'] -= 20
-        mask_washout = (temp['P_Chg'] < -0.03) & (temp['M_Chg'] < -0.02)
-        df.loc[mask_washout.values, 'Alpha_Score'] += 30
-        mask_squeeze = (temp['P_Chg'] > 0.02) & (temp['S_Chg'] > 0.02)
-        df.loc[mask_squeeze.values, 'Alpha_Score'] += 10
+        try:
+            # 1. 資料清洗與標準化
+            # 確保 Date 欄位格式一致 (去除時分秒，統一為 datetime64[ns])
+            df['Date_Join'] = pd.to_datetime(df['Date']).dt.normalize()
+            
+            m_clean = margin_df[['date', 'TodayBalance']].copy()
+            m_clean.columns = ['Date_Join', 'Margin_Bal']
+            m_clean['Date_Join'] = pd.to_datetime(m_clean['Date_Join']).dt.normalize()
+            
+            s_clean = short_df[['date', 'TodayBalance']].copy()
+            s_clean.columns = ['Date_Join', 'Short_Bal']
+            s_clean['Date_Join'] = pd.to_datetime(s_clean['Date_Join']).dt.normalize()
 
+            # 2. 合併資料 (Left Join)
+            # 以 df (股價) 為主，保留所有 K 線。若某天無籌碼資料，會填入 NaN
+            df = df.merge(m_clean, on='Date_Join', how='left')
+            df = df.merge(s_clean, on='Date_Join', how='left')
+
+            # 3. 缺失值處理 (Forward Fill)
+            # 假設：若今日無籌碼資料(如資料源延遲)，則籌碼餘額視為「維持昨日水準」
+            df['Margin_Bal'] = df['Margin_Bal'].ffill()
+            df['Short_Bal'] = df['Short_Bal'].ffill()
+
+            # 4. 計算變化率 (5日變化)
+            # 這裡計算的是「有交易日」的 5 天變化，符合實務邏輯
+            df['M_Chg'] = df['Margin_Bal'].pct_change(5)
+            df['S_Chg'] = df['Short_Bal'].pct_change(5)
+            df['P_Chg'] = df['Close'].pct_change(5)
+
+            # 5. 判斷邏輯 (邏輯運算前先去除 NaN，避免報錯)
+            # 籌碼安定 (價漲 > 2% 且 融資減 > 1%)
+            mask_stable = (df['P_Chg'] > 0.02) & (df['M_Chg'] < -0.01)
+            apply_rule(mask_stable, 20, "籌碼安定")
+            
+            # 融資套牢 (價跌 < -2% 且 融資增 > 1%)
+            mask_trap = (df['P_Chg'] < -0.02) & (df['M_Chg'] > 0.01)
+            apply_rule(mask_trap, -20, "融資套牢")
+            
+            # 軋空 (價漲 > 2% 且 融券增 > 2%)
+            mask_squeeze = (df['P_Chg'] > 0.02) & (df['S_Chg'] > 0.02)
+            apply_rule(mask_squeeze, 15, "軋空啟動")
+            
+            # 6. 清理暫存欄位 (保持 df 乾淨)
+            df = df.drop(columns=['Date_Join', 'Margin_Bal', 'Short_Bal', 'M_Chg', 'S_Chg', 'P_Chg'], errors='ignore')
+
+        except Exception as e:
+            # 若合併過程發生預期外錯誤 (如欄位名稱對不上)，不中斷程式，但印出錯誤供除錯
+            print(f"Chip Analysis Error: {e}")
+
+    # ====================================================
+    # E. 最終限制
+    # ====================================================
     df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
+    
     return df
 
 # ==========================================
@@ -1550,70 +1631,134 @@ elif page == "💼 持股健診與建議":
 
         portfolio_results = []
         
-        # 為了不讓畫面太長，我們用 expander 包住進度條，跑完自動收起來
-        with st.status(f"正在分析 {len(target_df)} 檔標的...", expanded=True) as status:
-            total_rows = len(target_df)
+        # 使用 status container 顯示動態進度，跑完自動收合
+        with st.status(f"正在全方位分析 {len(target_df)} 檔持股結構...", expanded=True) as status:
+            
+            # === 核心迴圈開始 ===
             for idx, row in target_df.iterrows():
                 ticker = str(row['代號']).strip()
                 shares = row['持有股數']
+                
+                # 基本防呆
                 if not ticker or shares <= 0: continue
                 
-                # 在這裡呼叫 get_stock_data，因為它有 ttl=1，所以會抓到最新價格
+                # 1. 獲取即時資料 (利用 ttl=1 快取，實現盤中即時更新)
                 raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
                 name = get_stock_name(fmt_ticker)
                 
-                if raw_df.empty or len(raw_df) < 30:
-                    continue # 資料不足跳過
+                # 資料不足跳過
+                if raw_df.empty or len(raw_df) < 60:
+                    continue 
                     
+                # 2. 執行策略回測 (取得技術買賣點)
                 best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_input, tax_input)
                 
                 if final_df is None or final_df.empty: continue
 
-                # 計算邏輯 (維持不變)
+                # 3. 計算基礎數值
                 current_price = final_df['Close'].iloc[-1]
                 market_value = current_price * shares
+                
+                # 4. [透明化評分] 計算 Alpha Score 並取得計分歷程
+                # 傳入空 df 以加速運算 (主要依賴技術指標: MACD, KD, 均線...)
                 stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
                 base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
+                
+                # 取得該股最後一天的詳細評分字串 (例如: "[季線+15][MACD金叉+10]")
+                base_score_log = stock_alpha_df['Score_Log'].iloc[-1] 
+                
+                # 5. 取得技術訊號 (Action)
                 action, color, tech_reason = analyze_signal(final_df)
                 
+                # 6. [情境感知] 評分動態調整 (Context-Aware Adjustment)
                 final_score = base_alpha_score
                 adjustment_log = []
+                
+                # A. 判斷策略屬性 (是否為逆勢/反彈策略)
                 last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
                 is_rebound = False
-                if last_trade is not None and any(x in str(last_trade['Reason']) for x in ["反彈", "超賣", "回測"]):
-                    is_rebound = True
+                if last_trade is not None:
+                    buy_reason = str(last_trade['Reason'])
+                    if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]):
+                        is_rebound = True
                 
-                if action == "✊ 續抱":
+                # B. 針對「續抱」或「買進」狀態進行邏輯分支
+                if action == "✊ 續抱" or action == "🚀 買進":
                     if is_rebound:
-                        if current_price < final_df['MA60'].iloc[-1]: final_score += 15; adjustment_log.append("忽略季線")
-                        if current_price > final_df['Close'].rolling(5).mean().iloc[-1]: final_score += 10
-                        if final_df['RSI'].iloc[-1] > final_df['RSI'].iloc[-2]: final_score += 10
+                        # 情境 A: 反彈策略 (抄底邏輯)
+                        # 補償 1: 不看長均線 (因為抄底必定在季線下，補回被扣的分數)
+                        if current_price < final_df['MA60'].iloc[-1]: 
+                            final_score += 15
+                            adjustment_log.append("反彈無視季線+15")
+                        
+                        # 補償 2: 檢視反彈有效性 (站上短均?)
+                        ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
+                        if current_price > ma5: 
+                            final_score += 10
+                            adjustment_log.append("站穩MA5+10")
+                        else:
+                            final_score -= 5
+                            adjustment_log.append("破MA5-5")
+                            
+                        # 補償 3: 動能檢核 (RSI翻揚?)
+                        rsi_now = final_df['RSI'].iloc[-1]
+                        rsi_prev = final_df['RSI'].iloc[-2]
+                        if rsi_now > rsi_prev: 
+                            final_score += 10
+                            adjustment_log.append("動能翻揚+10")
+                        elif rsi_now < 30:
+                            final_score += 5
+                            adjustment_log.append("低檔鈍化+5")
+                    
                     else:
-                        if final_df['Volume'].iloc[-1] > final_df['Vol_MA20'].iloc[-1] * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
-                            final_score -= 15; adjustment_log.append("爆量滯漲")
+                        # 情境 B: 順勢策略 (突破邏輯)
+                        # 檢查隱憂：高檔爆量滯漲
+                        vol_now = final_df['Volume'].iloc[-1]
+                        vol_ma = final_df['Vol_MA20'].iloc[-1]
+                        if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
+                            final_score -= 15
+                            adjustment_log.append("高檔爆量滯漲-15")
 
+                # C. 限制分數範圍 (-100 ~ 100)
                 final_score = max(min(final_score, 100), -100)
 
-                final_advice = ""; 
-                if action == "🚀 買進": final_advice = "🔥 強力加碼" if final_score > 30 else "✅ 買進訊號"
-                elif action == "⚡ 賣出": final_advice = "💀 清倉" if final_score < -20 else "📉 獲利了結"
+                # 7. 產生最終 AI 建議文字
+                final_advice = ""
+                if action == "🚀 買進": 
+                    final_advice = "🔥 強力加碼" if final_score > 30 else "✅ 買進訊號"
+                elif action == "⚡ 賣出": 
+                    final_advice = "💀 清倉/放空" if final_score < -20 else "📉 獲利了結"
                 elif action == "✊ 續抱": 
-                    if final_score > 40: final_advice = "✨ 抱緊"
-                    elif final_score > 0: final_advice = "✊ 續抱"
-                    elif final_score > -15: final_advice = "🛡️ 持倉"
-                    else: final_advice = "⚠️ 減碼"
-                else: final_advice = "👀 留意" if final_score > 60 else "💤 觀望"
+                    if final_score > 40: final_advice = "✨ 抱緊處理"
+                    elif final_score > 0: final_advice = "✊ 續抱觀察"
+                    elif final_score > -15: final_advice = "🛡️ 策略持倉"
+                    else: final_advice = "⚠️ 減碼觀望"
+                else: 
+                    final_advice = "👀 留意買點" if final_score > 60 else "💤 觀望"
 
-                reason_display = f"Alpha:{int(final_score)} | {tech_reason}"
-                if adjustment_log: reason_display = f"修:{int(final_score)} ({','.join(adjustment_log)})"
+                # 8. [組合顯示字串] 合併基礎評分與修正理由
+                # 格式範例: "[季線+15][MACD金叉+10] ➜ 修正: 站穩MA5+10"
+                display_reason = base_score_log
+                if adjustment_log:
+                    display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
+                
+                # 防呆：若完全沒有評分細節
+                if not display_reason:
+                    display_reason = f"Alpha:{int(final_score)} | {tech_reason}"
 
                 portfolio_results.append({
-                    "代號": fmt_ticker.split('.')[0], "名稱": name, "持有股數": shares,
-                    "收盤價": current_price, "市值": market_value, "綜合評分": int(final_score), 
-                    "AI 建議": final_advice, "詳細理由": reason_display
+                    "代號": fmt_ticker.split('.')[0], 
+                    "名稱": name, 
+                    "持有股數": shares,
+                    "收盤價": current_price, 
+                    "市值": market_value, 
+                    "綜合評分": int(final_score), 
+                    "AI 建議": final_advice, 
+                    "詳細理由": display_reason # 完整呈現計算過程
                 })
             
-            status.update(label="分析完成！", state="complete", expanded=False)
+            # 更新狀態為完成
+            status.update(label="AI 分析完成！", state="complete", expanded=False)
 
         # 顯示結果
         if portfolio_results:
@@ -1677,4 +1822,3 @@ elif page == "💼 持股健診與建議":
     st.markdown("---")
     # 這裡傳入 session_state 的資料，讓 Fragment 內部去處理
     render_live_dashboard(st.session_state['portfolio_data'])
-
