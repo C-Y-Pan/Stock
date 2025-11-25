@@ -884,7 +884,109 @@ def calculate_alpha_score(df, margin_df, short_df):
 # ==========================================
 # 6. 主儀表板繪製 (Updated)
 # ==========================================
+def generate_market_analysis(df, margin_df, short_df):
+    """
+    根據當前數據生成前瞻性市場分析報告
+    包含：趨勢診斷、風險評估、籌碼結構、操作建議
+    """
+    if df.empty: return "無足夠數據進行分析"
+    
+    last = df.iloc[-1]
+    prev = df.iloc[-2]
+    
+    # 1. 定義數據變數
+    close = last['Close']
+    ma20 = last['MA20'] if 'MA20' in last else 0
+    ma60 = last['MA60'] if 'MA60' in last else 0
+    rsi = last['RSI']
+    vix = last['VIX']
+    score = last['Alpha_Score']
+    
+    # 計算斜率與變化
+    ma20_slope = (last['MA20'] - prev['MA20'])
+    vix_change = last['VIX'] - prev['VIX']
+    
+    # 2. 判定市場體制 (Regime)
+    bias_60 = (close - ma60) / ma60 if ma60 != 0 else 0
+    is_panic = (vix > 25) or (rsi < 30) or (bias_60 < -0.10)
+    
+    analysis = []
+    
+    # --- A. 體制與趨勢診斷 ---
+    if is_panic:
+        status = "🔴 **空頭/恐慌體制 (Panic Regime)**"
+        desc = "市場處於高波動與情緒過度反應階段。此時技術支撐易失效，需關注「乖離率」與「VIX」何時收斂。"
+        if score > 0:
+            strategy = "💡 **前瞻建議**：數據顯示超跌訊號浮現 (黃金坑)，建議分批逆勢建倉，但需保留現金以防末跌段。"
+        else:
+            strategy = "🛡️ **前瞻建議**：跌勢未止且尚未出現足夠的恐慌清洗，建議保留現金，靜待 VIX 見頂轉折。"
+    else:
+        status = "🟢 **多頭/正常體制 (Normal Regime)**"
+        desc = "市場處於理性波動階段，股價主要受趨勢線 (均線) 支撐。"
+        if close > ma20 and ma20_slope > 0:
+            strategy = "🚀 **前瞻建議**：均線多頭排列，趨勢穩健。操作應順勢而為，遇月線回測不破為加碼點。"
+        elif close < ma20:
+            strategy = "⚠️ **前瞻建議**：短期趨勢轉弱，跌破月線。若無法在 3 日內站回，需提防向季線尋求支撐，建議縮減多單。"
+        else:
+            strategy = "👀 **前瞻建議**：趨勢不明，建議區間操作。"
+
+    analysis.append(f"### {status}")
+    analysis.append(f"{desc}")
+    analysis.append(f"> {strategy}")
+    analysis.append("---")
+
+    # --- B. 關鍵指標解析 ---
+    # 1. 恐慌指數 (VIX)
+    vix_analysis = f"- **恐慌指數 (VIX: {vix:.2f})**："
+    if vix > 30:
+        vix_analysis += "處於極端高檔。歷史經驗顯示，VIX > 30 通常難以維持長久，**短線極高機率出現報復性反彈**。"
+    elif vix > 20 and vix_change > 0:
+        vix_analysis += "持續攀升中，避險情緒增溫。在 VIX 未轉折向下前，不宜過度樂觀。"
+    elif vix < 15:
+        vix_analysis += "處於低檔安逸區。需提防市場過度樂觀引發的修正，居高思危。"
+    else:
+        vix_analysis += "處於正常波動區間。"
+    analysis.append(vix_analysis)
+
+    # 2. 動能 (RSI)
+    rsi_analysis = f"- **動能指標 (RSI: {rsi:.1f})**："
+    if rsi < 25:
+        rsi_analysis += "進入嚴重超賣區 (鈍化)。若股價再創新低但 RSI 未破底 (底背離)，將是**強烈的止跌訊號**。"
+    elif rsi > 75:
+        rsi_analysis += "進入過熱區。若量能無法跟上，需提防高檔假突破。"
+    elif 45 <= rsi <= 55:
+        rsi_analysis += "動能中性，等待方向表態。"
+    else:
+        rsi_analysis += "動能維持正常。"
+    analysis.append(rsi_analysis)
+
+    # --- C. 籌碼結構 (若有數據) ---
+    if not margin_df.empty and not short_df.empty:
+        try:
+            m_curr = margin_df['TodayBalance'].iloc[-1]
+            m_prev = margin_df['TodayBalance'].iloc[-5]
+            p_chg = (close - df['Close'].iloc[-5]) / df['Close'].iloc[-5]
+            m_chg = (m_curr - m_prev) / m_prev
+            
+            chip_analysis = "- **籌碼結構**："
+            if p_chg < -0.05 and m_chg < -0.03:
+                chip_analysis += "📉 **清洗浮額 (Washout)** - 股價急跌伴隨融資大減，散戶停損出場，籌碼趨於安定，**有利於築底**。"
+            elif p_chg < -0.05 and m_chg > 0.01:
+                chip_analysis += "⚠️ **融資套牢** - 股價下跌但融資逆勢增加，顯示散戶正在「接刀」。上檔賣壓沈重，**反彈空間有限**。"
+            elif p_chg > 0.05 and m_chg > 0.02:
+                chip_analysis += "🔥 **散戶追價** - 融資隨股價大增，過熱訊號，需留意主力出貨。"
+            else:
+                chip_analysis += "資券變化在正常範圍內。"
+            analysis.append(chip_analysis)
+        except: pass
+
+    return "\n".join(analysis)
+
+
 def draw_market_dashboard(market_df, start_date, end_date):
+    """
+    繪製總體市場儀表板：包含 Metrics、AI 前瞻分析報告與 Plotly 圖表
+    """
     st.markdown("### 🌍 總體市場戰情 (Macro)")
     target_start = pd.to_datetime(start_date)
     plot_df = market_df[market_df['Date'] >= target_start].copy()
@@ -894,116 +996,123 @@ def draw_market_dashboard(market_df, start_date, end_date):
         return
     
     # =========================================================
-    # 1. 欄位映射與資料準備
+    # 1. 資料前處理與欄位映射
     # =========================================================
-    if 'Market_RSI' in plot_df.columns:
-        plot_df['RSI'] = plot_df['Market_RSI']
-    else:
-        plot_df['RSI'] = 50 
+    # 將 Market_XXX 映射為通用名稱，供 Alpha Score 計算使用
+    if 'Market_RSI' in plot_df.columns: plot_df['RSI'] = plot_df['Market_RSI']
+    else: plot_df['RSI'] = 50 
 
-    if 'Market_MA20' in plot_df.columns:
-        plot_df['MA20'] = plot_df['Market_MA20']
-        
-    if 'Market_MA60' in plot_df.columns:
-        plot_df['MA60'] = plot_df['Market_MA60']
+    if 'Market_MA20' in plot_df.columns: plot_df['MA20'] = plot_df['Market_MA20']
+    if 'Market_MA60' in plot_df.columns: plot_df['MA60'] = plot_df['Market_MA60']
 
-    # 補算成交量均線
     if 'Volume' in plot_df.columns:
         plot_df['Vol_MA20'] = plot_df['Volume'].rolling(20).mean()
 
     # =========================================================
-    # 2. 獲取資券數據 (FinMind)
+    # 2. 獲取外部籌碼數據 (FinMind)
     # =========================================================
     margin_df_raw = get_margin_data(start_date.strftime('%Y-%m-%d'))
     margin_df = pd.DataFrame(); short_df = pd.DataFrame()
     if not margin_df_raw.empty:
         sliced = margin_df_raw[(margin_df_raw['date'] >= target_start) & (margin_df_raw['date'] <= pd.to_datetime(end_date))]
-        margin_df = sliced[sliced['name'] == 'MarginPurchaseMoney']; short_df = sliced[sliced['name'] == 'ShortSale']
+        margin_df = sliced[sliced['name'] == 'MarginPurchaseMoney']
+        short_df = sliced[sliced['name'] == 'ShortSale']
     
     # =========================================================
-    # 3. 執行改良版 Alpha Score 運算
+    # 3. 執行核心演算法 (Alpha Score & Regime Detection)
     # =========================================================
-    # 注意：這裡呼叫的是我們剛修正過、具備 Regime Switching 能力的 calculate_alpha_score
+    # 呼叫改良後的計分函式
     plot_df = calculate_alpha_score(plot_df, margin_df, short_df)
     
-    # =========================================================
-    # 4. 計算當前狀態與評語
-    # =========================================================
     last = plot_df.iloc[-1]
     score = last['Alpha_Score']
     vix = last['VIX']
-    rsi = last['RSI']
     close = last['Close']
     ma60 = last['MA60'] if 'MA60' in last else close
     
-    # 定義「恐慌體制」判斷邏輯 (需與演算法一致，用於前端顯示)
-    # 這裡加入乖離率輔助判斷
-    bias = (close - ma60) / ma60
-    is_panic_regime = (vix > 25) or (rsi < 30) or (bias < -0.10)
+    # =========================================================
+    # 4. 介面邏輯：判定體制與評語
+    # =========================================================
     
-    # 決定體制標籤
+    # 判定市場體制 (Regime)
+    bias = (close - ma60) / ma60
+    # 恐慌條件：VIX高 或 RSI低 或 負乖離大
+    is_panic_regime = (vix > 25) or (last['RSI'] < 30) or (bias < -0.10)
+    
     if is_panic_regime:
-        regime_label = "🐻 空頭/恐慌體制" 
-        regime_color = "inverse" # 黑底白字或其他醒目色
+        regime_label = "🐻 空頭/恐慌體制"
+        regime_color = "inverse" # 醒目顯示
     else:
         regime_label = "🐂 多頭/正常體制"
         regime_color = "normal"
 
-    # 決定操作評語 (根據體制動態調整)
-    # 紅色 (Red) = 買進/強 ; 綠色 (Green) = 賣出/弱 (台股習慣)
-    txt = "中性觀望"
-    c_score = "gray"
+    # 生成 Alpha Score 評語與顏色 (紅漲綠跌邏輯)
+    txt = "中性觀望"; c_score = "gray"
     
     if score >= 60: 
         if is_panic_regime:
-            txt = "💎 危機入市 (黃金坑)" # 恐慌時的高分
+            txt = "💎 危機入市 (黃金坑)" # 恐慌時的高分 = 抄底
         else:
-            txt = "🚀 強力趨勢買進"     # 正常時的高分
-        c_score = "red" 
+            txt = "🚀 強力趨勢買進"     # 正常時的高分 = 順勢
+        c_score = "#ff5252" # 紅色
     elif score >= 20: 
         txt = "分批承接" if is_panic_regime else "偏多操作"
-        c_score = "#ef5350" # 淺紅
+        c_score = "#ff8a80" # 淺紅
     elif score <= -60: 
         txt = "崩盤迴避" if is_panic_regime else "強力賣出"
-        c_score = "green" 
+        c_score = "#69f0ae" # 綠色
     elif score <= -20: 
         txt = "保守觀望" if is_panic_regime else "偏空調節"
-        c_score = "#66bb6a" # 淺綠
+        c_score = "#b9f6ca" # 淺綠
 
-    # VIX 狀態描述
     vix_st = "極度恐慌" if vix>30 else ("恐慌警戒" if vix>20 else ("樂觀貪婪" if vix<15 else "正常波動"))
 
     # =========================================================
-    # 5. 繪製 Metrics
+    # 5. 顯示 Metrics (數據概覽)
     # =========================================================
     c1, c2, c3, c4 = st.columns(4)
     
-    # Col 1: 指數與體制
-    c1.metric("加權指數 / 市場體制", f"{last['Close']:.0f}", regime_label, delta_color="off")
-    
-    # Col 2: 市場情緒
+    c1.metric("加權指數 / 體制", f"{last['Close']:.0f}", regime_label, delta_color="off")
     c2.metric("市場情緒 (RSI)", f"{last['Market_RSI']:.1f}", "區間: 0~100", delta_color="off")
     
-    # Col 3: 恐慌指數
-    # 若 VIX 過高顯示紅色警示
+    # VIX 超過 25 變色警示
     vix_delta_color = "inverse" if vix > 25 else "off"
     c3.metric("恐慌指數 (VIX)", f"{vix:.2f}", vix_st, delta_color=vix_delta_color)
     
-    # Col 4: 買賣評等
-    # 使用我們動態生成的 txt 與顏色邏輯
-    st.markdown(
+    # Alpha Score 自定義樣式
+    c4.markdown(
         f"""
-        <div style="background-color: #1E1E1E; border: 1px solid #333; border-radius: 8px; padding: 10px; text-align: center;">
-            <div style="font-size: 0.8rem; color: #aaa;">買賣評等 (Alpha Score)</div>
-            <div style="font-size: 1.8rem; font-weight: bold; color: {c_score};">{score:.0f} 分</div>
-            <div style="font-size: 1rem; color: {c_score};">{txt}</div>
+        <div style="background-color: #262730; border: 1px solid #444; border-radius: 5px; padding: 5px 10px; text-align: center;">
+            <div style="font-size: 0.8rem; color: #ccc;">買賣評等 (Alpha)</div>
+            <div style="font-size: 1.5rem; font-weight: bold; color: {c_score};">{score:.0f} 分</div>
+            <div style="font-size: 0.9rem; color: {c_score};">{txt}</div>
         </div>
         """, 
         unsafe_allow_html=True
     )
 
     # =========================================================
-    # 6. AI 籌碼解讀 (維持原邏輯，確保變數接軌)
+    # 6. 顯示 AI 前瞻分析報告 (整合新模組)
+    # =========================================================
+    st.write("") # Spacer
+    st.markdown("### 📋 AI 戰情室前瞻分析")
+    
+    analysis_text = generate_market_analysis(plot_df, margin_df, short_df)
+    
+    # 根據體制改變邊框顏色，強化視覺提示
+    border_color = "#ff5252" if is_panic_regime else "#69f0ae"
+    
+    st.markdown(
+        f"""
+        <div style="border-left: 5px solid {border_color}; padding: 15px; background-color: #1E1E1E; border-radius: 5px;">
+            {analysis_text.replace('\n', '<br>')}
+        </div>
+        """, 
+        unsafe_allow_html=True
+    )
+    
+    # =========================================================
+    # 7. 顯示籌碼警示 (舊版邏輯保留作為輔助)
     # =========================================================
     if not margin_df.empty and not short_df.empty:
         try:
@@ -1011,7 +1120,7 @@ def draw_market_dashboard(market_df, start_date, end_date):
             s_c = short_df['TodayBalance'].iloc[-1]; s_p = short_df['TodayBalance'].iloc[-5]
             p_c = plot_df['Close'].iloc[-1]; p_p = plot_df['Close'].iloc[-5]
             
-            # 防呆：避免分母為0
+            # 防除以零
             if m_p == 0: m_p = 1
             if s_p == 0: s_p = 1
             if p_p == 0: p_p = 1
@@ -1022,30 +1131,26 @@ def draw_market_dashboard(market_df, start_date, end_date):
             if m_chg > 0.02 and p_chg < -0.02: msg = "⚠️ **籌碼警示** - 融資套牢，提防多殺多。"; typ="error"
             elif s_chg > 0.05 and p_chg > 0.02: msg = "🚀 **軋空訊號** - 空單被鎖，助漲多頭。"; typ="success"
             elif m_chg < -0.02 and p_chg > 0.02: msg = "💪 **籌碼安定** - 融資換手，籌碼流入安定手。"; typ="success"
-            elif m_chg < -0.03 and p_chg < -0.03: msg = "🐻 **清洗浮額** - 融資斷頭，留意止跌訊號。"; typ="warning"
-            else: msg = "⚖️ **籌碼觀望** - 資券變動不大。"; typ="info"
             
             if typ=="error": st.error(msg)
             elif typ=="success": st.success(msg)
-            elif typ=="warning": st.warning(msg)
-            else: st.info(msg)
-        except: st.metric("AI 籌碼解讀", "N/A", "資料計算錯誤", delta_color="off")
-    else: st.metric("AI 籌碼解讀", "N/A", "無法獲取資券資料", delta_color="off")
+        except: pass
 
     # =========================================================
-    # 7. 繪製圖表 (Plotly)
+    # 8. 繪製圖表 (Plotly)
     # =========================================================
-    fig = make_subplots(rows=8, cols=1, shared_xaxes=True, vertical_spacing=0.02, 
+    st.write("")
+    fig = make_subplots(rows=8, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
                         row_heights=[0.3, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
                         subplot_titles=("加權指數", "買賣評等 (Alpha Score)", "籌碼能量 (OBV)", "動能指標 (RSI)", "恐慌指數 (VIX)", "建議持股水位 (%)", "融資餘額", "融券餘額"))
     
-    # Row 1: 價格與均線
+    # Row 1: 價格
     fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['Close'], name='收盤價', line=dict(color='white')), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA20'], name='月線', line=dict(color='yellow', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA60'], name='季線', line=dict(color='rgba(255, 255, 255, 0.5)', width=1)), row=1, col=1)
     
-    # Row 2: Alpha Score Bar (修正顏色邏輯: 正分紅, 負分綠)
-    colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in plot_df['Alpha_Score']]
+    # Row 2: Alpha Score (紅漲綠跌)
+    colors_score = ['#ff5252' if v > 0 else '#69f0ae' for v in plot_df['Alpha_Score']]
     fig.add_trace(go.Bar(x=plot_df['Date'], y=plot_df['Alpha_Score'], name='評等', marker_color=colors_score), row=2, col=1)
     
     # Row 3: OBV
@@ -1056,24 +1161,22 @@ def draw_market_dashboard(market_df, start_date, end_date):
     fig.add_shape(type="line", x0=plot_df['Date'].min(), x1=plot_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=4, col=1)
     fig.add_shape(type="line", x0=plot_df['Date'].min(), x1=plot_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=4, col=1)
     
-    # Row 5: VIX (恐慌指數)
+    # Row 5: VIX (紅線警戒)
     fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['VIX'], name='VIX', line=dict(color='#ab47bc')), row=5, col=1)
-    # 加入 25 警戒線
     fig.add_shape(type="line", x0=plot_df['Date'].min(), x1=plot_df['Date'].max(), y0=25, y1=25, line=dict(color="red", dash="dash"), row=5, col=1)
     
-    # Row 6: 建議持股水位
+    # Row 6: 建議持股
     fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['Recommended_Position'], name='持股%', line=dict(color='#00e676'), fill='tozeroy'), row=6, col=1)
     
     # Row 7/8: 資券
     if not margin_df.empty: fig.add_trace(go.Scatter(x=margin_df['date'], y=margin_df['TodayBalance'], name='融資', line=dict(color='#ef5350'), fill='tozeroy'), row=7, col=1)
     if not short_df.empty: fig.add_trace(go.Scatter(x=short_df['date'], y=short_df['TodayBalance'], name='融券', line=dict(color='#26a69a'), fill='tozeroy'), row=8, col=1)
 
-    # Layout 設定
+    # 圖表設定
     fig.update_xaxes(range=[start_date, end_date])
-    fig.update_yaxes(side='right') # 統一右側座標軸
-    fig.update_yaxes(range=[-110, 110], row=2, col=1, side='right') # 評分固定範圍
-    fig.update_yaxes(range=[0, 100], row=6, col=1, side='right') # 持股水位固定 0-100%
-    
+    fig.update_yaxes(side='right')
+    fig.update_yaxes(range=[-110, 110], row=2, col=1, side='right')
+    fig.update_yaxes(range=[0, 100], row=6, col=1, side='right')
     fig.update_layout(height=1600, template="plotly_dark", margin=dict(l=50, r=50, t=60, b=40), hovermode="x unified", showlegend=False)
     
     st.plotly_chart(fig, use_container_width=True)
