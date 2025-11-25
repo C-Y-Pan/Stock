@@ -7,9 +7,19 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import pytz
+import sqlite3
+import hashlib
+import extra_streamlit_components as stx  # [新增] 引入 Cookie 套件
+from datetime import datetime, timedelta    # [新增] 用於設定過期時間
 
 # --- 頁面設定 ---
 st.set_page_config(page_title="量化投資決策系統 (Quant Pro v6.0)", layout="wide")
+
+# [新增] 初始化 Cookie 管理器
+def get_cookie_manager():
+    return stx.CookieManager()
+
+cookie_manager = get_cookie_manager()
 
 import sqlite3
 import hashlib
@@ -861,13 +871,27 @@ def draw_market_dashboard(market_df, start_date, end_date):
 # 前端介面
 # ==========================================
 with st.sidebar:
-    st.title("⚔️ 台股戰情室")
-    st.caption("Pro v6.0: AI-Alpha Edition")
-    # === [新增] 用戶登入系統 ===
+    st.title("⚔️ 機構戰情室")
+    
+    # ==========================================
+    # [升級版] 登入系統 (含 Cookie 自動記憶)
+    # ==========================================
+    
+    # 1. 嘗試從 Cookie 獲取使用者 (自動登入關鍵)
+    cookie_user = cookie_manager.get(cookie="invest_user")
+    
+    # 初始化 Session
     if 'logged_in' not in st.session_state:
         st.session_state['logged_in'] = False
         st.session_state['username'] = ''
 
+    # 如果 Cookie 有值，且尚未登入 Session，則執行自動登入
+    if cookie_user and not st.session_state['logged_in']:
+        st.session_state['logged_in'] = True
+        st.session_state['username'] = cookie_user
+        # 不用 rerun，讓它自然往下執行即可
+
+    # 2. 登入/註冊介面
     if not st.session_state['logged_in']:
         st.info("🔒 請登入以啟用雲端儲存")
         choice = st.selectbox("功能", ["登入", "註冊新帳號"])
@@ -878,8 +902,14 @@ with st.sidebar:
         if choice == "登入":
             if st.button("登入"):
                 if login_user(user, passwd):
+                    # A. 設定 Session
                     st.session_state['logged_in'] = True
                     st.session_state['username'] = user
+                    
+                    # B. 寫入 Cookie (設定 30 天後過期)
+                    expires = datetime.now() + timedelta(days=30)
+                    cookie_manager.set("invest_user", user, expires_at=expires)
+                    
                     st.success("登入成功！")
                     st.rerun()
                 else:
@@ -891,16 +921,24 @@ with st.sidebar:
                 else:
                     st.error("此帳號已被使用")
         
-        st.warning("訪客模式：資料僅暫存於記憶體，重整後將消失。")
+        st.warning("訪客模式：資料僅暫存，刷新後消失。")
         st.markdown("---")
+        
     else:
+        # 3. 已登入狀態
         st.success(f"👤 歡迎, {st.session_state['username']}")
+        
         if st.button("登出"):
+            # A. 刪除 Cookie
+            cookie_manager.delete("invest_user")
+            
+            # B. 清除 Session
             st.session_state['logged_in'] = False
             st.session_state['username'] = ''
             st.rerun()
+            
         st.markdown("---")
-
+        
     # [修改] 加入 "💼 持股健診與建議"
     page = st.radio("導航", ["🌍 市場總覽 (Macro)", "📊 單股深度分析", "🚀 科技股掃描", "💼 持股健診與建議", "📋 全台股清單"])
     st.markdown("---")
