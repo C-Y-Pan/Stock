@@ -2136,23 +2136,40 @@ elif page == "💼 持股健診與建議":
         if enable_monitor and portfolio_results: # 只有在啟動監控且有資料時才檢查
             now = datetime.now()
             # 檢查是否超過 10 分鐘
+        if enable_monitor and portfolio_results: # 只有在啟動監控且有資料時才檢查
+            now = datetime.now()
+            
+            # 檢查是否超過 10 分鐘
             if (now - st.session_state['last_email_time']) > timedelta(minutes=10):
                 
-                # 準備數據
+                # 1. 準備持股分析表格數據
                 res_df = pd.DataFrame(portfolio_results)
-                # 這裡我們需要重新生成一次市場分析文字供 Email 使用 (或是您可以傳入)
-                analysis_html_for_email = generate_market_analysis(final_df, pd.DataFrame(), pd.DataFrame()) # 簡化傳入，或是您需要把完整的 plot_df 傳進來
                 
-                # 執行發送
+                # 2. [關鍵修正] 準備「大盤市場分析」數據
+                # 我們不能直接傳 final_df (那是個股)，要用全域變數 market_df (大盤)
+                # 並且要先計算大盤的 Alpha Score
+                try:
+                    # 確保 market_df 存在 (由外部傳入或全域變數)
+                    # 為了寄信速度，這裡籌碼面傳空值即可，主要看技術面與 VIX
+                    market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
+                    
+                    # 生成市場前瞻分析文字 (HTML格式)
+                    analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
+                except Exception as e:
+                    print(f"市場分析生成失敗: {e}")
+                    analysis_html_for_email = "<p>暫無法獲取市場分析數據</p>"
+                
+                # 3. 執行發送
                 with st.spinner("📧 正在發送定時報告..."):
-                    success = send_analysis_email(res_df, "請參考即時儀表板之詳細分析") 
+                    # 將「持股列表」與「大盤分析」一起傳入
+                    success = send_analysis_email(res_df, analysis_html_for_email) 
                     
                 if success:
                     st.session_state['last_email_time'] = now
                     st.toast(f"✅ 已於 {now.strftime('%H:%M')} 發送分析報告信件！")
                 else:
                     st.toast("❌ Email 發送失敗，請檢查後台 Log", icon="⚠️")
-
+                    
         # 顯示結果
         if portfolio_results:
             res_df = pd.DataFrame(portfolio_results)
