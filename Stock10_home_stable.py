@@ -874,8 +874,32 @@ def calculate_alpha_score(df, margin_df, short_df):
 # ==========================================
 def draw_market_dashboard(market_df, start_date, end_date):
     st.markdown("### 🌍 總體市場戰情 (Macro)")
-    target_start = pd.to_datetime(start_date); plot_df = market_df[market_df['Date'] >= target_start].copy()
-    if plot_df.empty: st.error("無大盤數據"); return
+    target_start = pd.to_datetime(start_date)
+    plot_df = market_df[market_df['Date'] >= target_start].copy()
+    
+    if plot_df.empty: 
+        st.error("無大盤數據")
+        return
+    
+    # =========================================================
+    # [修正] 欄位映射：將 Market_XXX 映射為通用名稱，供 Alpha Score 計算使用
+    # =========================================================
+    if 'Market_RSI' in plot_df.columns:
+        plot_df['RSI'] = plot_df['Market_RSI']
+    else:
+        plot_df['RSI'] = 50 # 防呆預設值
+
+    if 'Market_MA20' in plot_df.columns:
+        plot_df['MA20'] = plot_df['Market_MA20']
+        
+    if 'Market_MA60' in plot_df.columns:
+        plot_df['MA60'] = plot_df['Market_MA60']
+
+    # 補算成交量均線 (若大盤資料未計算)
+    if 'Volume' in plot_df.columns:
+        plot_df['Vol_MA20'] = plot_df['Volume'].rolling(20).mean()
+
+    # =========================================================
     
     # 獲取 FinMind 數據
     margin_df_raw = get_margin_data(start_date.strftime('%Y-%m-%d'))
@@ -884,7 +908,10 @@ def draw_market_dashboard(market_df, start_date, end_date):
         sliced = margin_df_raw[(margin_df_raw['date'] >= target_start) & (margin_df_raw['date'] <= pd.to_datetime(end_date))]
         margin_df = sliced[sliced['name'] == 'MarginPurchaseMoney']; short_df = sliced[sliced['name'] == 'ShortSale']
     
+    # 現在 plot_df 已經有 'RSI', 'MA20', 'MA60' 等欄位，計算不會報錯了
     plot_df = calculate_alpha_score(plot_df, margin_df, short_df)
+    
+    # ... (後續繪圖程式碼保持不變) ...
     last = plot_df.iloc[-1]; score = last['Alpha_Score']; vix = last['VIX']
     
     if score >= 60: txt="強力買進"; c_score="green"
