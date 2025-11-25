@@ -6,4 +6,3 @@ requests
 plotly
 matplotlib
 extra-streamlit-components
-streamlit --upgrade
