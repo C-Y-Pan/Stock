@@ -1253,94 +1253,105 @@ if page == "🌍 市場總覽 (Macro)":
 # --- 頁面 2 (手機介面優化版): 單股深度分析 ---
 elif page == "📊 單股深度分析":
     # ==================================================
-    # 1. 資料準備：建立搜尋清單 (代號 + 中文名稱)
+    # 1. 資料準備
     # ==================================================
     if st.session_state['all_stock_list'] is None:
         st.session_state['all_stock_list'] = get_master_stock_data()
     
     df_all = st.session_state['all_stock_list']
     
-    # 建立 "代號 名稱" 的格式清單
+    # 建立搜尋清單
     search_list = [f"{row['代號']} {row['名稱']}" for idx, row in df_all.iterrows()]
     base_search_list = [f"{k} {v}" for k, v in TW_STOCK_NAMES_STATIC.items()]
     full_search_options = sorted(list(set(search_list + base_search_list)))
 
-    # ==================================================
-    # [Step 3] 導航介面優化：修正按鈕無效問題
-    # ==================================================
-    
-    # 1. 確保 last_ticker 有初始值
+    # 確保 last_ticker 有值
     if 'last_ticker' not in st.session_state:
         st.session_state['last_ticker'] = "2330"
 
-    # 2. 找出當前 ticker 對應的清單索引 (Index)
-    # 這是為了讓 selectbox 預設選中正確的位置
-    current_ticker = st.session_state['last_ticker']
-    current_index = 0
+    # ==================================================
+    # [KEY FIX] 定義按鈕的回調函數 (Callback)
+    # 這段函數會在按鈕點擊後、頁面重繪前執行，解決報錯問題
+    # ==================================================
+    def change_stock_selection(direction):
+        # 1. 取得當前選單的值
+        current_val = st.session_state.get('stock_selector', full_search_options[0])
+        
+        # 2. 找出當前索引
+        try:
+            current_idx = full_search_options.index(current_val)
+        except:
+            current_idx = 0
+            
+        # 3. 計算新索引
+        new_idx = (current_idx + direction) % len(full_search_options)
+        new_option = full_search_options[new_idx]
+        
+        # 4. 更新 Session State (這時候更新是合法的)
+        st.session_state['stock_selector'] = new_option
+        st.session_state['last_ticker'] = new_option.split(" ")[0]
+
+    # ==================================================
+    # 2. 介面佈局
+    # ==================================================
     
-    # 比對目前的 ticker 是清單中的哪一個
+    # 找出當前 ticker 對應的 index (為了初始顯示正確)
+    current_ticker = st.session_state['last_ticker']
+    current_index_gui = 0
     for idx, opt in enumerate(full_search_options):
         if opt.startswith(str(current_ticker)):
-            current_index = idx
+            current_index_gui = idx
             break
 
-    # --- Row 1: 搜尋與確認 ---
+    # --- Row 1: 搜尋與 Go 按鈕 ---
     with st.container():
         col_search, col_run = st.columns([3, 1])
         
         with col_search:
-            # 這裡的 key='stock_selector' 會自動綁定 session_state
-            # 注意：index 參數只有在 key 尚未存在於 session_state 時才有效，
-            # 所以後面的按鈕邏輯必須強制更新 session_state['stock_selector']
-            selected_option = st.selectbox(
+            # Selectbox
+            # 注意：這裡不用再寫 index=...，因為我們綁定了 key，Streamlit 會自動優先使用 session_state['stock_selector']
+            # 若 session_state 還沒這個 key，我們可以手動初始化它
+            if 'stock_selector' not in st.session_state:
+                st.session_state['stock_selector'] = full_search_options[current_index_gui]
+
+            st.selectbox(
                 "搜尋股票 (支援代號或中文)",
                 options=full_search_options,
-                index=current_index,
                 label_visibility="collapsed",
                 key="stock_selector" 
             )
             
         with col_run:
+            # Go 按鈕 (這裡不需要 callback，因為它是讀取 selectbox 的值)
             if st.button("Go", type="primary", use_container_width=True):
-                new_ticker = selected_option.split(" ")[0]
-                st.session_state['last_ticker'] = new_ticker
+                # 讀取使用者在選單選的值
+                selected = st.session_state['stock_selector']
+                st.session_state['last_ticker'] = selected.split(" ")[0]
                 st.rerun()
 
-    # --- Row 2: 大拇指導航區 (修正版) ---
+    # --- Row 2: 上一檔 / 下一檔 (使用 on_click) ---
     col_prev, col_next = st.columns([1, 1])
     
     with col_prev:
-        if st.button("◀ 上一檔", use_container_width=True):
-            new_index = (current_index - 1) % len(full_search_options)
-            new_option = full_search_options[new_index]
-            
-            # [KEY FIX] 同步更新 ticker 與 selectbox 的狀態
-            st.session_state['last_ticker'] = new_option.split(" ")[0]
-            st.session_state['stock_selector'] = new_option # 強制更新下拉選單顯示
-            st.rerun()
+        # args=(-1,) 代表傳入參數 -1 給 change_stock_selection
+        st.button("◀ 上一檔", use_container_width=True, on_click=change_stock_selection, args=(-1,))
 
     with col_next:
-        if st.button("下一檔 ▶", use_container_width=True):
-            new_index = (current_index + 1) % len(full_search_options)
-            new_option = full_search_options[new_index]
-            
-            # [KEY FIX] 同步更新 ticker 與 selectbox 的狀態
-            st.session_state['last_ticker'] = new_option.split(" ")[0]
-            st.session_state['stock_selector'] = new_option # 強制更新下拉選單顯示
-            st.rerun()
+        # args=(1,) 代表傳入參數 1
+        st.button("下一檔 ▶", use_container_width=True, on_click=change_stock_selection, args=(1,))
 
     # ==================================================
-    # 2. 自動執行分析邏輯
+    # 3. 確保 ticker同步 與 執行分析
     # ==================================================
     
-    # 確保邏輯：優先使用 selectbox 的選擇 (若使用者直接操作下拉選單)
+    # 如果使用者手動更改了下拉選單但沒按 Go，我們也在這裡同步變數
     if 'stock_selector' in st.session_state:
-        selected_code = st.session_state['stock_selector'].split(" ")[0]
-        if selected_code != st.session_state['last_ticker']:
-             st.session_state['last_ticker'] = selected_code
+        sel_val = st.session_state['stock_selector'].split(" ")[0]
+        if sel_val != st.session_state['last_ticker']:
+             st.session_state['last_ticker'] = sel_val
 
     ticker_input = st.session_state['last_ticker']
-
+    
     if ticker_input: 
         with st.spinner(f'正在分析 {ticker_input} ...'):
             current_fee = fee_input if 'fee_input' in locals() else 0.001425
@@ -1592,7 +1603,7 @@ elif page == "📊 單股深度分析":
                         st.plotly_chart(fig_val, use_container_width=True)
                     else:
                         st.warning("數據不足，無法執行樣本外驗證。")
-                        
+
 # --- 頁面 3 (修正版): 科技股/熱門股掃描 ---
 elif page == "🚀 科技股掃描":
     st.markdown(f"### 🚀 戰略雷達：全市場機會掃描")
