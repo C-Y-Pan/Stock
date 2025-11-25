@@ -1077,71 +1077,90 @@ if page == "🌍 市場總覽 (Macro)":
 # --- 頁面 2 (手機介面優化版): 單股深度分析 ---
 elif page == "📊 單股深度分析":
     # ==================================================
-    # 1. 資料準備與索引定位
+    # 1. 資料準備：建立搜尋清單 (代號 + 中文名稱)
     # ==================================================
     if st.session_state['all_stock_list'] is None:
         st.session_state['all_stock_list'] = get_master_stock_data()
     
-    # 取得排序後的所有代號列表 (含上市櫃 + 靜態清單)
     df_all = st.session_state['all_stock_list']
-    all_tickers = sorted(df_all['代號'].astype(str).tolist())
-    base_tickers = list(TW_STOCK_NAMES_STATIC.keys())
-    all_tickers = sorted(list(set(all_tickers + base_tickers)))
-
-    # 定位當前股票索引
-    current_ticker_clean = st.session_state['last_ticker'].split('.')[0]
-    try:
-        current_index = all_tickers.index(current_ticker_clean)
-    except ValueError:
-        current_index = 0 
-
-    # ==================================================
-    # [Step 3] 導航介面優化：手指友善版 (Finger-Friendly)
-    # ==================================================
-    # 設計思路：
-    # 手機畫面窄，為了好按，將 "搜尋" 與 "切換" 分成上下兩層。
-    # 上層：輸入框 + Go 按鈕
-    # 下層：上一檔 + 下一檔 (並排顯示)
     
-    # --- Row 1: 搜尋與確認 ---
+    # 建立 "代號 名稱" 的格式清單 (例如: "2330 台積電")
+    # 這樣使用者在搜尋框打 "2330" 或 "台積電" 都能篩選到
+    search_list = [f"{row['代號']} {row['名稱']}" for idx, row in df_all.iterrows()]
+    
+    # 確保基本清單 (靜態清單) 也在裡面，避免 API 失敗時完全無法運作
+    base_search_list = [f"{k} {v}" for k, v in TW_STOCK_NAMES_STATIC.items()]
+    # 合併並去重排序
+    full_search_options = sorted(list(set(search_list + base_search_list)))
+
+    # ==================================================
+    # [Step 3] 導航介面優化：支援中文名稱搜尋
+    # ==================================================
+    
+    # 1. 找出當前 Session 中 'last_ticker' 對應的選項索引
+    current_ticker = st.session_state['last_ticker']
+    current_index = 0
+    
+    # 嘗試在清單中找到目前選中的股票 (比對字串開頭是否為代號)
+    for idx, opt in enumerate(full_search_options):
+        if opt.startswith(str(current_ticker)):
+            current_index = idx
+            break
+
+    # --- Row 1: 搜尋與確認 (使用 selectbox 取代 text_input) ---
     with st.container():
         col_search, col_run = st.columns([3, 1])
+        
         with col_search:
-            # 使用 callback 或 value 綁定
-            ticker_input_val = st.text_input(
-                "輸入股票代號", 
-                key="last_ticker_input", 
-                value=st.session_state['last_ticker'], 
-                label_visibility="collapsed", 
-                placeholder="輸入代號 (如 2330)"
+            # [核心修改] 使用 selectbox 達成可搜尋中文與代號
+            selected_option = st.selectbox(
+                "搜尋股票 (支援代號或中文)",
+                options=full_search_options,
+                index=current_index,
+                label_visibility="collapsed",
+                key="stock_selector" # 設定 key 避免重繪問題
             )
+            
         with col_run:
-            # 加大按鈕寬度，方便點擊
             if st.button("Go", type="primary", use_container_width=True):
-                st.session_state['last_ticker'] = ticker_input_val
+                # 從選項 "2330 台積電" 中切割出 "2330"
+                new_ticker = selected_option.split(" ")[0]
+                st.session_state['last_ticker'] = new_ticker
                 st.rerun()
 
     # --- Row 2: 大拇指導航區 (上一檔 / 下一檔) ---
-    # 使用 columns([1, 1]) 確保手機上這兩個按鈕是「並排」而不是「堆疊」
     col_prev, col_next = st.columns([1, 1])
     
     with col_prev:
         if st.button("◀ 上一檔", use_container_width=True):
-            new_index = (current_index - 1) % len(all_tickers)
-            st.session_state['last_ticker'] = all_tickers[new_index]
+            new_index = (current_index - 1) % len(full_search_options)
+            # 取出新選項的代號部分
+            new_ticker = full_search_options[new_index].split(" ")[0]
+            st.session_state['last_ticker'] = new_ticker
             st.rerun()
 
     with col_next:
         if st.button("下一檔 ▶", use_container_width=True):
-            new_index = (current_index + 1) % len(all_tickers)
-            st.session_state['last_ticker'] = all_tickers[new_index]
+            new_index = (current_index + 1) % len(full_search_options)
+            # 取出新選項的代號部分
+            new_ticker = full_search_options[new_index].split(" ")[0]
+            st.session_state['last_ticker'] = new_ticker
             st.rerun()
 
     # ==================================================
-    # 2. 自動執行分析邏輯
+    # 2. 自動執行分析邏輯 (更新 ticker_input 來源)
     # ==================================================
-    ticker_input = st.session_state['last_ticker']
     
+    # 確保 ticker_input 與上方選擇同步
+    # 如果使用者剛剛選了下拉選單但沒按 Go，我們還是即時更新變數
+    if 'stock_selector' in st.session_state:
+        selected_code = st.session_state['stock_selector'].split(" ")[0]
+        # 如果選擇變了，更新 last_ticker
+        if selected_code != st.session_state['last_ticker']:
+             st.session_state['last_ticker'] = selected_code
+
+    ticker_input = st.session_state['last_ticker']
+
     if ticker_input: 
         # 只有當沒有快取資料或強制刷新時才顯示 spinner
         # 這裡為了流暢度，我們簡單用 spinner 包住
