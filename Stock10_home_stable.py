@@ -2146,11 +2146,6 @@ elif page == "💼 持股健診與建議":
         # ==========================================
         # [新增] 自動寄信邏輯
         # ==========================================
-        if enable_monitor and portfolio_results: # 只有在啟動監控且有資料時才檢查
-            now = datetime.now()
-            # 檢查是否超過 10 分鐘
-        if enable_monitor and portfolio_results: # 只有在啟動監控且有資料時才檢查
-            now = datetime.now()
             
         # 初始化：用於記錄上次寄出時的各股分數狀態
         # 結構範例: {'2330': 60, '2317': 45}
