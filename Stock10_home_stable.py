@@ -1133,293 +1133,230 @@ elif page == "📊 單股深度分析":
                 best_params, final_df = run_optimization(raw_df, market_df, start_date, current_fee, current_tax)
                 validation_result = validate_strategy_robust(raw_df, market_df, 0.7, current_fee, current_tax)
 
-            if final_df is None or final_df.empty:
-                st.warning("⚠️ 選定區間內無資料。")
-            else:
-                # ==========================================
-                # 1. 執行 Alpha 評分與演算歷程提取
-                # ==========================================
-                # 傳入空 DataFrame 以忽略籌碼面(除非有額外獲取個股資券)，專注於技術與趨勢面
-                stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
-                
-                # 提取基礎分數與日誌
-                base_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-                base_log = stock_alpha_df['Score_Log'].iloc[-1]
-                
-                # ==========================================
-                # 2. 執行情境感知調整 (Context-Aware Adjustment)
-                # ==========================================
-                adjusted_score = base_score
-                adjustment_log = ""
-                
-                current_price = final_df['Close'].iloc[-1]
-                ma20 = final_df['MA20'].iloc[-1]
-                ma60 = final_df['MA60'].iloc[-1]
-                rsi_now = final_df['RSI'].iloc[-1]
-                rsi_prev = final_df['RSI'].iloc[-2]
-                
-                # 判斷最後一次訊號理由，識別策略屬性
-                last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
-                is_rebound_strategy = False
-                if last_trade is not None:
-                    buy_reason = str(last_trade['Reason'])
-                    if any(x in buy_reason for x in ["反彈", "超賣", "回測", "低檔"]):
-                        is_rebound_strategy = True
-
-                # 取得當前建議動作
-                action, color, reason = analyze_signal(final_df)
-
-                # 針對「買進/續抱」狀態進行加權修正
-                if action == "✊ 續抱" or action == "🚀 買進":
-                    if is_rebound_strategy:
-                        # 情境 A: 反彈策略 (容許破季線，重視短期動能)
-                        if current_price < ma60: 
-                            adjusted_score += 15
-                            adjustment_log += "[反彈位階修正+15]"
-                        
-                        # 檢查 RSI 是否轉強
-                        if rsi_now > rsi_prev:
-                            adjusted_score += 10
-                            adjustment_log += "[RSI翻揚+10]"
-                        
-                        # 檢查是否站上 5 日線 (模擬)
-                        ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
-                        if current_price > ma5:
-                            adjusted_score += 10
-                            adjustment_log += "[站穩MA5+10]"
-                    else:
-                        # 情境 B: 趨勢策略 (重視均線排列)
-                        if current_price > ma20 and ma20 > ma60:
-                            adjusted_score += 10
-                            adjustment_log += "[多頭排列+10]"
-                        
-                        if final_df['Volume'].iloc[-1] > final_df['Vol_MA20'].iloc[-1]:
-                            adjusted_score += 5
-                            adjustment_log += "[量增+5]"
-
-                # 限制分數範圍 (-100 ~ 100)
-                final_composite_score = max(min(adjusted_score, 100), -100)
-                
-                # 組合最終顯示日誌
-                full_log_text = f"{base_log} {adjustment_log}" if base_log or adjustment_log else "無顯著特徵"
-
-                # ==========================================
-                # 3. 計算其餘績效指標
-                # ==========================================
-                beta, vol, personality = calculate_stock_personality(final_df, market_df)
-                hit_rate, hits, total = calculate_target_hit_rate(final_df)
-                real_win_rate, real_wins, real_total, avg_pnl = calculate_realized_win_rate(final_df)
-                risk_metrics = calculate_risk_metrics(final_df)
-                
-                # 存入 Session State (快取用)
-                st.session_state['analysis_history'][fmt_ticker] = {
-                    'df': final_df, 'params': best_params, 'action': action,
-                    'reason': reason, 'beta': beta, 'vol': vol, 'personality': personality,
-                    'name': name, 
-                    'hit_rate': hit_rate, 'hits': hits, 'total_trades': total,
-                    'real_win_rate': real_win_rate, 'real_wins': real_wins, 'real_total': real_total, 'avg_pnl': avg_pnl,
-                    'risk': risk_metrics,
-                    'validation': validation_result,
-                    'alpha_score': final_composite_score, # 新增
-                    'score_log': full_log_text            # 新增
-                }
-
-                # ==========================================
-                # 4. 前端介面顯示
-                # ==========================================
-                # --- (A) 標題與 AI 評分區塊 ---
-                st.markdown(f"## {ticker_input} {name}")
-                st.caption(f"策略邏輯: {reason} | 波動率: {vol}")
-
-                # 建立評分專屬面板
-                st.markdown("### 🏆 AI 綜合評分與決策依據")
-                score_col, log_col = st.columns([1, 3])
-                
-                with score_col:
-                    # 動態顏色設定
-                    s_color = "normal"
-                    if final_composite_score >= 60: s_color = "off" 
-                    elif final_composite_score <= -20: s_color = "inverse"
+                if final_df is None or final_df.empty:
+                    st.warning("⚠️ 選定區間內無資料。")
+                else:
+                    # 計算各項指標
+                    beta, vol, personality = calculate_stock_personality(final_df, market_df)
+                    action, color, reason = analyze_signal(final_df)
+                    hit_rate, hits, total = calculate_target_hit_rate(final_df)
+                    real_win_rate, real_wins, real_total, avg_pnl = calculate_realized_win_rate(final_df)
+                    risk_metrics = calculate_risk_metrics(final_df)
                     
-                    st.metric(
-                        label="綜合評分 (Alpha Score)",
-                        value=f"{int(final_composite_score)} 分",
-                        delta=action,
-                        delta_color=s_color
-                    )
-                
-                with log_col:
-                    st.info(f"**🧮 演算歷程解析：**\n\n{full_log_text}")
+                    # 存入 Session
+                    st.session_state['analysis_history'][fmt_ticker] = {
+                        'df': final_df, 'params': best_params, 'action': action,
+                        'reason': reason, 'beta': beta, 'vol': vol, 'personality': personality,
+                        'name': name, 
+                        'hit_rate': hit_rate, 'hits': hits, 'total_trades': total,
+                        'real_win_rate': real_win_rate, 'real_wins': real_wins, 'real_total': real_total, 'avg_pnl': avg_pnl,
+                        'risk': risk_metrics,
+                        'validation': validation_result
+                    }
 
-                # --- (B) 核心績效數據矩陣 ---
-                strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
-                strat_ret = best_params['Return'] * 100
-
-                # Row 1: 獲利能力 & 勝率
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("淨報酬 (含成本)", f"{strat_ret:.1f}%", f"MDD: {strat_mdd:.1f}%")
-                m2.metric("實際勝率 (Realized)", real_win_rate, f"{real_wins}勝 / {real_total}總")
-                m3.metric("目標達成率 (Target)", hit_rate, f"{hits}次達標 (+15%)")
-                m4.metric("盈虧因子 (PF)", f"{risk_metrics.get('Profit_Factor', 0):.2f}", f"夏普: {risk_metrics.get('Sharpe', 0):.2f}")
-
-                # ==========================================
-                # 5. Tabs 繪圖區
-                # ==========================================
-                tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
-                
-                # [Tab 1: K線圖]
-                with tab1:
-                    # 建立子圖
-                    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
-                                        row_heights=[0.5, 0.15, 0.15, 0.20], 
-                                        subplot_titles=("", "成交量", "法人籌碼 (OBV)", "相對強弱指標 (RSI)"))
+    # ==================================================
+    # [Step 4] 數據顯示優化：Grid Layout (避免手機堆疊)
+    # ==================================================
+    current_ticker = st.session_state['last_ticker']
+    possible_keys = [k for k in st.session_state['analysis_history'].keys() if current_ticker in k]
+    
+    if possible_keys:
+        data = st.session_state['analysis_history'][possible_keys[0]]
+        final_df = data['df']
+        risk = data.get('risk', {})
+        
+        strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
+        strat_ret = data['params']['Return'] * 100
+        
+        st.markdown(f"## {possible_keys[0]} {data['name']}")
+        st.caption(f"策略邏輯: {data['reason']} | 波動率: {data['vol']}")
+        
+        # --- 使用 2x2 網格取代 1x5 排列 ---
+        
+        # Row A: 核心建議 & 獲利能力
+        ma_1, ma_2 = st.columns(2)
+        ma_1.metric("策略建議", data['action'], data['reason'])
+        ma_2.metric("淨報酬 (含成本)", f"{strat_ret:.1f}%", f"MDD: {strat_mdd:.1f}%")
+        
+        # Row B: 勝率 & 風險指標
+        mb_1, mb_2 = st.columns(2)
+        mb_1.metric("實際勝率", data.get('real_win_rate', '0%'), f"{data.get('real_wins', 0)}勝")
+        mb_2.metric("夏普值 (Sharpe)", f"{risk.get('Sharpe', 0):.2f}", f"PF: {risk.get('Profit_Factor', 0):.2f}")
+        
+        # Row C: 目標達成率 (單獨一行顯示)
+        st.metric("目標觸及率 (Target Hit)", data['hit_rate'], f"{data['hits']}/{data['total_trades']} 次 (目標+15%)")
+        
+        # ==================================================
+        # Tabs 繪圖區 (內容保持不變，僅恢復結構)
+        # ==================================================
+        tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
+        
+# [Tab 1: K線圖與詳細註記]
+        with tab1:
+            # 建立子圖架構
+            fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
+                                row_heights=[0.5, 0.15, 0.15, 0.20], 
+                                subplot_titles=("", "成交量", "法人籌碼 (OBV)", "相對強弱指標 (RSI)"))
             
-                    # 主圖 K 線
-                    fig.add_trace(go.Candlestick(
-                        x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
-                        low=final_df['Low'], close=final_df['Close'], name='K線',
-                        increasing_line_color='#ef5350', decreasing_line_color='#00bfa5' 
-                    ), row=1, col=1)
-                    
-                    # 均線
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', 
-                                            line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
-                                            line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
+            # --- 1. K線圖 (紅漲綠跌) ---
+            fig.add_trace(go.Candlestick(
+                x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
+                low=final_df['Low'], close=final_df['Close'], name='K線',
+                increasing_line_color='#ef5350', decreasing_line_color='#00bfa5' 
+            ), row=1, col=1)
+            
+            # 均線與指標
+            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', 
+                                     line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
+            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
+                                     line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # 買賣點標記函式
-                    final_df['Buy_Y'] = final_df['Low'] * 0.92
-                    final_df['Sell_Y'] = final_df['High'] * 1.08
+            # --- 2. 買賣點標記與理由註記 ---
+            final_df['Buy_Y'] = final_df['Low'] * 0.92 # 買點標記位置 (K線下方)
+            final_df['Sell_Y'] = final_df['High'] * 1.08 # 賣點標記位置 (K線上方)
 
-                    def get_buy_text(sub_df):
-                        # 在圖表上顯示該次買進時的信心分數
-                        return [f"<b>{score}</b>" for score in sub_df['Confidence']]
+            # 輔助函式：產生「信心分數 + 理由」的文字
+            # 為了避免圖表太亂，買進我們顯示「信心值」，顏色代表「理由」
+            def get_buy_text(sub_df):
+                return [f"<b>{score}</b>" for score in sub_df['Confidence']]
 
-                    def get_sell_text(sub_df):
-                        labels = []
-                        for idx, row in sub_df.iterrows():
-                            ret = row['Return_Label']
-                            reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
-                            labels.append(f"{ret}<br>({reason_str})")
-                        return labels
+            # 輔助函式：產生「報酬率 + 簡短理由」的文字
+            def get_sell_text(sub_df):
+                labels = []
+                for idx, row in sub_df.iterrows():
+                    ret = row['Return_Label']
+                    reason = row['Reason']
+                    # 簡化理由文字以節省空間
+                    short_reason = reason.replace("觸發", "").replace("操作", "")
+                    labels.append(f"{ret}<br>({short_reason})") # 使用 <br> 換行
+                return labels
 
-                    # 繪製不同類型的買點
-                    # A. 趨勢/突破
-                    buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
-                    if not buy_trend.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_trend), textposition="bottom center",
-                            textfont=dict(color='#FFD700', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), 
-                            name='買進 (趨勢)', hovertext=buy_trend['Reason']
-                        ), row=1, col=1)
-                    
-                    # B. 反彈/超賣
-                    buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
-                    if not buy_panic.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_panic), textposition="bottom center",
-                            textfont=dict(color='#00FFFF', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), 
-                            name='買進 (反彈)', hovertext=buy_panic['Reason']
-                        ), row=1, col=1)
-                    
-                    # C. 籌碼/佈局
-                    buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
-                    if not buy_chip.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_chip), textposition="bottom center",
-                            textfont=dict(color='#DDA0DD', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), 
-                            name='買進 (籌碼)', hovertext=buy_chip['Reason']
-                        ), row=1, col=1)
+            # [買進 A] 動能突破/回測 (金黃色 Triangle)
+            buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
+            if not buy_trend.empty:
+                fig.add_trace(go.Scatter(
+                    x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text',
+                    text=get_buy_text(buy_trend), textposition="bottom center",
+                    textfont=dict(color='#FFD700', size=11),
+                    marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), 
+                    name='買進 (趨勢)', hovertext=buy_trend['Reason']
+                ), row=1, col=1)
+            
+            # [買進 B] 超賣反彈 (青色 Triangle)
+            buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
+            if not buy_panic.empty:
+                fig.add_trace(go.Scatter(
+                    x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text',
+                    text=get_buy_text(buy_panic), textposition="bottom center",
+                    textfont=dict(color='#00FFFF', size=11),
+                    marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), 
+                    name='買進 (反彈)', hovertext=buy_panic['Reason']
+                ), row=1, col=1)
+            
+            # [買進 C] 籌碼佈局 (淡紫色 Triangle)
+            buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
+            if not buy_chip.empty:
+                fig.add_trace(go.Scatter(
+                    x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text',
+                    text=get_buy_text(buy_chip), textposition="bottom center",
+                    textfont=dict(color='#DDA0DD', size=11),
+                    marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), 
+                    name='買進 (籌碼)', hovertext=buy_chip['Reason']
+                ), row=1, col=1)
 
-                    # 賣出點
-                    sell_all = final_df[final_df['Action'] == 'Sell']
-                    if not sell_all.empty:
-                        fig.add_trace(go.Scatter(
-                            x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', 
-                            text=get_sell_text(sell_all), textposition="top center",
-                            textfont=dict(color='white', size=11),
-                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), 
-                            name='賣出', hovertext=sell_all['Reason']
-                        ), row=1, col=1)
-                    
-                    # 副圖
-                    colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=3, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=4, col=1)
-                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=4, col=1)
-                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=4, col=1)
-                    
-                    fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
-                                      legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
-                    st.plotly_chart(fig, use_container_width=True)
-                    
-                # [Tab 2: 權益曲線]
-                with tab2:
-                    fig_c = go.Figure()
-                    fig_c.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Cum_Market'], name='大盤', line=dict(color='gray', dash='dot')))
-                    fig_c.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Cum_Strategy'], name='策略淨值', line=dict(color='#ef5350', width=2), fill='tozeroy'))
-                    
-                    buy_pts = final_df[final_df['Action']=='Buy']
-                    sell_pts = final_df[final_df['Action']=='Sell']
-                    if not buy_pts.empty:
-                        fig_c.add_trace(go.Scatter(x=buy_pts['Date'], y=buy_pts['Cum_Strategy'], mode='markers', marker=dict(symbol='triangle-up', size=10, color='#FFD700'), name='買進'))
-                    if not sell_pts.empty:
-                        fig_c.add_trace(go.Scatter(x=sell_pts['Date'], y=sell_pts['Cum_Strategy'], mode='markers', marker=dict(symbol='triangle-down', size=10, color='#FF00FF'), name='賣出'))
-                        
-                    fig_c.update_layout(template="plotly_dark", height=450, title="策略權益成長曲線", margin=dict(l=10, r=10, t=40, b=10))
-                    st.plotly_chart(fig_c, use_container_width=True)
-                    
-                # [Tab 3: 蒙地卡羅]
-                with tab3:
-                    st.markdown("### 🎲 蒙地卡羅風險模擬")
-                    last_p = final_df['Close'].iloc[-1]
-                    sim_df, var95 = run_monte_carlo_sim(last_p, vol, days=120, sims=200)
-                    
-                    fp = sim_df.iloc[-1]
-                    opt_p = np.percentile(fp, 95)
-                    pes_p = np.percentile(fp, 5)
-                    prob_up = (fp > last_p).mean() * 100
-                    
-                    cm1, cm2 = st.columns([3, 1])
-                    with cm1:
-                        fig_mc = go.Figure()
-                        for c in sim_df.columns[:30]:
-                            fig_mc.add_trace(go.Scatter(y=sim_df[c], mode='lines', line=dict(width=1, color='rgba(0,255,255,0.1)'), showlegend=False))
-                        fig_mc.add_hline(y=last_p, line_dash="dash", line_color="white", annotation_text="現價")
-                        fig_mc.update_layout(template="plotly_dark", height=400, margin=dict(l=10, r=10, t=30, b=10))
-                        st.plotly_chart(fig_mc, use_container_width=True)
-                    with cm2:
-                        st.metric("上漲機率", f"{prob_up:.1f}%")
-                        st.metric("潛在獲利 (95%)", f"+{(opt_p-last_p)/last_p*100:.1f}%")
-                        st.metric("潛在風險 (5%)", f"-{(last_p-pes_p)/last_p*100:.1f}%")
+            # [賣出] 顯示報酬率與理由 (洋紅色 Down Triangle)
+            sell_all = final_df[final_df['Action'] == 'Sell']
+            if not sell_all.empty:
+                fig.add_trace(go.Scatter(
+                    x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', 
+                    text=get_sell_text(sell_all), # 這裡會顯示如 "+15% (停利)"
+                    textposition="top center",
+                    textfont=dict(color='white', size=11),
+                    marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), 
+                    name='賣出', hovertext=sell_all['Reason']
+                ), row=1, col=1)
+            
+            # --- 副圖指標繪製 ---
+            colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
+            fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=2, col=1)
+            
+            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=3, col=1)
+            
+            fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=4, col=1)
+            fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=4, col=1)
+            fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=4, col=1)
+            
+            fig.update_layout(
+                height=800, 
+                template="plotly_dark", 
+                xaxis_rangeslider_visible=False,
+                margin=dict(l=20, r=40, t=30, b=20),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+            )
+            st.plotly_chart(fig, use_container_width=True)
+            
+        # [Tab 2: 權益曲線]
+        with tab2:
+            fig_c = go.Figure()
+            fig_c.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Cum_Market'], name='大盤', line=dict(color='gray', dash='dot')))
+            fig_c.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Cum_Strategy'], name='策略淨值', line=dict(color='#ef5350', width=2), fill='tozeroy'))
+            
+            # 標記買賣點
+            buy_pts = final_df[final_df['Action']=='Buy']
+            sell_pts = final_df[final_df['Action']=='Sell']
+            if not buy_pts.empty:
+                fig_c.add_trace(go.Scatter(x=buy_pts['Date'], y=buy_pts['Cum_Strategy'], mode='markers', marker=dict(symbol='triangle-up', size=10, color='#FFD700'), name='買進'))
+            if not sell_pts.empty:
+                fig_c.add_trace(go.Scatter(x=sell_pts['Date'], y=sell_pts['Cum_Strategy'], mode='markers', marker=dict(symbol='triangle-down', size=10, color='#FF00FF'), name='賣出'))
+                
+            fig_c.update_layout(template="plotly_dark", height=450, title="策略權益成長曲線", margin=dict(l=10, r=10, t=40, b=10))
+            st.plotly_chart(fig_c, use_container_width=True)
+            
+        # [Tab 3: 蒙地卡羅]
+        with tab3:
+            st.markdown("### 🎲 蒙地卡羅模擬")
+            last_price = final_df['Close'].iloc[-1]
+            sim_df, var95 = run_monte_carlo_sim(last_price, data['vol'], days=120, sims=200)
+            
+            final_prices = sim_df.iloc[-1]
+            optimistic_price = np.percentile(final_prices, 95)
+            pessimistic_price = np.percentile(final_prices, 5)
+            prob_up = (final_prices > last_price).mean() * 100
+            
+            c_mc1, c_mc2 = st.columns([3, 1])
+            with c_mc1:
+                fig_mc = go.Figure()
+                for col in sim_df.columns[:30]: # 只畫前30條避免太亂
+                    fig_mc.add_trace(go.Scatter(y=sim_df[col], mode='lines', line=dict(width=1, color='rgba(0,255,255,0.1)'), showlegend=False))
+                fig_mc.add_hline(y=last_price, line_dash="dash", line_color="white", annotation_text="現價")
+                fig_mc.update_layout(template="plotly_dark", height=400, margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(fig_mc, use_container_width=True)
+            with c_mc2:
+                st.metric("上漲機率", f"{prob_up:.1f}%")
+                st.metric("潛在獲利", f"+{(optimistic_price-last_price)/last_price*100:.1f}%")
+                st.metric("潛在風險", f"-{(last_price-pessimistic_price)/last_price*100:.1f}%")
 
-                # [Tab 4: 有效性驗證]
-                with tab4:
-                    if validation_result:
-                        st.markdown(f"### 🧪 樣本外測試 (Walk-Forward Analysis)")
-                        tr_cagr = validation_result['train']['cagr'] * 100
-                        te_cagr = validation_result['test']['cagr'] * 100
-                        
-                        vt1, vt2 = st.columns(2)
-                        vt1.metric("訓練集年化報酬", f"{tr_cagr:.1f}%")
-                        vt2.metric("測試集年化報酬", f"{te_cagr:.1f}%", f"差異: {(te_cagr-tr_cagr):.1f}%")
-                        
-                        fig_val = go.Figure()
-                        fig_val.add_trace(go.Scatter(x=validation_result['train']['df']['Date'], y=validation_result['train']['df']['Cum_Strategy'], name='訓練', line=dict(color='gray', dash='dot')))
-                        scale_factor = validation_result['train']['df']['Cum_Strategy'].iloc[-1]
-                        fig_val.add_trace(go.Scatter(x=validation_result['test']['df']['Date'], y=validation_result['test']['df']['Cum_Strategy']*scale_factor, name='測試', line=dict(color='#00e676')))
-                        fig_val.add_vline(x=validation_result['split_date'].timestamp()*1000, line_dash="dash", line_color="white")
-                        fig_val.update_layout(template="plotly_dark", height=400, margin=dict(l=10, r=10, t=30, b=10))
-                        st.plotly_chart(fig_val, use_container_width=True)
-                    else:
-                        st.warning("數據不足，無法執行樣本外驗證。")
+        # [Tab 4: 驗證]
+        with tab4:
+            val_res = data.get('validation')
+            if val_res:
+                st.markdown(f"### 🧪 樣本外測試")
+                train_cagr = val_res['train']['cagr'] * 100
+                test_cagr = val_res['test']['cagr'] * 100
+                
+                vt1, vt2 = st.columns(2)
+                vt1.metric("訓練集報酬", f"{train_cagr:.1f}%")
+                vt2.metric("測試集報酬", f"{test_cagr:.1f}%", f"{(test_cagr-train_cagr):.1f}%")
+                
+                fig_val = go.Figure()
+                fig_val.add_trace(go.Scatter(x=val_res['train']['df']['Date'], y=val_res['train']['df']['Cum_Strategy'], name='訓練', line=dict(color='gray', dash='dot')))
+                scale = val_res['train']['df']['Cum_Strategy'].iloc[-1]
+                fig_val.add_trace(go.Scatter(x=val_res['test']['df']['Date'], y=val_res['test']['df']['Cum_Strategy']*scale, name='測試', line=dict(color='#00e676')))
+                fig_val.add_vline(x=val_res['split_date'].timestamp()*1000, line_dash="dash", line_color="white")
+                fig_val.update_layout(template="plotly_dark", height=400, margin=dict(l=10, r=10, t=30, b=10))
+                st.plotly_chart(fig_val, use_container_width=True)
+            else:
+                st.warning("數據不足，無法驗證。")
 
 # --- 頁面 3 (修正版): 科技股/熱門股掃描 ---
 elif page == "🚀 科技股掃描":
@@ -1500,97 +1437,45 @@ elif page == "🚀 科技股掃描":
                 best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input)
                 
                 if final_df is not None and not final_df.empty:
-                    # ==========================================
-                    # 1. 計算基礎 Alpha Score 與 提取演算歷程
-                    # ==========================================
-                    # 傳入空 DataFrame 作為籌碼資料 (掃描模式下通常不逐一抓取資券以節省時間)
+                    # 計算 Alpha Score
                     stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
                     base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-                    base_log = stock_alpha_df['Score_Log'].iloc[-1] # [新增] 獲取基礎評分細節
-
-                    # 取得技術訊號與基本資訊
+                    
+                    # 技術面分析
                     action, color, reason = analyze_signal(final_df)
                     name = get_stock_name(fmt_ticker)
                     
-                    # ==========================================
-                    # 2. 情境感知調整 (Context-Aware Adjustment)
-                    # ==========================================
+                    # 情境感知調整
                     final_score = base_alpha_score
-                    adjustment_log = "" # [新增] 用於記錄調整原因
-                    
-                    # 準備數據
                     current_price = final_df['Close'].iloc[-1]
-                    ma20 = final_df['MA20'].iloc[-1]
-                    ma60 = final_df['MA60'].iloc[-1]
-                    
-                    # 判斷最後一次買進訊號的理由，以識別是「反彈策略」還是「趨勢策略」
                     last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
-                    is_rebound_strategy = False
+                    is_rebound = False
+                    if last_trade is not None and any(x in str(last_trade['Reason']) for x in ["反彈", "超賣", "回測"]):
+                        is_rebound = True
                     
-                    if last_trade is not None:
-                        buy_reason_str = str(last_trade['Reason'])
-                        if any(x in buy_reason_str for x in ["反彈", "超賣", "回測", "低檔"]):
-                            is_rebound_strategy = True
-                    
-                    # 針對「續抱」或「買進」狀態進行加分邏輯修正
                     if action == "✊ 續抱" or action == "🚀 買進":
-                        if is_rebound_strategy:
-                            # --- 情境 A: 反彈策略 (抄底邏輯) ---
-                            # 補償 1: 反彈初期通常在季線下，基礎分會被扣分，這裡補回
-                            if current_price < ma60: 
-                                final_score += 15
-                                adjustment_log += "[反彈位階+15]"
-                            
-                            # 補償 2: 檢查是否站上 5 日線 (短線轉強訊號)
-                            ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
-                            if current_price > ma5: 
-                                final_score += 10
-                                adjustment_log += "[站穩MA5+10]"
-                            
-                            # 補償 3: RSI 動能翻揚
-                            if final_df['RSI'].iloc[-1] > final_df['RSI'].iloc[-2]: 
-                                final_score += 10
-                                adjustment_log += "[RSI翻揚+10]"
+                        if is_rebound:
+                            if current_price < final_df['MA60'].iloc[-1]: final_score += 15
+                            if current_price > final_df['Close'].rolling(5).mean().iloc[-1]: final_score += 10
+                            if final_df['RSI'].iloc[-1] > final_df['RSI'].iloc[-2]: final_score += 10
                         else:
-                            # --- 情境 B: 順勢策略 (突破邏輯) ---
-                            # 獎勵多頭排列
-                            if current_price > ma20: 
-                                final_score += 5
-                                adjustment_log += "[多頭排列+5]"
-                            
-                            # 獎勵量能支撐
-                            if final_df['Volume'].iloc[-1] > final_df['Vol_MA20'].iloc[-1]:
-                                final_score += 5
-                                adjustment_log += "[量能支撐+5]"
+                            if current_price > final_df['MA20'].iloc[-1]: final_score += 5
                     
-                    # 限制分數範圍 (-100 ~ 100)
                     final_score = max(min(final_score, 100), -100)
-                    
-                    # ==========================================
-                    # 3. 資料彙整
-                    # ==========================================
-                    # 組合完整計算過程字串
-                    full_calc_process = f"{base_log} {adjustment_log}"
-                    if not full_calc_process.strip():
-                        full_calc_process = "無顯著訊號"
-
-                    # 計算勝率指標
                     hit_rate, hits, total = calculate_target_hit_rate(final_df)
                     
-                    # 存入結果 List
+                    # 3. 每算完一檔，立刻存入暫存 list
                     res_item = {
                         "代號": fmt_ticker.split('.')[0], 
-                        "名稱": name, 
-                        "建議": action,
+                        "名稱": name, "建議": action,
                         "收盤價": current_price,
                         "Alpha_Score": int(final_score), 
-                        "計算過程": full_calc_process, # [關鍵新增] 顯示完整邏輯
-                        "理由": f"{reason} | Score:{int(final_score)}", # 舊版兼容
+                        "理由": f"{reason} | Alpha:{int(final_score)}", 
                         "回測報酬": best_params['Return'],
                         "達標率": hit_rate
                     }
                     results.append(res_item)
-
+                    
             except Exception as e:
                 print(f"Error scanning {ticker}: {e}")
                 continue # 遇到錯誤直接跳過，不要崩潰
@@ -1644,9 +1529,7 @@ elif page == "🚀 科技股掃描":
             top10.style
             .format({"收盤價": "{:.1f}", "回測報酬": "{:.1%}"})
             .applymap(highlight_top_score, subset=['Alpha_Score']),
-            use_container_width=True,
-            # [新增] 指定欄位順序，將 "計算過程" 加入顯示
-            column_order=["代號", "名稱", "Alpha_Score", "建議", "收盤價", "回測報酬", "計算過程", "達標率"]
+            use_container_width=True
         )
         
         st.markdown("---")
