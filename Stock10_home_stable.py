@@ -933,7 +933,6 @@ def generate_market_analysis(df, margin_df, short_df):
     analysis.append(f"{status}")
     analysis.append(f"{desc}")
     analysis.append(f"> {strategy}")
-    analysis.append("---")
 
     # --- B. 關鍵指標解析 ---
     # 1. 恐慌指數 (VIX)
