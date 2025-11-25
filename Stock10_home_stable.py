@@ -1449,231 +1449,176 @@ elif page == "📋 全台股清單":
             df_show = df_show[df_show['代號'].str.contains(search_term) | df_show['名稱'].str.contains(search_term)]
         st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-# --- 頁面 3.5 (雲端儲存版): 持股健診 ---
+# --- 頁面 3.5 (局部無感刷新版): 持股健診 ---
 elif page == "💼 持股健診與建議":
     st.markdown("### 💼 智能持股健診 (Portfolio Doctor)")
     
-    # 檢查登入狀態，顯示不同提示
+    # 登入狀態提示
     if st.session_state.get('logged_in'):
-        st.caption(f"✅ 已連線至雲端資料庫 (User: {st.session_state['username']})，您的持股將自動儲存。")
+        st.caption(f"✅ 雲端連線中 (User: {st.session_state['username']})")
     else:
-        st.caption("⚠️ 目前為 **訪客模式**。請在左側登入以永久儲存持股清單。")
+        st.caption("⚠️ 訪客模式")
 
     # ==========================================
-    # 1. 資料載入 (優先從 DB 載入)
+    # 1. 準備輸入資料 (主執行緒)
     # ==========================================
     if 'portfolio_data' not in st.session_state:
-        # 如果已登入，嘗試從 DB 抓資料
         if st.session_state.get('logged_in'):
             db_df = load_portfolio_from_db(st.session_state['username'])
-            if not db_df.empty:
-                st.session_state['portfolio_data'] = db_df
-            else:
-                # 登入但無資料，給預設值
-                st.session_state['portfolio_data'] = pd.DataFrame([{"代號": "2330", "持有股數": 1000}])
+            st.session_state['portfolio_data'] = db_df if not db_df.empty else pd.DataFrame([{"代號": "2330", "持有股數": 1000}])
         else:
-            # 訪客預設值
             st.session_state['portfolio_data'] = pd.DataFrame([
-                {"代號": "2330", "持有股數": 1000}, 
-                {"代號": "2317", "持有股數": 2000}, 
-                {"代號": "2603", "持有股數": 5000}, 
+                {"代號": "2330", "持有股數": 1000}, {"代號": "2317", "持有股數": 2000}, {"代號": "2603", "持有股數": 5000}
             ])
-    
-    if 'portfolio_report_df' not in st.session_state:
-        st.session_state['portfolio_report_df'] = None
 
-    # ==========================================
-    # 2. 建立可編輯表格 & 自動存檔
-    # ==========================================
-    col_input, col_chart = st.columns([1, 1])
+    col_input, col_ctrl = st.columns([1, 1])
     
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
-        
         edited_df = st.data_editor(
-            st.session_state['portfolio_data'], 
-            num_rows="dynamic", 
-            use_container_width=True,
-            key="portfolio_editor",
+            st.session_state['portfolio_data'], num_rows="dynamic", use_container_width=True, key="portfolio_editor",
             column_config={
                 "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號"),
                 "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
         
-        # === 關鍵修改：當資料變動時 ===
-        # 1. 更新 Session State
-        st.session_state['portfolio_data'] = edited_df
-        
-        # 2. 如果已登入，同步寫入資料庫 (Auto-Save)
-        if st.session_state.get('logged_in'):
-            save_portfolio_to_db(st.session_state['username'], edited_df)
-        
-        # 加入 key="btn_start_diag" 以解決 ID 重複衝突
-        start_diag_btn = st.button("⚡ 開始診斷", type="primary", use_container_width=True, key="btn_start_diag")
+        # 資料同步邏輯
+        if not edited_df.equals(st.session_state['portfolio_data']):
+            st.session_state['portfolio_data'] = edited_df
+            if st.session_state.get('logged_in'):
+                save_portfolio_to_db(st.session_state['username'], edited_df)
+
+    with col_ctrl:
+        st.markdown("#### 2. 監控設定")
+        st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 60 秒僅更新圖表數據，不會重載整頁。")
+        # 使用 toggle 來切換「持續監控模式」
+        enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 60 秒更新)", value=False)
 
     # ==========================================
-    # 3. 執行診斷邏輯 (計算並存入記憶)
+    # 3. 定義局部刷新片段 (The Fragment)
     # ==========================================
-    if start_diag_btn:
+    # 關鍵：這個函式內部的程式碼，會獨立於主程式之外自己循環運行
+    # run_every=60 代表這個片段每 60 秒會自己重跑一次
+    @st.fragment(run_every=60 if enable_monitor else None) 
+    def render_live_dashboard(target_df):
+        if target_df.empty:
+            st.warning("⚠️ 請先輸入持股資料。")
+            return
+
+        # 顯示最後更新時間 (證明有在動)
+        update_time = datetime.now().strftime("%H:%M:%S")
+        if enable_monitor:
+            st.caption(f"⚡ 實時監控中... (最後更新: {update_time})")
+        else:
+            st.caption(f"Analysis Snapshot (時間: {update_time})")
+
         portfolio_results = []
-        progress_bar = st.progress(0)
-        status_text = st.empty()
         
-        total_rows = len(edited_df)
-        for idx, row in edited_df.iterrows():
-            ticker = str(row['代號']).strip()
-            shares = row['持有股數']
-            
-            if not ticker or shares <= 0: continue
-            
-            status_text.text(f"AI 運算中 ({idx+1}/{total_rows}): {ticker} ...")
-            
-            # 獲取資料
-            raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
-            name = get_stock_name(fmt_ticker)
-            
-            if raw_df.empty:
-                portfolio_results.append({
-                    "代號": ticker, "名稱": "無資料", "建議": "⚠️ 異常", "持有股數": shares,
-                    "收盤價": 0, "市值": 0, "評分": 0, "理由": "無法獲取數據", "AI 建議": "略過", "技術訊號": "N/A"
-                })
-                continue
+        # 為了不讓畫面太長，我們用 expander 包住進度條，跑完自動收起來
+        with st.status(f"正在分析 {len(target_df)} 檔標的...", expanded=True) as status:
+            total_rows = len(target_df)
+            for idx, row in target_df.iterrows():
+                ticker = str(row['代號']).strip()
+                shares = row['持有股數']
+                if not ticker or shares <= 0: continue
                 
-            best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_input, tax_input)
-            
-            if final_df is None or final_df.empty:
+                # 在這裡呼叫 get_stock_data，因為它有 ttl=1，所以會抓到最新價格
+                raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
+                name = get_stock_name(fmt_ticker)
+                
+                if raw_df.empty or len(raw_df) < 30:
+                    continue # 資料不足跳過
+                    
+                best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_input, tax_input)
+                
+                if final_df is None or final_df.empty: continue
+
+                # 計算邏輯 (維持不變)
+                current_price = final_df['Close'].iloc[-1]
+                market_value = current_price * shares
+                stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
+                base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
+                action, color, tech_reason = analyze_signal(final_df)
+                
+                final_score = base_alpha_score
+                adjustment_log = []
+                last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
+                is_rebound = False
+                if last_trade is not None and any(x in str(last_trade['Reason']) for x in ["反彈", "超賣", "回測"]):
+                    is_rebound = True
+                
+                if action == "✊ 續抱":
+                    if is_rebound:
+                        if current_price < final_df['MA60'].iloc[-1]: final_score += 15; adjustment_log.append("忽略季線")
+                        if current_price > final_df['Close'].rolling(5).mean().iloc[-1]: final_score += 10
+                        if final_df['RSI'].iloc[-1] > final_df['RSI'].iloc[-2]: final_score += 10
+                    else:
+                        if final_df['Volume'].iloc[-1] > final_df['Vol_MA20'].iloc[-1] * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
+                            final_score -= 15; adjustment_log.append("爆量滯漲")
+
+                final_score = max(min(final_score, 100), -100)
+
+                final_advice = ""; 
+                if action == "🚀 買進": final_advice = "🔥 強力加碼" if final_score > 30 else "✅ 買進訊號"
+                elif action == "⚡ 賣出": final_advice = "💀 清倉" if final_score < -20 else "📉 獲利了結"
+                elif action == "✊ 續抱": 
+                    if final_score > 40: final_advice = "✨ 抱緊"
+                    elif final_score > 0: final_advice = "✊ 續抱"
+                    elif final_score > -15: final_advice = "🛡️ 持倉"
+                    else: final_advice = "⚠️ 減碼"
+                else: final_advice = "👀 留意" if final_score > 60 else "💤 觀望"
+
+                reason_display = f"Alpha:{int(final_score)} | {tech_reason}"
+                if adjustment_log: reason_display = f"修:{int(final_score)} ({','.join(adjustment_log)})"
+
                 portfolio_results.append({
-                    "代號": ticker, "名稱": name, "建議": "⚠️ 數據不足", "持有股數": shares,
-                    "收盤價": 0, "市值": 0, "評分": 0, "理由": "區間內無交易", "AI 建議": "略過", "技術訊號": "N/A"
+                    "代號": fmt_ticker.split('.')[0], "名稱": name, "持有股數": shares,
+                    "收盤價": current_price, "市值": market_value, "綜合評分": int(final_score), 
+                    "AI 建議": final_advice, "詳細理由": reason_display
                 })
-                continue
-
-            # [Step 1-5 邏輯維持不變，與上一版相同]
-            current_price = final_df['Close'].iloc[-1]
-            market_value = current_price * shares
-            stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
-            base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-            action, color, tech_reason = analyze_signal(final_df)
             
-            final_score = base_alpha_score
-            adjustment_log = []
-            last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
-            is_rebound_strategy = False
-            if last_trade is not None:
-                buy_reason = str(last_trade['Reason'])
-                if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]): is_rebound_strategy = True
-            
-            if action == "✊ 續抱":
-                if is_rebound_strategy:
-                    ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
-                    rsi_now = final_df['RSI'].iloc[-1]
-                    rsi_prev = final_df['RSI'].iloc[-2]
-                    if current_price < final_df['MA60'].iloc[-1]: final_score += 15; adjustment_log.append("反彈策略忽略季線")
-                    if current_price > ma5: final_score += 10; adjustment_log.append("站穩MA5")
-                    else: final_score -= 5; adjustment_log.append("未站回MA5")
-                    if rsi_now > rsi_prev: final_score += 10; adjustment_log.append("動能翻揚")
-                    elif rsi_now < 30: final_score += 5; adjustment_log.append("低檔鈍化")
-                    else: final_score -= 5
-                else:
-                    vol_now = final_df['Volume'].iloc[-1]
-                    vol_ma = final_df['Vol_MA20'].iloc[-1]
-                    if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
-                        final_score -= 15; adjustment_log.append("高檔爆量滯漲")
+            status.update(label="分析完成！", state="complete", expanded=False)
 
-            final_score = max(min(final_score, 100), -100)
-
-            final_advice = ""; advice_color = ""
-            if action == "🚀 買進":
-                if final_score > 30: final_advice = "🔥 強力加碼"; advice_color = "red"
-                else: final_advice = "✅ 買進訊號"; advice_color = "red"
-            elif action == "⚡ 賣出":
-                if final_score < -20: final_advice = "💀 清倉/放空"; advice_color = "green"
-                else: final_advice = "📉 獲利了結"; advice_color = "green"
-            elif action == "✊ 續抱": 
-                if final_score > 40: final_advice = "✨ 抱緊處理"; advice_color = "red"
-                elif final_score > 0: final_advice = "✊ 續抱觀察"; advice_color = "gray"
-                elif final_score > -15: final_advice = "🛡️ 策略持倉"; advice_color = "blue"
-                else: final_advice = "⚠️ 減碼觀望"; advice_color = "orange"
-            else: 
-                if final_score > 60: final_advice = "👀 留意買點"; advice_color = "blue"
-                else: final_advice = "💤 觀望"; advice_color = "gray"
-
-            reason_display = f"Alpha:{int(final_score)} | {tech_reason}"
-            if adjustment_log: reason_display = f"原:{int(base_alpha_score)}➜修:{int(final_score)} ({','.join(adjustment_log)})"
-
-            portfolio_results.append({
-                "代號": fmt_ticker.split('.')[0], "名稱": name, "持有股數": shares,
-                "收盤價": current_price, "市值": market_value, "綜合評分": int(final_score), 
-                "AI 建議": final_advice, "技術訊號": action, "詳細理由": reason_display
-            })
-            
-            progress_bar.progress((idx + 1) / total_rows)
-            
-        progress_bar.empty()
-        status_text.empty()
-        
-        # === 關鍵：將結果存入 Session State ===
+        # 顯示結果
         if portfolio_results:
-            st.session_state['portfolio_report_df'] = pd.DataFrame(portfolio_results)
-        else:
-            st.session_state['portfolio_report_df'] = pd.DataFrame() # 存空值避免報錯
+            res_df = pd.DataFrame(portfolio_results)
+            total_val = res_df['市值'].sum()
+            res_df['權重%'] = (res_df['市值'] / total_val * 100) if total_val > 0 else 0
+            health = (res_df['綜合評分'] * res_df['市值']).sum() / total_val if total_val > 0 else 0
+            
+            # --- 儀表板區塊 (會在 Fragment 內刷新) ---
+            c_gauge, c_info = st.columns([1, 2])
+            with c_gauge:
+                fig_g = go.Figure(go.Indicator(
+                    mode = "gauge+number", value = health, 
+                    title = {'text': "組合健康度"},
+                    gauge = {'axis': {'range': [-100, 100]}, 'bar': {'color': "#00e676" if health > 0 else "#ef5350"}}
+                ))
+                fig_g.update_layout(height=200, margin=dict(t=30, b=10, l=20, r=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
+                st.plotly_chart(fig_g, use_container_width=True)
+            
+            with c_info:
+                st.metric("💰 總資產估值", f"NT$ {int(total_val):,}", delta=None)
+                st.info(f"💡 最後更新: {update_time}\n\n若開啟即時監控，此區域數值與下方建議將每分鐘自動變動，不影響上方輸入框。")
+
+            # --- 表格區塊 ---
+            def highlight_score(val):
+                color = '#ffcdd2' if val >= 30 else ('#c8e6c9' if val <= -20 else 'white')
+                return f'background-color: {color}; color: black'
+
+            st.dataframe(
+                res_df.style.map(highlight_score, subset=['AI 建議'])
+                .format({"權重%": "{:.1f}%", "收盤價": "{:.1f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
+                use_container_width=True
+            )
 
     # ==========================================
-    # 4. 顯示結果 (從 Session State 讀取)
+    # 4. 呼叫片段 (主程式進入點)
     # ==========================================
-    # 只要記憶體有資料，就顯示 (不管有沒有按按鈕)
-    if st.session_state['portfolio_report_df'] is not None and not st.session_state['portfolio_report_df'].empty:
-        res_df = st.session_state['portfolio_report_df'] # 讀取記憶體
-        
-        # 重新計算權重 (避免顯示時資料不一致)
-        total_market_value = res_df['市值'].sum()
-        if total_market_value > 0:
-            res_df['權重%'] = (res_df['市值'] / total_market_value) * 100
-            portfolio_health = (res_df['綜合評分'] * res_df['市值']).sum() / total_market_value
-        else:
-            res_df['權重%'] = 0; portfolio_health = 0
-            
-        with col_chart:
-            st.markdown("#### 2. 組合健康度總覽")
-            st.caption(f"💰 總資產估值: NT$ {int(total_market_value):,}") 
-            
-            fig_gauge = go.Figure(go.Indicator(
-                mode = "gauge+number", value = portfolio_health, title = {'text': "投資組合健康指數"},
-                gauge = {
-                    'axis': {'range': [-100, 100]},
-                    'bar': {'color': "#00e676" if portfolio_health > 0 else "#ef5350"},
-                    'steps': [{'range': [-100, -30], 'color': "rgba(255, 0, 0, 0.3)"}, {'range': [-30, 30], 'color': "rgba(128, 128, 128, 0.3)"}, {'range': [30, 100], 'color': "rgba(0, 255, 0, 0.3)"}],
-                    'threshold': {'line': {'color': "white", 'width': 4}, 'thickness': 0.75, 'value': portfolio_health}
-                }
-            ))
-            fig_gauge.update_layout(height=250, margin=dict(l=20, r=20, t=50, b=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
-            st.plotly_chart(fig_gauge, use_container_width=True)
-
-        st.markdown("---")
-        st.markdown("#### 3. 個股操作建議明細")
-        
-        def highlight_advice(val):
-            color = 'white'; val_str = str(val)
-            if '加碼' in val_str or '買進' in val_str or '抱緊' in val_str: color = '#ffcdd2'
-            elif '減碼' in val_str or '賣出' in val_str or '清倉' in val_str: color = '#c8e6c9'
-            elif '策略持倉' in val_str: color = '#bbdefb'
-            elif '觀望' in val_str: color = '#cfd8dc'
-            return f'background-color: {color}; color: black; font-weight: bold'
-
-        def highlight_score(val):
-            color = 'red' if val >= 30 else ('green' if val <= -20 else 'gray')
-            return f'color: {color}; font-weight: bold'
-
-        final_display_cols = ["代號", "名稱", "持有股數", "收盤價", "市值", "權重%", "綜合評分", "AI 建議", "技術訊號", "詳細理由"]
-        
-        st.dataframe(
-            res_df[final_display_cols].style
-            .applymap(highlight_advice, subset=['AI 建議'])
-            .applymap(highlight_score, subset=['綜合評分'])
-            .format({"權重%": "{:.1f}%", "收盤價": "{:.1f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
-            use_container_width=True, height=500
-        )
-        
-        health_desc = "偏多" if portfolio_health > 20 else ("轉弱" if portfolio_health < -20 else "震盪")
-        st.info(f"💡 **AI 總結**：目前持有 {len(res_df)} 檔標的，總市值約 **NT$ {int(total_market_value/10000):,} 萬**。組合健康分為 **{portfolio_health:.1f}** ({health_desc})。")
+    # 只有當使用者輸入了資料，且按下按鈕或開啟監控時，才顯示這個片段
+    # 這裡我們直接呼叫它，讓它根據 enable_monitor 決定要不要自動刷新
+    
+    st.markdown("---")
+    # 這裡傳入 session_state 的資料，讓 Fragment 內部去處理
+    render_live_dashboard(st.session_state['portfolio_data'])
