@@ -765,114 +765,131 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v3.1 (Robust Fix): 修復索引對齊與數據缺失問題
+    Alpha Score v4.0 (Professional): 針對戰勝 Buy&Hold 優化
+    核心改動：
+    1. 改用 EMA (指數移動平均) 提升反應速度。
+    2. 加入 KD 指標 (Stochastic Oscillator) 捕捉短線轉折。
+    3. 引入「乖離率懲罰 (Bias Penalty)」避免高檔追價。
+    4. 加入「相對強弱 (Relative Strength)」概念。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據準備與防呆
+    # 1. 基礎指標運算 (若缺漏則補算)
     # ====================================================
-    # 填充基礎欄位，防止因某天無交易量導致運算崩潰
-    if 'Volume' in df.columns:
-        df['Volume'] = df['Volume'].fillna(0)
+    # 使用 EMA 替代 SMA，對近期價格更敏感
+    df['EMA10'] = df['Close'].ewm(span=10, adjust=False).mean()
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
     
-    # 均線 (若無則補算)
-    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    # 計算 KD 指標 (Stochastic Oscillator)
+    # 9日 RSV
+    low_min = df['Low'].rolling(9).min()
+    high_max = df['High'].rolling(9).max()
+    rsv = (df['Close'] - low_min) / (high_max - low_min) * 100
+    df['K'] = rsv.ewm(com=2, adjust=False).mean() # K值
+    df['D'] = df['K'].ewm(com=2, adjust=False).mean() # D值
     
-    # MACD
+    # MACD 柱狀圖 (Histogram)
     exp12 = df['Close'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     dif = exp12 - exp26
     dea = dif.ewm(span=9, adjust=False).mean()
-    
-    # 布林通道 %B
-    std20 = df['Close'].rolling(20).std()
-    bb_up = df['MA20'] + 2 * std20
-    bb_low = df['MA20'] - 2 * std20
-    bb_width = (bb_up - bb_low).replace(0, 1) # 防除以零
-    pct_b = (df['Close'] - bb_low) / bb_width
+    df['MACD_Hist'] = (dif - dea) * 2
 
     # ====================================================
-    # 2. 四大因子量化計分
+    # 2. 因子計分模型 (總分 100)
     # ====================================================
     
-    # A. 趨勢因子
-    # 使用 ffill 避免當天 MA60 缺值
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
-    score_trend = (bias_60 / 0.20) * 100
-    score_trend = score_trend.clip(-100, 100)
+    # --- A. 趨勢結構 (Trend) - 佔比 40% ---
+    # 邏輯：EMA 排列 + MACD 動能方向
+    score_trend = np.zeros(len(df))
     
-    # B. 動能因子
-    # RSI 若有空值填補 50 (中性)
+    # 多頭排列 (EMA20 > EMA60) 且 收盤在 EMA20 之上 -> 強勢
+    c1 = (df['Close'] > df['EMA20']) & (df['EMA20'] > df['EMA60'])
+    score_trend = np.where(c1, 40, score_trend)
+    
+    # 短線轉強 (收盤站上 EMA10 且 EMA10 上彎)
+    c2 = (df['Close'] > df['EMA10']) & (df['EMA10'] > df['EMA10'].shift(1))
+    score_trend = np.where(c2 & ~c1, 20, score_trend) # 若非多頭排列但短線轉強，給 20 分
+    
+    # 趨勢轉弱扣分 (MACD 柱狀圖收斂)
+    # 當柱狀圖數值下降，代表漲勢趨緩，需扣分以提早出場
+    hist_slope = df['MACD_Hist'].diff()
+    score_trend = np.where((df['MACD_Hist'] > 0) & (hist_slope < 0), score_trend - 10, score_trend)
+
+    # --- B. 動能與位階 (Momentum) - 佔比 30% ---
+    # 邏輯：RSI 區間 + KD 黃金交叉
     curr_rsi = df['RSI'].fillna(50)
-    score_rsi = (curr_rsi - 50) * 2
-    score_macd = np.where(dif > dea, 50, -50)
-    score_mom = (score_rsi + score_macd) / 1.5
-    score_mom = score_mom.clip(-100, 100)
+    score_mom = np.zeros(len(df))
     
-    # C. 波動位置因子
-    score_pos = (pct_b.fillna(0.5) - 0.5) * 200
-    score_pos = score_pos.clip(-100, 100)
+    # RSI 處於攻擊區 (55-75 為最佳，>80 過熱)
+    score_mom = np.where((curr_rsi >= 55) & (curr_rsi <= 80), 20, score_mom)
+    score_mom = np.where(curr_rsi > 80, 10, score_mom) # 過熱稍微降分
+    
+    # KD 黃金交叉 (K 由下往上穿過 D，且位置在低檔 < 50 更有力)
+    k_cross_d = (df['K'] > df['D']) & (df['K'].shift(1) < df['D'].shift(1))
+    score_mom = np.where(k_cross_d & (df['K'] < 60), score_mom + 10, score_mom)
+    
+    # KD 死亡交叉扣分
+    k_dead_d = (df['K'] < df['D']) & (df['K'].shift(1) > df['D'].shift(1))
+    score_mom = np.where(k_dead_d & (df['K'] > 80), score_mom - 15, score_mom) # 高檔死叉重扣
 
-    # D. 籌碼/量能因子
-    vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
+    # --- C. 量價配合 (Volume) - 佔比 15% ---
+    vol_ma = df['Vol_MA20'].replace(0, 1)
     vol_ratio = df['Volume'] / vol_ma
-    # 填補可能的空值
-    vol_ratio = vol_ratio.fillna(1.0)
-    price_dir = np.sign(df['Close'].diff().fillna(0))
-    score_vol = (vol_ratio - 1) * price_dir * 30
-    score_vol = score_vol.clip(-50, 50)
-
-    # ====================================================
-    # 3. 綜合加權
-    # ====================================================
-    raw_score = (
-        score_trend * 0.35 + 
-        score_mom * 0.30 + 
-        score_pos * 0.25 + 
-        score_vol * 0.10
-    )
-
-    # ====================================================
-    # 4. 市場體制修正 (Panic Correction)
-    # ====================================================
-    # 確保 VIX 有值
-    if 'VIX' not in df.columns: df['VIX'] = 20.0
-    df['VIX'] = df['VIX'].fillna(20.0)
+    price_up = df['Close'] > df['Close'].shift(1)
     
-    is_panic = (df['VIX'] > 25) & ((curr_rsi < 30) | (bias_60 < -0.15))
+    score_vol = np.zeros(len(df))
+    # 價漲量增 (攻擊量)
+    score_vol = np.where(price_up & (vol_ratio > 1.2), 15, score_vol)
+    # 價漲量縮 (惜售? 或無力?) -> 給予中性分
+    score_vol = np.where(price_up & (vol_ratio <= 1.0), 5, score_vol)
+    # 價跌量增 (出貨) -> 扣分
+    score_vol = np.where(~price_up & (vol_ratio > 1.2), -15, score_vol)
+
+    # --- D. 籌碼/相對強弱 (Alpha) - 佔比 15% ---
+    # 比較個股與大盤的 RSI 強度
+    market_rsi = df['Market_RSI'].fillna(50)
+    rs_score = np.where(curr_rsi > market_rsi, 15, 0) # 個股強於大盤
     
-    # 恐慌修正邏輯
-    panic_score = abs(raw_score) + (df['VIX'] - 20) * 2
-    final_score_array = np.where(is_panic, panic_score, raw_score)
+    # ====================================================
+    # 3. 綜合計算與懲罰機制 (Penalty)
+    # ====================================================
+    raw_score = score_trend + score_mom + score_vol + rs_score
+    
+    # --- 關鍵優化：乖離率懲罰 (Bias Penalty) ---
+    # 目的：防止在股價已經飛離均線太遠時進場 (Buy High)
+    bias_60 = ((df['Close'] - df['EMA60']) / df['EMA60']) * 100
+    
+    # 如果乖離率 > 20% (短線漲太多)，強制扣分
+    # 扣分幅度：每超過 20% 1%，扣 2 分
+    overbought_penalty = np.maximum(0, (bias_60 - 20) * 2)
+    
+    final_score_array = raw_score - overbought_penalty
+    
+    # --- 市場恐慌修正 (VIX Correction) ---
+    if 'VIX' in df.columns:
+        vix = df['VIX'].fillna(20)
+        # 恐慌時 (VIX>30)，若技術面有底背離或低檔金叉，加分 (視為抄底機會)
+        is_bottom = (curr_rsi < 30) & k_cross_d
+        final_score_array = np.where((vix > 30) & is_bottom, final_score_array + 30, final_score_array)
 
     # ====================================================
-    # 5. [關鍵修正] 平滑化與索引對齊
+    # 4. 數據平滑與輸出
     # ====================================================
-    # 重點：必須指定 index=df.index，否則會因為索引錯位導致全部變成 NaN
     final_series = pd.Series(final_score_array, index=df.index)
     
-    # 進行滾動平均 (填補空缺，確保連續性)
-    df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
+    # 使用小幅度的滾動平均消除雜訊，但天數不能太多以免滯後
+    df['Alpha_Score'] = final_series.rolling(2, min_periods=1).mean()
+    df['Alpha_Score'] = df['Alpha_Score'].fillna(0).clip(-100, 100)
     
-    # [最後防線]：如果最後幾天計算出來是 NaN (可能因即時資料缺失)，
-    # 強制向前填充 (Forward Fill)，確保圖表不會斷頭
-    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0)
-    
-    # 限制範圍
-    df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
-
-    # ====================================================
-    # 6. 生成建議
-    # ====================================================
-    df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭", 
-                      np.where(df['Alpha_Score'] < -60, "弱勢空頭", "盤整震盪"))
-    df['Score_Log'] = np.where(is_panic, "恐慌超跌(修正轉正)", df['Score_Log'])
-
-    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
-
+    # 生成簡易評語
+    df['Score_Log'] = np.where(df['Alpha_Score'] > 70, "極強勢",
+                      np.where(df['Alpha_Score'] > 30, "偏多整理",
+                      np.where(df['Alpha_Score'] < -30, "空頭修正", "中性震盪")))
+                      
     return df
 
 # ==========================================
