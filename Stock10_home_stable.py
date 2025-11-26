@@ -751,92 +751,111 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    改良版 Alpha Score：引入「市場體制 (Regime)」概念
-    區分「順勢動能」與「恐慌超跌」兩種邏輯，避免崩盤時發出賣出訊號。
+    Alpha Score v2.0 (Action-Oriented): 買賣指令強度版
+    分數代表當日的「動作建議強度」，而非趨勢健康度。
+    
+    +100: 強力買進/建倉 (All-in)
+    +40 : 支撐確認/加碼 (Add)
+    0   : 觀望/續抱 (Hold)
+    -40 : 過熱/減碼 (Trim)
+    -100: 破線/清倉 (Clear)
     """
     df = df.copy()
-    if 'Alpha_Score' not in df.columns: df['Alpha_Score'] = 0.0
+    # 初始化分數為 0 (觀望/續抱)
+    df['Alpha_Score'] = 0.0
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
-    # 輔助函式：記錄分數變動
-    def apply_rule(mask, points, reason):
-        if not mask.any(): return
-        df.loc[mask, 'Alpha_Score'] += points
-        sign = "+" if points > 0 else ""
-        df.loc[mask, 'Score_Log'] = df.loc[mask, 'Score_Log'] + f"[{reason}{sign}{points}]"
+    # 輔助函式：記錄日誌
+    def log_signal(mask, msg):
+        if mask.any():
+            df.loc[mask, 'Score_Log'] = df.loc[mask, 'Score_Log'] + f"[{msg}]"
 
     # ====================================================
-    # 0. 計算必要指標 (確保欄位存在)
+    # 0. 基礎指標準備
     # ====================================================
-    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    # 確保基本均線存在
+    if 'MA5' not in df.columns: df['MA5'] = df['Close'].rolling(5).mean()
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'VIX' not in df.columns: df['VIX'] = 20.0 # 防呆預設
+    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     
-    # 計算乖離率 (Bias)：衡量超跌程度
-    df['Bias_60'] = (df['Close'] - df['MA60']) / df['MA60']
-    
-    # 判斷市場體制 (Regime Identification)
-    # 恐慌模式定義：VIX > 25 或 RSI < 30 或 季線負乖離超過 10%
-    is_panic = (df['VIX'] > 25) | (df['RSI'] < 30) | (df['Bias_60'] < -0.10)
+    # 以前一日數據做比對 (用於偵測交叉)
+    prev_close = df['Close'].shift(1)
+    prev_ma60 = df['MA60'].shift(1)
+    prev_ma20 = df['MA20'].shift(1)
+
+    # 判斷市場體制 (Panic or Normal)
+    bias_60 = (df['Close'] - df['MA60']) / df['MA60']
+    # 恐慌定義：VIX高 或 RSI低 或 負乖離過大
+    is_panic = (df['VIX'] > 25) | (df['RSI'] < 25) | (bias_60 < -0.12)
     
     # ====================================================
-    # A. 趨勢與乖離 (Trend & Mean Reversion)
+    # 1. 賣出指令 (Sell Signals) - 優先權高
     # ====================================================
     
-    # --- 正常體制 (Normal Regime)：順勢操作 ---
-    # 邏輯：站上均線是好事，跌破是壞事
-    normal_bull = (~is_panic) & (df['Close'] > df['MA60'])
-    normal_bear = (~is_panic) & (df['Close'] < df['MA60'])
+    # [減碼 -40]：RSI 過熱 或 乖離過大
+    # 邏輯：雖然趨勢向上，但短線過熱，建議減碼
+    cond_overheat = (df['RSI'] > 80) & (df['Close'] < df['Open']) # 過熱且收黑
+    df.loc[cond_overheat, 'Alpha_Score'] = -40
+    log_signal(cond_overheat, "過熱減碼-40")
     
-    apply_rule(normal_bull, 20, "順勢-站上季線")
-    apply_rule(normal_bear, -20, "順勢-跌破季線")
+    # [清倉 -100]：趨勢破壞 (正常體制)
+    # 邏輯：收盤跌破季線，且昨日還在季線上 (有效跌破)
+    cond_break_ma60 = (~is_panic) & (df['Close'] < df['MA60']) & (prev_close >= prev_ma60)
+    df.loc[cond_break_ma60, 'Alpha_Score'] = -100
+    log_signal(cond_break_ma60, "跌破季線清倉-100")
     
-    # --- 恐慌體制 (Panic Regime)：逆勢操作 ---
-    # 邏輯：在恐慌時，嚴重跌破均線代表「黃金坑」，反而給予高分
-    
-    # 恐慌但負乖離適中 (跌破季線但未深跌)：觀望或小買
-    panic_dip = (is_panic) & (df['Bias_60'] < 0) & (df['Bias_60'] > -0.15)
-    apply_rule(panic_dip, 10, "恐慌-價值浮現") 
-    
-    # 極度恐慌且深跌 (負乖離 > 15%)：強力買進
-    panic_deep_value = (is_panic) & (df['Bias_60'] <= -0.15)
-    apply_rule(panic_deep_value, 40, "恐慌-超跌黃金坑") # 給予極高分以抵銷技術面的弱勢
-    
-    # 恐慌時若還站穩季線 (強勢股)
-    panic_strong = (is_panic) & (df['Close'] > df['MA60'])
-    apply_rule(panic_strong, 20, "恐慌-抗跌強勢")
+    # [清倉 -100]：停損觸發 (所有體制)
+    # 邏輯：跌破 SuperTrend 停損線
+    if 'SuperTrend' in df.columns:
+        cond_stop_loss = (df['Close'] < df['SuperTrend']) & (prev_close >= df['SuperTrend'].shift(1))
+        df.loc[cond_stop_loss, 'Alpha_Score'] = -100
+        log_signal(cond_stop_loss, "觸發停損-100")
 
     # ====================================================
-    # B. 技術動能 (Momentum)
+    # 2. 買進指令 (Buy Signals) - 會覆蓋弱勢賣訊
     # ====================================================
-    # MACD / KD 邏輯維持不變，作為輔助
-    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['DIF'] = exp12 - exp26
-    df['DEA'] = df['DIF'].ewm(span=9, adjust=False).mean()
-    
-    apply_rule(df['DIF'] > df['DEA'], 10, "MACD多")
-    apply_rule(df['DIF'] < df['DEA'], -10, "MACD空")
-    
-    # RSI 極端值修正
-    # 正常盤：RSI > 55 強
-    apply_rule((~is_panic) & (df['RSI'] > 55), 5, "動能強")
-    # 恐慌盤：RSI < 25 (超賣) 加分，而非扣分
-    apply_rule((is_panic) & (df['RSI'] < 25), 15, "RSI超賣鈍化")
+
+    # [加碼 +40]：多頭回測支撐 (Buying the dip)
+    # 邏輯：趨勢向上(MA60上) + 回測月線不破 + 量縮
+    cond_dip = (
+        (~is_panic) & 
+        (df['Close'] > df['MA60']) &               # 長線多頭
+        (df['Low'] <= df['MA20']) & (df['Close'] > df['MA20']) & # 回測月線有守
+        (df['Volume'] < df['Vol_MA20'])            # 量縮整理
+    )
+    # 只有在原本分數不為 -100 (非停損日) 時才給加碼分
+    mask_add = cond_dip & (df['Alpha_Score'] > -50)
+    df.loc[mask_add, 'Alpha_Score'] = 40
+    log_signal(mask_add, "回測月線加碼+40")
+
+    # [強力買進 +100]：趨勢突破 (Breakout)
+    # 邏輯：正常體制下，站上季線 + 爆量
+    cond_breakout = (
+        (~is_panic) &
+        (df['Close'] > df['MA60']) & (prev_close <= prev_ma60) & # 站上季線
+        (df['Volume'] > df['Vol_MA20'] * 1.2) # 攻擊量
+    )
+    df.loc[cond_breakout, 'Alpha_Score'] = 100
+    log_signal(cond_breakout, "帶量突破+100")
+
+    # [強力買進 +100]：恐慌抄底 (Panic Buy)
+    # 邏輯：恐慌體制下 + RSI低檔鈍化/背離 + 收紅K
+    cond_panic_buy = (
+        (is_panic) & 
+        (df['RSI'] < 30) & 
+        (df['Close'] > df['Open']) & # 收紅
+        (df['Close'] > df['MA5'])    # 站上5日線(止跌第一訊號)
+    )
+    df.loc[cond_panic_buy, 'Alpha_Score'] = 100
+    log_signal(cond_panic_buy, "恐慌黃金坑+100")
 
     # ====================================================
-    # C. 恐慌指數 VIX 特別加權
-    # ====================================================
-    # VIX 越高，分數越高 (左側交易核心)
-    apply_rule(df['VIX'] > 20, 10, "VIX警戒")
-    apply_rule(df['VIX'] > 30, 20, "VIX極度恐慌") # 累加後共 +30
-
-    # ====================================================
-    # D. 籌碼面 (Chips)
+    # 3. 籌碼特殊事件 (Chips Events) - 權重最高
     # ====================================================
     if not margin_df.empty and not short_df.empty:
         try:
-            # 資料前處理與合併 (維持原邏輯，但加入錯誤處理)
+            # 簡化版籌碼邏輯 (沿用之前的清洗/運算)
             df['Date_Join'] = pd.to_datetime(df['Date']).dt.normalize()
             m_clean = margin_df[['date', 'TodayBalance']].copy()
             m_clean.columns = ['Date_Join', 'Margin_Bal']
@@ -845,52 +864,45 @@ def calculate_alpha_score(df, margin_df, short_df):
             s_clean.columns = ['Date_Join', 'Short_Bal']
             s_clean['Date_Join'] = pd.to_datetime(s_clean['Date_Join']).dt.normalize()
             
-            # 暫存合併
-            temp_df = df.merge(m_clean, on='Date_Join', how='left').merge(s_clean, on='Date_Join', how='left')
-            
-            # 計算變化
-            temp_df['Margin_Bal'] = temp_df['Margin_Bal'].ffill()
-            temp_df['Short_Bal'] = temp_df['Short_Bal'].ffill()
-            temp_df['M_Chg'] = temp_df['Margin_Bal'].pct_change(5)
-            temp_df['S_Chg'] = temp_df['Short_Bal'].pct_change(5)
-            temp_df['P_Chg'] = temp_df['Close'].pct_change(5)
-            
-            # 籌碼邏輯應用到原 df
-            # 融資斷頭 (多殺多後通常是買點)：價跌 & 融資大減
-            mask_wash = (temp_df['P_Chg'] < -0.05) & (temp_df['M_Chg'] < -0.03)
-            apply_rule(mask_wash, 25, "融資斷頭清洗")
-            
-            # 軋空
-            mask_squeeze = (temp_df['P_Chg'] > 0.02) & (temp_df['S_Chg'] > 0.02)
-            apply_rule(mask_squeeze, 15, "軋空動能")
+            # 合併
+            temp = df[['Date_Join']].merge(m_clean, on='Date_Join', how='left').merge(s_clean, on='Date_Join', how='left')
+            temp['M_Chg'] = temp['Margin_Bal'].ffill().pct_change(5)
+            temp['S_Chg'] = temp['Short_Bal'].ffill().pct_change(5)
+            temp['P_Chg'] = df['Close'].pct_change(5)
 
-            # 清理
-            df = df.drop(columns=['Date_Join', 'Bias_60'], errors='ignore') # 移除暫存欄位
+            # 軋空 (+100)
+            squeeze_mask = (temp['P_Chg'] > 0.05) & (temp['S_Chg'] > 0.05)
+            # 融資斷頭 (+100)
+            washout_mask = (temp['P_Chg'] < -0.10) & (temp['M_Chg'] < -0.05) & (df['Close'] > df['Open']) # 斷頭後收紅
+
+            df.loc[squeeze_mask, 'Alpha_Score'] = 100
+            log_signal(squeeze_mask, "軋空強襲+100")
+            
+            df.loc[washout_mask, 'Alpha_Score'] = 100
+            log_signal(washout_mask, "融資斷頭抄底+100")
+            
+            df = df.drop(columns=['Date_Join'])
         except: pass
 
     # ====================================================
-    # E. 最終分數收斂與建議倉位計算
+    # 4. 建議倉位映射 (維持向下兼容)
     # ====================================================
-    df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
+    # 注意：現在 Alpha Score 是「動作」，不是「倉位」。
+    # 這裡做一個簡單的轉換供 Dashboard 的面積圖使用
+    # 如果今天是買進訊號，建議倉位設為 100；賣出則為 0；觀望則沿用昨日
     
-    # 建議倉位計算邏輯改良：
-    # 如果是「恐慌體制」且分數轉正，建議倉位應該更激進 (Base Position)
-    # 正常：0~100 線性對應
-    # 恐慌：若 Score > 0 (代表超跌訊號確認)，底倉至少 40%
-    
-    def calculate_position(row):
-        score = row['Alpha_Score']
-        vix = row['VIX'] if 'VIX' in row else 0
+    reco_pos = []
+    current_pos = 0.0
+    for score in df['Alpha_Score']:
+        if score >= 80: current_pos = 100.0   # All-in
+        elif score >= 40: current_pos = min(current_pos + 30, 100.0) # 加碼
+        elif score <= -80: current_pos = 0.0  # All-out
+        elif score <= -40: current_pos = max(current_pos - 30, 0.0)  # 減碼
+        # score == 0 時，維持 current_pos 不變
+        reco_pos.append(current_pos)
         
-        base_pos = (score + 100) / 2
-        
-        # 恐慌加權：如果 VIX 高且分數正 (代表 AI 認為跌過頭了)，強制拉高持股水位
-        if vix > 25 and score > 10:
-            return max(base_pos, 50) # 恐慌時若訊號轉多，至少半倉
-        return base_pos
+    df['Recommended_Position'] = reco_pos
 
-    df['Recommended_Position'] = df.apply(calculate_position, axis=1).clip(0, 100)
-    
     return df
 
 # ==========================================
@@ -1673,7 +1685,7 @@ elif page == "📊 單股深度分析":
                     fig.update_yaxes(side='right')
                     
                     st.plotly_chart(fig, use_container_width=True)
-                                                            
+
                 # [Tab 2: 權益曲線]
                 with tab2:
                     fig_c = go.Figure()
