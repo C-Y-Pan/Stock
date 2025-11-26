@@ -437,18 +437,19 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略邏輯 v7.0 (Hybrid): 趨勢濾網 + 恐慌抄底
-    修正1: 賣出加入 MA20 濾網，避免多頭回檔被洗掉。
-    修正2: 買進加入「恐慌抄底」邏輯，允許負分買進。
+    策略邏輯 v7.1 (Noisy Filter): 
+    修正：對 Alpha Slope 進行二次平滑，過濾掉單日暴衝的雜訊。
     """
     df = data.copy()
     
-    # 確保有 Alpha Score
     if 'Alpha_Score' not in df.columns:
         df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
-    # 計算 Alpha Slope
-    df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
+    # [關鍵修正] 計算平滑後的 Slope
+    # 1. 先算單日變化
+    raw_diff = df['Alpha_Score'].diff()
+    # 2. 再取 3 日平均，濾掉單日尖刺 (Spike)
+    df['Alpha_Slope'] = raw_diff.rolling(window=3, min_periods=1).mean().fillna(0)
 
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
@@ -458,66 +459,55 @@ def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.0
     alpha = df['Alpha_Score'].values
     slope = df['Alpha_Slope'].values 
     close = df['Close'].values
-    
-    # 防呆：確保有均線資料
     ma20 = df['EMA20'].values if 'EMA20' in df.columns else close
-    ma60 = df['EMA60'].values if 'EMA60' in df.columns else close
 
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
         ret_label = ""; conf_score = 0
         
-        # --- 進場邏輯 (Dual Entry) ---
+        # --- 進場邏輯 ---
         if position == 0:
             is_buy = False
             
-            # 情境 A: 順勢突破 (Standard Momentum)
-            # 條件：Slope 轉強 + 分數為正 (確認多頭結構)
-            if slope[i] >= slope_threshold and alpha[i] > 0:
+            # A. 順勢 (Slope 門檻建議稍微調降，因為平滑後數值會變小)
+            # 平滑後的 Slope 如果能維持在 3~5 以上，代表連續幾天都在轉強，比單日暴衝更可靠
+            if slope[i] >= (slope_threshold * 0.8) and alpha[i] > 0:
                 is_buy = True
                 reason_str = f"順勢噴出 (Slope:+{int(slope[i])})"
                 conf_score = 70
             
-            # 情境 B: 恐慌抄底 (V-Shape Reversal)
-            # 條件：Slope 極強 (報復性反彈) + 分數在深水區 (超跌)
-            # 這裡設定 Slope > 15 (更嚴格的動能要求)，但允許 Alpha < 0
-            elif slope[i] >= 15 and alpha[i] < -30:
+            # B. 抄底
+            elif slope[i] >= 10 and alpha[i] < -30:
                 is_buy = True
                 reason_str = f"恐慌抄底 (Slope:+{int(slope[i])})"
-                conf_score = 85 # 這種反轉通常利潤最高，信心給高
+                conf_score = 85
             
             if is_buy:
                 signal = 1
                 entry_price = close[i]
                 action_code = "Buy"
 
-        # --- 出場邏輯 (Trend Filtered Exit) ---
+        # --- 出場邏輯 ---
         elif position == 1:
             pnl = (close[i] - entry_price) / entry_price
-            
             is_sell = False
             
-            # 1. 趨勢破壞賣出 (Trend Breakdown)
-            # 條件：(分數轉弱 AND 斜率轉弱) AND (跌破月線 MA20)
-            # [關鍵修正] 只有在跌破月線時，才理會評分轉弱。守住月線就續抱。
+            # 1. 趨勢破壞
             if (alpha[i] < 0 and slope[i] < 0) and (close[i] < ma20[i]):
                 is_sell = True
                 reason_str = "破線轉弱"
             
-            # 2. 獲利回吐保護 (Profit Protection)
-            # 如果獲利曾經 > 20%，現在跌破 MA20，也強制出場
+            # 2. 獲利回吐
             elif pnl > 0.20 and close[i] < ma20[i]:
                 is_sell = True
                 reason_str = "獲利了結"
 
-            # 3. 硬性停損 (Stop Loss)
-            # 設 10%
+            # 3. 停損
             elif pnl < -0.10:
                 is_sell = True
                 reason_str = "觸發停損"
                 
-            # 4. 極端風險出場
-            # 如果分數直接崩跌到 -50 以下，不管有沒有破線，先跑再說
+            # 4. 崩盤
             elif alpha[i] < -50:
                 is_sell = True
                 reason_str = "評分崩盤"
@@ -535,7 +525,7 @@ def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.0
     df['Position'] = positions; df['Reason'] = reasons; df['Action'] = actions
     df['Return_Label'] = return_labels; df['Confidence'] = confidences
     
-    # === 績效計算 ===
+    # 績效計算 (維持不變)
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
@@ -767,8 +757,10 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.1 (Balanced Momentum) - Fix: 補回 Recommended_Position
-    修正：補上建議持股水位的計算，解決 KeyError。
+    Alpha Score v6.2 (Denoised): 去噪版
+    修正：
+    1. 針對 Alpha Score 出現 0 的情況進行補值 (視為資料缺失而非評分歸零)。
+    2. 強化平滑處理，減少 Slope 的毛刺。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -795,51 +787,48 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['MACD_Hist'] = (dif - dea) * 2
 
     # ====================================================
-    # 2. 多空計分邏輯 (對稱加扣分)
+    # 2. 多空計分邏輯
     # ====================================================
     score = np.zeros(len(df))
 
-    # --- A. 趨勢結構 (Trend) ---
-    # 多頭：收盤在月線之上 (+30)
-    # 空頭：收盤在月線之下 (-30)
+    # A. 趨勢
     score = np.where(df['Close'] > df['EMA20'], score + 30, score - 30)
-    
-    # 趨勢強化
     score = np.where(df['EMA20'] > df['EMA60'], score + 10, score - 10)
 
-    # --- B. 動能方向 (Momentum) ---
-    # MACD 柱狀圖翻紅 (+20) vs 翻綠 (-20)
+    # B. 動能
     score = np.where(df['MACD_Hist'] > 0, score + 20, score - 20)
-    
-    # RSI 強弱區
     score = np.where(df['RSI'] > 55, score + 10, score)
     score = np.where(df['RSI'] < 45, score - 10, score)
 
-    # --- C. 量價結構 (Volume) ---
+    # C. 量價
     vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
     vol_ratio = df['Volume'] / vol_ma
-    
     is_up = df['Close'] > df['Close'].shift(1)
     is_down = df['Close'] < df['Close'].shift(1)
-    
     score = np.where(is_up & (vol_ratio > 1.2), score + 20, score)
     score = np.where(is_down & (vol_ratio > 1.2), score - 20, score)
     
-    # --- D. 區間限制與平滑 ---
+    # ====================================================
+    # 3. 關鍵修正：去噪與平滑
+    # ====================================================
     score = np.clip(score, -100, 100)
-    
     final_series = pd.Series(score, index=df.index)
     
-    # 平滑化 (SMA 3)
-    df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
-    df['Alpha_Score'] = df['Alpha_Score'].fillna(0)
+    # [修正1]：如果算出是 0 (通常代表數據缺失或無效)，將其替換為 NaN
+    # 這樣在 rolling mean 時會自動忽略它，或者我們可以 forward fill
+    final_series = final_series.replace(0, np.nan)
     
-    # 評語生成
+    # [修正2]：使用 ffill 填補空洞，讓分數延續昨天的狀態，而不是掉到 0
+    final_series = final_series.ffill().fillna(0) 
+
+    # [修正3]：加大一點平滑力道 (Window=4)，讓曲線更圓滑
+    df['Alpha_Score'] = final_series.rolling(4, min_periods=1).mean()
+    
+    # 評語
     df['Score_Log'] = np.where(df['Alpha_Score'] > 50, "強勢多頭",
                       np.where(df['Alpha_Score'] > 0, "偏多整理",
                       np.where(df['Alpha_Score'] > -50, "偏空整理", "弱勢空頭")))
     
-    # [關鍵修正] 補上這一行：將 -100~100 的分數映射回 0~100% 的持股建議
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
