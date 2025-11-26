@@ -437,17 +437,17 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略邏輯 v6.0: 動能噴出 (Slope Breakout)
-    slope_threshold: 評分單日變化量門檻 (建議 5~15)
+    策略邏輯 v7.0 (Hybrid): 趨勢濾網 + 恐慌抄底
+    修正1: 賣出加入 MA20 濾網，避免多頭回檔被洗掉。
+    修正2: 買進加入「恐慌抄底」邏輯，允許負分買進。
     """
     df = data.copy()
     
-    # 1. 確保有 Alpha Score
+    # 確保有 Alpha Score
     if 'Alpha_Score' not in df.columns:
         df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
-    # 2. 計算 Alpha Slope (變化率)
-    # diff(1) = 今天分數 - 昨天分數
+    # 計算 Alpha Slope
     df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
 
     positions = []; reasons = []; actions = []; target_prices = []
@@ -459,47 +459,68 @@ def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.0
     slope = df['Alpha_Slope'].values 
     close = df['Close'].values
     
-    # 防呆
+    # 防呆：確保有均線資料
+    ma20 = df['EMA20'].values if 'EMA20' in df.columns else close
     ma60 = df['EMA60'].values if 'EMA60' in df.columns else close
 
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
         ret_label = ""; conf_score = 0
         
-        # --- 進場邏輯 ---
+        # --- 進場邏輯 (Dual Entry) ---
         if position == 0:
-            # 條件：Alpha Slope 出現長紅 (大於門檻)
-            # 意義：評分急速轉強，代表動能點火
-            # 濾網：Alpha Score 至少要大於 0 (避免在深水區的騙線)
+            is_buy = False
+            
+            # 情境 A: 順勢突破 (Standard Momentum)
+            # 條件：Slope 轉強 + 分數為正 (確認多頭結構)
             if slope[i] >= slope_threshold and alpha[i] > 0:
+                is_buy = True
+                reason_str = f"順勢噴出 (Slope:+{int(slope[i])})"
+                conf_score = 70
+            
+            # 情境 B: 恐慌抄底 (V-Shape Reversal)
+            # 條件：Slope 極強 (報復性反彈) + 分數在深水區 (超跌)
+            # 這裡設定 Slope > 15 (更嚴格的動能要求)，但允許 Alpha < 0
+            elif slope[i] >= 15 and alpha[i] < -30:
+                is_buy = True
+                reason_str = f"恐慌抄底 (Slope:+{int(slope[i])})"
+                conf_score = 85 # 這種反轉通常利潤最高，信心給高
+            
+            if is_buy:
                 signal = 1
                 entry_price = close[i]
                 action_code = "Buy"
-                reason_str = f"動能噴出 (Slope:+{int(slope[i])})"
-                conf_score = min(60 + int(slope[i])*2, 99)
 
-        # --- 出場邏輯 ---
+        # --- 出場邏輯 (Trend Filtered Exit) ---
         elif position == 1:
             pnl = (close[i] - entry_price) / entry_price
             
             is_sell = False
             
-            # 1. 雙綠燈出場 (Trend Breakdown)
-            # 評分進入空方 (Score < 0) 且 動能持續衰退 (Slope < 0)
-            if alpha[i] < 0 and slope[i] < 0:
+            # 1. 趨勢破壞賣出 (Trend Breakdown)
+            # 條件：(分數轉弱 AND 斜率轉弱) AND (跌破月線 MA20)
+            # [關鍵修正] 只有在跌破月線時，才理會評分轉弱。守住月線就續抱。
+            if (alpha[i] < 0 and slope[i] < 0) and (close[i] < ma20[i]):
                 is_sell = True
-                reason_str = "雙綠燈轉空"
+                reason_str = "破線轉弱"
             
-            # 2. 停損 (Stop Loss) - 設寬一點給趨勢發展
+            # 2. 獲利回吐保護 (Profit Protection)
+            # 如果獲利曾經 > 20%，現在跌破 MA20，也強制出場
+            elif pnl > 0.20 and close[i] < ma20[i]:
+                is_sell = True
+                reason_str = "獲利了結"
+
+            # 3. 硬性停損 (Stop Loss)
+            # 設 10%
             elif pnl < -0.10:
                 is_sell = True
                 reason_str = "觸發停損"
                 
-            # (可選) 3. 季線保護
-            # 如果跌破季線，無論分數如何都先跑
-            elif close[i] < ma60[i] and pnl < -0.05:
+            # 4. 極端風險出場
+            # 如果分數直接崩跌到 -50 以下，不管有沒有破線，先跑再說
+            elif alpha[i] < -50:
                 is_sell = True
-                reason_str = "破季線停損"
+                reason_str = "評分崩盤"
 
             if is_sell:
                 signal = 0
