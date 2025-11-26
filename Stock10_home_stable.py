@@ -746,8 +746,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.0 (Momentum Trend): 動能順勢版
-    目的：配合「Slope 買入策略」，股價上漲時分數必須上升，才能創造正向斜率。
+    Alpha Score v6.1 (Balanced Momentum): 多空平衡版
+    修正：加入扣分機制，確保分數能呈現負值 (空頭趨勢)，讓賣出訊號 (Score < 0) 能正常運作。
+    區間：-100 (極空) ~ +100 (極多)
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -755,8 +756,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 1. 基礎指標運算
     # ====================================================
-    # EMA (反應比 SMA 快)
-    df['EMA10'] = df['Close'].ewm(span=10, adjust=False).mean()
     df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
     
@@ -776,50 +775,57 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['MACD_Hist'] = (dif - dea) * 2
 
     # ====================================================
-    # 2. 順勢因子計分 (總分 -100 ~ +100)
+    # 2. 多空計分邏輯 (對稱加扣分)
     # ====================================================
     score = np.zeros(len(df))
 
-    # A. 均線趨勢 (Trend) - 佔 40%
-    # 收盤在月線之上，且月線向上
-    ma20_slope = df['EMA20'].diff()
-    c1 = (df['Close'] > df['EMA20']) & (ma20_slope > 0)
-    score = np.where(c1, score + 20, score)
+    # --- A. 趨勢結構 (Trend) ---
+    # 多頭：收盤在月線之上 (+30)
+    # 空頭：收盤在月線之下 (-30)
+    score = np.where(df['Close'] > df['EMA20'], score + 30, score - 30)
     
-    # 多頭排列 (季線向上且股價在季線上)
-    c2 = (df['Close'] > df['EMA60']) & (df['EMA60'] > df['EMA60'].shift(1))
-    score = np.where(c2, score + 20, score)
+    # 趨勢強化：多頭排列 vs 空頭排列
+    # 多頭排列 (月線 > 季線) -> 再加 10
+    # 空頭排列 (月線 < 季線) -> 再扣 10
+    score = np.where(df['EMA20'] > df['EMA60'], score + 10, score - 10)
 
-    # B. 動能爆發 (Momentum) - 佔 40%
-    # RSI 處於強勢區 (50~80)
-    score = np.where((df['RSI'] > 50) & (df['RSI'] <= 80), score + 20, score)
-    # MACD 柱狀圖翻紅或擴大
-    score = np.where(df['MACD_Hist'] > 0, score + 20, score)
+    # --- B. 動能方向 (Momentum) ---
+    # MACD 柱狀圖翻紅 (+20) vs 翻綠 (-20)
+    score = np.where(df['MACD_Hist'] > 0, score + 20, score - 20)
+    
+    # RSI 強弱區
+    # 強勢區 (>55) -> +10
+    # 弱勢區 (<45) -> -10
+    score = np.where(df['RSI'] > 55, score + 10, score)
+    score = np.where(df['RSI'] < 45, score - 10, score)
 
-    # C. 量能確認 (Volume) - 佔 20%
-    vol_ma = df['Volume'].rolling(20).mean()
-    # 這裡防除以零
-    vol_ratio = df['Volume'] / vol_ma.replace(0, 1)
-    # 價漲量增
-    score = np.where((df['Close'] > df['Close'].shift(1)) & (vol_ratio > 1.1), score + 20, score)
-
-    # D. 過熱修正 (不強制扣分，僅微調，避免 Slope 轉負)
-    # 只有極度過熱 (RSI > 85) 才稍微壓抑分數，不要讓它直接跳水
-    score = np.where(df['RSI'] > 85, score - 10, score)
-
-    # ====================================================
-    # 3. 輸出處理
-    # ====================================================
+    # --- C. 量價結構 (Volume) ---
+    vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
+    vol_ratio = df['Volume'] / vol_ma
+    
+    # 價漲量增 (攻擊) -> +20
+    # 價跌量增 (出貨/殺盤) -> -20
+    is_up = df['Close'] > df['Close'].shift(1)
+    is_down = df['Close'] < df['Close'].shift(1)
+    
+    score = np.where(is_up & (vol_ratio > 1.2), score + 20, score)
+    score = np.where(is_down & (vol_ratio > 1.2), score - 20, score)
+    
+    # --- D. 區間限制與平滑 ---
+    # 確保極端值不超過 100
+    score = np.clip(score, -100, 100)
+    
     final_series = pd.Series(score, index=df.index)
     
-    # 平滑化 (重要：讓斜率不要太抖動)
+    # 平滑化 (SMA 3)
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
-    df['Alpha_Score'] = df['Alpha_Score'].fillna(0).clip(-100, 100)
+    df['Alpha_Score'] = df['Alpha_Score'].fillna(0)
     
-    # 評語
-    df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭",
-                      np.where(df['Alpha_Score'] < 0, "空頭/盤整", "多方整理"))
-                      
+    # 評語生成
+    df['Score_Log'] = np.where(df['Alpha_Score'] > 50, "強勢多頭",
+                      np.where(df['Alpha_Score'] > 0, "偏多整理",
+                      np.where(df['Alpha_Score'] > -50, "偏空整理", "弱勢空頭")))
+
     return df
 
 # ==========================================
