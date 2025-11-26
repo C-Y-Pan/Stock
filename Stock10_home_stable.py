@@ -559,30 +559,31 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
     """
-    優化：針對 Alpha 策略尋找最佳的 [買入評分門檻]
+    [修正版] 優化器：正確呼叫 Alpha Momentum 策略，並尋找最佳參數
     """
     best_ret = -999; best_params = None; best_df = None
     target_start = pd.to_datetime(user_start_date)
     
     # 1. 先計算好所有指標與 Alpha Score (避免在迴圈內重複計算，提升效能)
-    #    注意：這裡必須先呼叫一次 calculate_alpha_score
+    #    注意：這裡必須先呼叫一次 calculate_alpha_score 產生基礎數據
     df_ind = calculate_indicators(raw_df, 10, 3.0, market_df)
-    df_scored = calculate_alpha_score(df_ind, pd.DataFrame(), pd.DataFrame()) # 先算出 Slope
+    df_scored = calculate_alpha_score(df_ind, pd.DataFrame(), pd.DataFrame()) 
     
     df_slice = df_scored[df_scored['Date'] >= target_start].copy()
     if df_slice.empty: return None, None
 
-    # 2. 參數網格搜尋
-    # 我們測試不同的 "買入評分門檻" (60, 70, 75) 與 "賣出動能門檻" (-3, -5, -8)
+    # 2. 參數網格搜尋 (Grid Search)
+    #    我們測試不同的 "買入評分門檻" 來尋找最佳解
+    #    注意：Strategy C (連續5日>50) 是固定規則，不受此參數影響，但會一同被執行
     param_grid = [
-        {'buy_thresh': 60, 'sell_slope': -3},
-        {'buy_thresh': 60, 'sell_slope': -5},
-        {'buy_thresh': 70, 'sell_slope': -5}, # 較嚴謹
+        {'buy_thresh': 55, 'sell_slope': -3}, # 寬鬆
+        {'buy_thresh': 60, 'sell_slope': -5}, # 標準
+        {'buy_thresh': 70, 'sell_slope': -5}, # 嚴謹
         {'buy_thresh': 75, 'sell_slope': -8}, # 極嚴謹
     ]
 
     for params in param_grid:
-        # 呼叫新的策略函式
+        # [關鍵修正] 這裡改為呼叫新的 run_alpha_momentum_strategy
         df_res = run_alpha_momentum_strategy(
             df_slice, 
             buy_score_thresh=params['buy_thresh'], 
@@ -591,37 +592,15 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
             tax_rate=tax_rate
         )
         
-        # 評估績效
+        # 評估績效 (使用累積報酬率)
         ret = df_res['Cum_Strategy'].iloc[-1] - 1
         
         if ret > best_ret:
             best_ret = ret
-            # 這裡為了相容原本的 UI 顯示 key，我們保留 'Return' key
             best_params = params
             best_params['Return'] = ret
             best_df = df_res
             
-    return best_params, best_df
-
-# 修改後：傳遞成本參數
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
-    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
-    
-    # 為了節省運算，這裡只展示部分參數組合，實務上可擴增
-    for m in [3.0, 3.5]:
-        for r in [25, 30]:
-            df_ind = calculate_indicators(raw_df, 10, m, market_df)
-            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
-            if df_slice.empty: continue
-            
-            # [關鍵] 傳入成本參數
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate)
-            
-            ret = df_res['Cum_Strategy'].iloc[-1] - 1
-            if ret > best_ret:
-                best_ret = ret
-                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
-                best_df = df_res
     return best_params, best_df
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
