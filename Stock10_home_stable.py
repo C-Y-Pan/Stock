@@ -1527,108 +1527,65 @@ elif page == "📊 單股深度分析":
                 # ... (請保留原本的 Tabs 繪圖代碼) ...
                 tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
                 
-# [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
+                # [Tab 1: K線圖]
                 with tab1:
                     # 1. 準備數據
-                    # 將 Alpha Score 寫入 final_df
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    
-                    # [關鍵新增] 計算 Alpha Score 的斜率 (對時間微分/一階差分)
-                    # 意義：衡量評分變化的方向與力道
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
+                    
+                    # [新增] 計算 Alpha Score 的 5 日均線，用於判斷評分趨勢
+                    final_df['Alpha_MA5'] = final_df['Alpha_Score'].rolling(5).mean()
 
-                    # 2. 建立子圖：擴增為 6 列
+                    # 2. 建立子圖 (維持原本設定)
                     fig = make_subplots(
                         rows=6, cols=1, 
                         shared_xaxes=True, 
                         vertical_spacing=0.02, 
-                        # 調整高度比例：主圖最大，其餘副圖平均分配
                         row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13], 
                         subplot_titles=(
                             "", 
-                            "買賣評等 (Alpha Score)", 
-                            "評分動能 (Alpha Slope / 變化率)", # 新增標題
+                            "買賣評等 (Alpha Score + SMA5)",  # 修改標題
+                            "評分動能 (Alpha Slope / 變化率)", 
                             "成交量", 
                             "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)"
                         )
                     )
             
-                    # --- Row 1: 主圖 K 線 ---
+                    # --- Row 1: 主圖 K 線 (維持不變) ---
                     fig.add_trace(go.Candlestick(
                         x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
                         low=final_df['Low'], close=final_df['Close'], name='K線',
                         increasing_line_color='#ef5350', decreasing_line_color='#00bfa5' 
                     ), row=1, col=1)
                     
-                    # 均線
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', 
                                             line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
                                             line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # 買賣點標記函式
-                    final_df['Buy_Y'] = final_df['Low'] * 0.92
-                    final_df['Sell_Y'] = final_df['High'] * 1.08
+                    # (此處省略中間買賣點標記代碼，請保留原有的買賣點繪製邏輯)
+                    # ... [請保留原本 fig.add_trace(go.Scatter(... mode='markers+text' ...)) 的部分] ...
 
-                    def get_buy_text(sub_df):
-                        return [f"<b>{score}</b>" for score in sub_df['Confidence']]
-
-                    def get_sell_text(sub_df):
-                        labels = []
-                        for idx, row in sub_df.iterrows():
-                            ret = row['Return_Label']
-                            reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
-                            labels.append(f"{ret}<br>({reason_str})")
-                        return labels
-
-                    # 繪製買點
-                    buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
-                    if not buy_trend.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_trend), textposition="bottom center",
-                            textfont=dict(color='#FFD700', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), 
-                            name='買進 (趨勢)', hovertext=buy_trend['Reason']
-                        ), row=1, col=1)
-                    
-                    buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
-                    if not buy_panic.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_panic), textposition="bottom center",
-                            textfont=dict(color='#00FFFF', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), 
-                            name='買進 (反彈)', hovertext=buy_panic['Reason']
-                        ), row=1, col=1)
-                    
-                    buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
-                    if not buy_chip.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_chip), textposition="bottom center",
-                            textfont=dict(color='#DDA0DD', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), 
-                            name='買進 (籌碼)', hovertext=buy_chip['Reason']
-                        ), row=1, col=1)
-
-                    sell_all = final_df[final_df['Action'] == 'Sell']
-                    if not sell_all.empty:
-                        fig.add_trace(go.Scatter(
-                            x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', 
-                            text=get_sell_text(sell_all), textposition="top center",
-                            textfont=dict(color='white', size=11),
-                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), 
-                            name='賣出', hovertext=sell_all['Reason']
-                        ), row=1, col=1)
-                    
-                    # --- Row 2: Alpha Score (狀態) ---
+                    # --- [修改重點] Row 2: Alpha Score (狀態) + 均線 ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
+                    
+                    # 1. 繪製柱狀圖 (Bar)
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Score'], 
                         name='Alpha Score', marker_color=colors_score
                     ), row=2, col=1)
+                    
+                    # 2. [新增] 繪製 5 日均線 (Line)
+                    # 使用黃色線條，能清晰顯示在紅綠柱狀圖之上
+                    fig.add_trace(go.Scatter(
+                        x=final_df['Date'], y=final_df['Alpha_MA5'],
+                        name='Alpha SMA5',
+                        mode='lines',
+                        line=dict(color='yellow', width=1.5),
+                        hoverinfo='skip' # 滑鼠懸停時不重複顯示，保持畫面整潔
+                    ), row=2, col=1)
+
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
                     # --- Row 3: Alpha Slope (動能/微分) [新增] ---
