@@ -557,8 +557,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     df['Cum_Market']=(1+df['Market_Return']).cumprod()
     return df
 
-
-
 # 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
     best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
