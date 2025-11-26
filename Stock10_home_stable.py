@@ -746,9 +746,8 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.1 (Balanced Momentum): 多空平衡版
-    修正：加入扣分機制，確保分數能呈現負值 (空頭趨勢)，讓賣出訊號 (Score < 0) 能正常運作。
-    區間：-100 (極空) ~ +100 (極多)
+    Alpha Score v6.1 (Balanced Momentum) - Fix: 補回 Recommended_Position
+    修正：補上建議持股水位的計算，解決 KeyError。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -784,9 +783,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 空頭：收盤在月線之下 (-30)
     score = np.where(df['Close'] > df['EMA20'], score + 30, score - 30)
     
-    # 趨勢強化：多頭排列 vs 空頭排列
-    # 多頭排列 (月線 > 季線) -> 再加 10
-    # 空頭排列 (月線 < 季線) -> 再扣 10
+    # 趨勢強化
     score = np.where(df['EMA20'] > df['EMA60'], score + 10, score - 10)
 
     # --- B. 動能方向 (Momentum) ---
@@ -794,8 +791,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     score = np.where(df['MACD_Hist'] > 0, score + 20, score - 20)
     
     # RSI 強弱區
-    # 強勢區 (>55) -> +10
-    # 弱勢區 (<45) -> -10
     score = np.where(df['RSI'] > 55, score + 10, score)
     score = np.where(df['RSI'] < 45, score - 10, score)
 
@@ -803,8 +798,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
     vol_ratio = df['Volume'] / vol_ma
     
-    # 價漲量增 (攻擊) -> +20
-    # 價跌量增 (出貨/殺盤) -> -20
     is_up = df['Close'] > df['Close'].shift(1)
     is_down = df['Close'] < df['Close'].shift(1)
     
@@ -812,7 +805,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     score = np.where(is_down & (vol_ratio > 1.2), score - 20, score)
     
     # --- D. 區間限制與平滑 ---
-    # 確保極端值不超過 100
     score = np.clip(score, -100, 100)
     
     final_series = pd.Series(score, index=df.index)
@@ -825,6 +817,9 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Score_Log'] = np.where(df['Alpha_Score'] > 50, "強勢多頭",
                       np.where(df['Alpha_Score'] > 0, "偏多整理",
                       np.where(df['Alpha_Score'] > -50, "偏空整理", "弱勢空頭")))
+    
+    # [關鍵修正] 補上這一行：將 -100~100 的分數映射回 0~100% 的持股建議
+    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
 
