@@ -603,6 +603,26 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
             
     return best_params, best_df
 
+# 修改後：傳遞成本參數
+def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
+    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
+    
+    # 為了節省運算，這裡只展示部分參數組合，實務上可擴增
+    for m in [3.0, 3.5]:
+        for r in [25, 30]:
+            df_ind = calculate_indicators(raw_df, 10, m, market_df)
+            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
+            if df_slice.empty: continue
+            
+            # [關鍵] 傳入成本參數
+            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate)
+            
+            ret = df_res['Cum_Strategy'].iloc[-1] - 1
+            if ret > best_ret:
+                best_ret = ret
+                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
+                best_df = df_res
+    return best_params, best_df
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
