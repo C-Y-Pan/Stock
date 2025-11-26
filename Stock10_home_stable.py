@@ -557,92 +557,67 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     df['Cum_Market']=(1+df['Market_Return']).cumprod()
     return df
 
+
+
+# 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
-    """
-    [修正版] 優化器：正確呼叫 Alpha Momentum 策略，並尋找最佳參數
-    """
-    best_ret = -999; best_params = None; best_df = None
-    target_start = pd.to_datetime(user_start_date)
+    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
     
-    # 1. 先計算好所有指標與 Alpha Score (避免在迴圈內重複計算，提升效能)
-    #    注意：這裡必須先呼叫一次 calculate_alpha_score 產生基礎數據
-    df_ind = calculate_indicators(raw_df, 10, 3.0, market_df)
-    df_scored = calculate_alpha_score(df_ind, pd.DataFrame(), pd.DataFrame()) 
-    
-    df_slice = df_scored[df_scored['Date'] >= target_start].copy()
-    if df_slice.empty: return None, None
-
-    # 2. 參數網格搜尋 (Grid Search)
-    #    我們測試不同的 "買入評分門檻" 來尋找最佳解
-    #    注意：Strategy C (連續5日>50) 是固定規則，不受此參數影響，但會一同被執行
-    param_grid = [
-        {'buy_thresh': 55, 'sell_slope': -3}, # 寬鬆
-        {'buy_thresh': 60, 'sell_slope': -5}, # 標準
-        {'buy_thresh': 70, 'sell_slope': -5}, # 嚴謹
-        {'buy_thresh': 75, 'sell_slope': -8}, # 極嚴謹
-    ]
-
-    for params in param_grid:
-        # [關鍵修正] 這裡改為呼叫新的 run_alpha_momentum_strategy
-        df_res = run_alpha_momentum_strategy(
-            df_slice, 
-            buy_score_thresh=params['buy_thresh'], 
-            sell_slope_thresh=params['sell_slope'],
-            fee_rate=fee_rate, 
-            tax_rate=tax_rate
-        )
-        
-        # 評估績效 (使用累積報酬率)
-        ret = df_res['Cum_Strategy'].iloc[-1] - 1
-        
-        if ret > best_ret:
-            best_ret = ret
-            best_params = params
-            best_params['Return'] = ret
-            best_df = df_res
+    # 為了節省運算，這裡只展示部分參數組合，實務上可擴增
+    for m in [3.0, 3.5]:
+        for r in [25, 30]:
+            df_ind = calculate_indicators(raw_df, 10, m, market_df)
+            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
+            if df_slice.empty: continue
             
+            # [關鍵] 傳入成本參數
+            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate)
+            
+            ret = df_res['Cum_Strategy'].iloc[-1] - 1
+            if ret > best_ret:
+                best_ret = ret
+                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
+                best_df = df_res
     return best_params, best_df
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
-    [修正版] 樣本外測試：適配 Alpha Momentum 策略參數
+    執行嚴謹的樣本外測試 (Walk-Forward Analysis 簡化版)
+    Split Ratio: 訓練集佔比 (預設 70%)
     """
     # 1. 資料切割
     total_len = len(raw_df)
-    if total_len < 100: return None 
+    if total_len < 100: return None # 資料過少無法驗證
     
     split_idx = int(total_len * split_ratio)
     train_data_raw = raw_df.iloc[:split_idx].copy()
     test_data_raw = raw_df.iloc[split_idx:].copy()
     
+    # 確保切分後的測試集有足夠數據
     if len(test_data_raw) < 30: return None
 
-    # 2. 訓練階段 (In-Sample): 找出最佳 buy_thresh 與 sell_slope
+    # 2. 訓練階段 (In-Sample): 在過去數據找最佳參數
+    # 注意：start_date 設為訓練集的第一天
     train_start_date = train_data_raw['Date'].min()
     best_params_train, train_res_df = run_optimization(train_data_raw, market_df, train_start_date, fee_rate, tax_rate)
     
     if best_params_train is None: return None
 
-    # 3. 測試階段 (Out-of-Sample): 固定參數跑未來數據
+    # 3. 測試階段 (Out-of-Sample): 用訓練好的參數去跑未來的數據
+    # 關鍵：這裡不能再做 run_optimization，必須固定參數
     
-    # [修正點 1] 指標計算：Multiplier 固定為 3.0 (與 run_optimization 一致)
-    # 因為新的優化器不再調整 Mult，所以這裡不能讀取 best_params_train['Mult']
-    test_ind = calculate_indicators(test_data_raw, 10, 3.0, market_df)
+    # 先計算測試集的指標 (使用訓練集找出的最佳 Multiplier)
+    test_ind = calculate_indicators(test_data_raw, 10, best_params_train['Mult'], market_df)
     
-    # [修正點 2] 策略執行：改呼叫 run_alpha_momentum_strategy 並傳入正確參數
-    test_res_df = run_alpha_momentum_strategy(
-        test_ind, 
-        buy_score_thresh=best_params_train['buy_thresh'], 
-        sell_slope_thresh=best_params_train['sell_slope'],
-        fee_rate=fee_rate, 
-        tax_rate=tax_rate
-    )
+    # 執行策略 (使用訓練集找出的最佳 RSI 閾值)
+    test_res_df = run_simple_strategy(test_ind, best_params_train['RSI_Buy'], fee_rate, tax_rate)
     
     # 4. 績效比較與指標計算
     def get_metrics(df):
-        if df.empty: return 0, 0, 0
+        if df.empty: return 0, 0
         cum_ret = df['Cum_Strategy'].iloc[-1] - 1
         mdd = calculate_mdd(df['Cum_Strategy'])
+        # 年化報酬估算
         days = (df['Date'].max() - df['Date'].min()).days
         cagr = ((1 + cum_ret) ** (365/days) - 1) if days > 0 else 0
         return cum_ret, mdd, cagr
@@ -860,24 +835,21 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 5. [關鍵修正] 平滑化與索引對齊
     # ====================================================
+    # 重點：必須指定 index=df.index，否則會因為索引錯位導致全部變成 NaN
     final_series = pd.Series(final_score_array, index=df.index)
     
-    # 第一次平滑：計算 Alpha Score (3日平均，減少單日雜訊)
+    # 進行滾動平均 (填補空缺，確保連續性)
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
-    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0).clip(-100, 100)
-
-    # ====================================================
-    # [NEW] 6. 計算 Alpha Slope (評分動能)
-    # ====================================================
-    # 1. 原始斜率 (一階差分)
-    df['Alpha_Slope_Raw'] = df['Alpha_Score'].diff().fillna(0)
     
-    # 2. 平滑斜率 (3日平均)：這是為了避免單日數值跳動造成的假訊號 (Anti-Whipsaw)
-    #    所有的交易訊號將基於這個平滑後的 Slope
-    df['Alpha_Slope'] = df['Alpha_Slope_Raw'].rolling(3, min_periods=1).mean().fillna(0)
+    # [最後防線]：如果最後幾天計算出來是 NaN (可能因即時資料缺失)，
+    # 強制向前填充 (Forward Fill)，確保圖表不會斷頭
+    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0)
+    
+    # 限制範圍
+    df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
 
     # ====================================================
-    # 7. 生成文字建議 (Log)
+    # 6. 生成建議
     # ====================================================
     df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭", 
                       np.where(df['Alpha_Score'] < -60, "弱勢空頭", "盤整震盪"))
@@ -885,154 +857,6 @@ def calculate_alpha_score(df, margin_df, short_df):
 
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
-    return df
-
-def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5, fee_rate=0.001425, tax_rate=0.003):
-    """
-    Alpha 策略 v7.1 (Logic Fix): 修正 elif 造成的邏輯遮蔽，確保策略 C 能被執行。
-    """
-    df = data.copy()
-    
-    # 若無 Alpha Score 則現場計算
-    if 'Alpha_Score' not in df.columns or 'Alpha_Slope' not in df.columns:
-        df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
-
-    positions = []; reasons = []; actions = []; target_prices = []
-    return_labels = []; confidences = []
-    
-    position = 0; entry_price = 0.0
-    
-    # 數據快取 (Numpy Array 加速)
-    close = df['Close'].values
-    open_p = df['Open'].values
-    score = df['Alpha_Score'].values
-    slope = df['Alpha_Slope'].values
-    ma5 = df['Close'].rolling(5).mean().values
-    ma20 = df['MA20'].values
-    ma60 = df['MA60'].values if 'MA60' in df.columns else df['Close'].values
-    obv = df['OBV'].values
-    obv_ma = df['OBV_MA20'].values
-    rsi = df['RSI'].values
-    
-    # 嘗試讀取 VIX
-    vix = df['VIX'].values if 'VIX' in df.columns else np.full(len(df), 20.0)
-    
-    # [參數設定]
-    stop_loss_pct = 0.08       # 基礎停損: 8%
-    
-    for i in range(len(df)):
-        signal = position
-        reason_str = ""
-        action_code = "Hold" if position == 1 else "Wait"
-        this_target = entry_price * 1.15 if position == 1 else np.nan
-        ret_label = ""
-        conf_score = 0
-        
-        # 確保有足夠的歷史數據進行回溯 (至少 5 天)
-        if i < 5: 
-            positions.append(0); reasons.append(""); actions.append("Wait"); 
-            target_prices.append(np.nan); return_labels.append(""); confidences.append(0)
-            continue
-
-        # =========================================
-        # 1. 定義恐慌狀態 (Panic State) - 用於豁免停損
-        # =========================================
-        is_oversold = (rsi[i] < 25)
-        is_deep_bias = (close[i] < ma60[i] * 0.85)
-        is_market_crash = (vix[i] > 30)
-        is_panic_state = is_oversold or is_deep_bias or is_market_crash
-
-        # =========================================
-        # 2. 進場邏輯 (Buy)
-        # =========================================
-        if position == 0:
-            is_buy = False
-            
-            # --- 策略 A: 動能回調重啟 (Reversal) ---
-            # 邏輯：評分高位 + 動能由負轉正 + 趨勢向上
-            cond_score = (score[i] >= buy_score_thresh)
-            cond_slope = (slope[i] > 0.5) and (slope[i-1] <= 0)
-            cond_trend = (close[i] > ma60[i])
-            
-            if cond_score and cond_slope and cond_trend:
-                is_buy = True; reason_str = "動能回調重啟"; conf_score = 85
-
-            # --- 策略 B: 籌碼止跌確認 (Bottom Fishing) ---
-            # [修正] 改用 if not is_buy，避免 elif 阻斷後續檢查
-            if not is_buy:
-                trend_is_up = (ma60[i] > ma60[i-5]) and (close[i] > ma60[i])
-                chip_divergence = (close[i] < ma20[i]) and (obv[i] > obv_ma[i])
-                price_trigger = (close[i] > ma5[i]) and (close[i] > open_p[i])
-                safe_zone = (rsi[i] > 40)
-                
-                if trend_is_up and chip_divergence and price_trigger and safe_zone:
-                    is_buy = True; reason_str = "籌碼止跌確認"; conf_score = 75
-
-            # --- 策略 C: 趨勢慣性延續 (Persistence) ---
-            # [修正] 改用 if not is_buy，確保這裡能被執行到
-            if not is_buy:
-                # 檢查過去 5 天 (包含今天 i, i-1, i-2, i-3, i-4)
-                recent_scores = score[i-4 : i+1]
-                
-                # 條件：全數 > 50 且 股價位於季線之上
-                persistence_check = np.all(recent_scores > 50)
-                trend_check = (close[i] > ma60[i])
-                
-                if persistence_check and trend_check:
-                    is_buy = True; reason_str = "強勢動能延續"; conf_score = 80
-
-            if is_buy:
-                signal = 1; entry_price = close[i]; action_code = "Buy"
-
-        # =========================================
-        # 3. 出場邏輯 (Sell)
-        # =========================================
-        elif position == 1:
-            drawdown = (close[i] - entry_price) / entry_price
-            is_sell = False
-            
-            # 情境 A: 觸發停損線
-            if drawdown < -stop_loss_pct:
-                if is_panic_state:
-                    is_sell = False; action_code = "Hold"; reason_str = "恐慌豁免停損"
-                else:
-                    is_sell = True; reason_str = "觸發停損"
-            
-            # 情境 B: 獲利回吐或趨勢改變
-            elif not is_panic_state:
-                if (score[i] < 20) and (slope[i] < sell_slope_thresh):
-                    is_sell = True; reason_str = "動能衰竭"
-                elif (close[i] < ma60[i] * 0.98):
-                    is_sell = True; reason_str = "趨勢破壞"
-
-            if is_sell:
-                signal = 0; action_code = "Sell"
-                pnl = (close[i] - entry_price) / entry_price * 100
-                sign = "+" if pnl > 0 else ""
-                ret_label = f"{sign}{pnl:.1f}%"
-
-        position = signal
-        positions.append(signal); reasons.append(reason_str); actions.append(action_code)
-        target_prices.append(this_target); return_labels.append(ret_label)
-        confidences.append(conf_score if action_code == "Buy" else 0)
-
-    df['Position'] = positions; df['Reason'] = reasons; df['Action'] = actions
-    df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
-    df['Confidence'] = confidences
-
-    # === 計算績效 ===
-    df['Real_Position'] = df['Position'].shift(1).fillna(0)
-    df['Market_Return'] = df['Close'].pct_change().fillna(0)
-    df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
-    
-    cost_series = pd.Series(0.0, index=df.index)
-    cost_series[df['Action'] == 'Buy'] = fee_rate
-    cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
-    
-    df['Strategy_Return'] = df['Strategy_Return'] - cost_series
-    df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
-    df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
-    
     return df
 
 # ==========================================
