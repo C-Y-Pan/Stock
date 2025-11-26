@@ -908,10 +908,7 @@ def calculate_alpha_score(df, margin_df, short_df):
 
 def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5, fee_rate=0.001425, tax_rate=0.003):
     """
-    Alpha 策略 v7.0 (Persistence Added): 
-    1. 加入「Score 連續 5 日 > 50」買入規則，捕捉主升段慣性。
-    2. 保留「恐慌豁免停損」機制。
-    3. 保留「籌碼止跌」與「動能回調」策略。
+    Alpha 策略 v7.1 (Logic Fix): 修正 elif 造成的邏輯遮蔽，確保策略 C 能被執行。
     """
     df = data.copy()
     
@@ -980,8 +977,8 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
                 is_buy = True; reason_str = "動能回調重啟"; conf_score = 85
 
             # --- 策略 B: 籌碼止跌確認 (Bottom Fishing) ---
-            # 邏輯：季線向上 + 籌碼背離 + 站上MA5
-            elif not is_buy:
+            # [修正] 改用 if not is_buy，避免 elif 阻斷後續檢查
+            if not is_buy:
                 trend_is_up = (ma60[i] > ma60[i-5]) and (close[i] > ma60[i])
                 chip_divergence = (close[i] < ma20[i]) and (obv[i] > obv_ma[i])
                 price_trigger = (close[i] > ma5[i]) and (close[i] > open_p[i])
@@ -990,13 +987,13 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
                 if trend_is_up and chip_divergence and price_trigger and safe_zone:
                     is_buy = True; reason_str = "籌碼止跌確認"; conf_score = 75
 
-            # --- [新增] 策略 C: 趨勢慣性延續 (Persistence) ---
-            # 邏輯：Alpha Score 連續 5 日大於 50 (強勢慣性)
-            elif not is_buy:
+            # --- 策略 C: 趨勢慣性延續 (Persistence) ---
+            # [修正] 改用 if not is_buy，確保這裡能被執行到
+            if not is_buy:
                 # 檢查過去 5 天 (包含今天 i, i-1, i-2, i-3, i-4)
                 recent_scores = score[i-4 : i+1]
                 
-                # 條件：全數 > 50 且 股價位於季線之上 (避免空頭反彈騙線)
+                # 條件：全數 > 50 且 股價位於季線之上
                 persistence_check = np.all(recent_scores > 50)
                 trend_check = (close[i] > ma60[i])
                 
@@ -1016,18 +1013,14 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
             # 情境 A: 觸發停損線
             if drawdown < -stop_loss_pct:
                 if is_panic_state:
-                    # 恐慌狀態下豁免賣出
                     is_sell = False; action_code = "Hold"; reason_str = "恐慌豁免停損"
                 else:
                     is_sell = True; reason_str = "觸發停損"
             
-            # 情境 B: 獲利回吐或趨勢改變 (非恐慌狀態下執行)
+            # 情境 B: 獲利回吐或趨勢改變
             elif not is_panic_state:
-                # 智能出場：評分轉弱 且 動能轉負
                 if (score[i] < 20) and (slope[i] < sell_slope_thresh):
                     is_sell = True; reason_str = "動能衰竭"
-                
-                # 破線出場：跌破季線
                 elif (close[i] < ma60[i] * 0.98):
                     is_sell = True; reason_str = "趨勢破壞"
 
