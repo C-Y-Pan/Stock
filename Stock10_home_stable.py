@@ -1531,12 +1531,17 @@ elif page == "📊 單股深度分析":
                 with tab1:
                     # 1. 準備數據
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
+                    
+                    # 計算 Alpha Score 的 5 日均線 (用於 Row 2)
+                    final_df['Alpha_MA5'] = final_df['Alpha_Score'].rolling(5).mean()
+                    
+                    # [保留] 原始 Alpha Slope (原始分數的變化量) -> 用於畫柱狀圖
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
                     
-                    # [新增] 計算 Alpha Score 的 5 日均線，用於判斷評分趨勢
-                    final_df['Alpha_MA5'] = final_df['Alpha_Score'].rolling(20).mean()
+                    # [新增] 均線的 Slope (MA5 的變化量) -> 用於畫黃色曲線
+                    final_df['Alpha_MA_Slope'] = final_df['Alpha_MA5'].diff().fillna(0)
 
-                    # 2. 建立子圖 (維持原本設定)
+                    # 2. 建立子圖
                     fig = make_subplots(
                         rows=6, cols=1, 
                         shared_xaxes=True, 
@@ -1544,8 +1549,8 @@ elif page == "📊 單股深度分析":
                         row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13], 
                         subplot_titles=(
                             "", 
-                            "買賣評等 (Alpha Score + SMA5)",  # 修改標題
-                            "評分動能 (Alpha Slope / 變化率)", 
+                            "買賣評等 (Alpha Score + SMA5)", 
+                            "評分動能 (Raw Slope + MA Slope)", # 修改標題
                             "成交量", 
                             "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)"
@@ -1564,39 +1569,56 @@ elif page == "📊 單股深度分析":
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
                                             line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # (此處省略中間買賣點標記代碼，請保留原有的買賣點繪製邏輯)
+                    # (買賣點標記代碼，請保留原有的邏輯)
                     # ... [請保留原本 fig.add_trace(go.Scatter(... mode='markers+text' ...)) 的部分] ...
-
-                    # --- [修改重點] Row 2: Alpha Score (狀態) + 均線 ---
-                    colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
+                    # 為了確保代碼可運行，這裡補上必要的變數定義
+                    final_df['Buy_Y'] = final_df['Low'] * 0.92
+                    final_df['Sell_Y'] = final_df['High'] * 1.08
                     
-                    # 1. 繪製柱狀圖 (Bar)
+                    buy_pts = final_df[final_df['Action'] == 'Buy']
+                    if not buy_pts.empty:
+                        fig.add_trace(go.Scatter(
+                            x=buy_pts['Date'], y=buy_pts['Buy_Y'], mode='markers',
+                            marker=dict(symbol='triangle-up', size=14, color='#FFD700'), name='買進'
+                        ), row=1, col=1)
+                    
+                    sell_pts = final_df[final_df['Action'] == 'Sell']
+                    if not sell_pts.empty:
+                        fig.add_trace(go.Scatter(
+                            x=sell_pts['Date'], y=sell_pts['Sell_Y'], mode='markers',
+                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF'), name='賣出'
+                        ), row=1, col=1)
+
+                    # --- Row 2: Alpha Score + SMA5 Line ---
+                    colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Score'], 
                         name='Alpha Score', marker_color=colors_score
                     ), row=2, col=1)
                     
-                    # 2. [新增] 繪製 5 日均線 (Line)
-                    # 使用黃色線條，能清晰顯示在紅綠柱狀圖之上
                     fig.add_trace(go.Scatter(
                         x=final_df['Date'], y=final_df['Alpha_MA5'],
-                        name='Alpha SMA5',
-                        mode='lines',
-                        line=dict(color='yellow', width=1.5),
-                        hoverinfo='skip' # 滑鼠懸停時不重複顯示，保持畫面整潔
+                        name='Alpha SMA5', mode='lines',
+                        line=dict(color='yellow', width=1.5), hoverinfo='skip'
                     ), row=2, col=1)
-
+                    
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
-                    # --- Row 3: Alpha Slope (動能/微分) [新增] ---
-                    # 邏輯：斜率 > 0 代表評分正在改善 (轉強) -> 紅色
-                    #       斜率 < 0 代表評分正在惡化 (轉弱) -> 綠色
+                    # --- [修改重點] Row 3: 原始 Slope (柱狀) + MA Slope (黃線) ---
+                    # 1. 柱狀圖：顯示單日原始變化 (Raw Slope)
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Slope'],
-                        name='Alpha Slope', marker_color=colors_slope
+                        name='Raw Slope', marker_color=colors_slope, opacity=0.6 # 稍微調透明一點，讓黃線更明顯
                     ), row=3, col=1)
-                    # 加一條零軸線
+                    
+                    # 2. 折線圖：顯示趨勢變化 (MA Slope)
+                    fig.add_trace(go.Scatter(
+                        x=final_df['Date'], y=final_df['Alpha_MA_Slope'],
+                        name='MA Slope', mode='lines',
+                        line=dict(color='yellow', width=1.5)
+                    ), row=3, col=1)
+                    
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
 
                     # --- Row 4: 成交量 ---
@@ -1612,12 +1634,10 @@ elif page == "📊 單股深度分析":
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
                     
                     # Layout 設定
-                    # 增加總高度以容納 6 張圖
                     fig.update_layout(height=1200, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
-                                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
+                                      legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
                     
                     fig.update_yaxes(side='right')
-                    
                     st.plotly_chart(fig, use_container_width=True)
 
                 # [Tab 2: 權益曲線]
