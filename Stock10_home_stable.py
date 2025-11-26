@@ -1530,126 +1530,124 @@ elif page == "📊 單股深度分析":
                 # [Tab 1: K線圖]
                 with tab1:
                     # ==========================================
-                    # 1. [新增] 使用者互動控制項
+                    # 1. 使用者互動控制項
                     # ==========================================
-                    st.write("") # 排版留白
+                    st.write("") 
                     c_ctrl, c_blank = st.columns([1, 3])
                     with c_ctrl:
-                        # 讓使用者調整 Alpha Score 的平滑天數
                         ma_window = st.slider("Alpha 均線天數 (平滑度)", min_value=2, max_value=20, value=5)
 
                     # ==========================================
-                    # 2. 數據計算 (動態調整)
+                    # 2. 數據計算
                     # ==========================================
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    
-                    # [動態] 計算指定天數的 Alpha 均線
                     final_df['Alpha_MA_Dynamic'] = final_df['Alpha_Score'].rolling(ma_window).mean()
-                    
-                    # [保留] 原始 Alpha Slope (原始分數的變化量) -> 柱狀圖
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
-                    
-                    # [動態] 均線的 Slope (MA 的變化量) -> 黃色曲線
                     final_df['Alpha_MA_Slope'] = final_df['Alpha_MA_Dynamic'].diff().fillna(0)
 
                     # ==========================================
-                    # 3. 繪圖邏輯
+                    # 3. 準備繪圖 (雙 Y 軸設定)
                     # ==========================================
+                    
+                    # 定義 Subplot 結構：Row 3 啟用 secondary_y (雙軸)
+                    specs_list = [
+                        [{"secondary_y": False}], 
+                        [{"secondary_y": False}], 
+                        [{"secondary_y": True}],  # <--- Row 3 啟用雙軸
+                        [{"secondary_y": False}], 
+                        [{"secondary_y": False}], 
+                        [{"secondary_y": False}]
+                    ]
+
                     fig = make_subplots(
                         rows=6, cols=1, 
                         shared_xaxes=True, 
-                        vertical_spacing=0.02, 
+                        vertical_spacing=0.03, # 稍微拉開間距避免刻度重疊
                         row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13], 
+                        specs=specs_list,
                         subplot_titles=(
                             "", 
-                            f"買賣評等 (Alpha Score + SMA{ma_window})",  # 標題動態顯示天數
-                            f"評分動能 (Raw Slope + MA{ma_window} Slope)", # 標題動態顯示天數
+                            f"買賣評等 (Alpha Score + SMA{ma_window})", 
+                            f"評分動能 (柱狀=Raw / 黃線=SMA{ma_window} Slope)", 
                             "成交量", 
                             "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)"
                         )
                     )
             
-                    # --- Row 1: 主圖 K 線 ---
+                    # --- Row 1: K線 (維持不變) ---
                     fig.add_trace(go.Candlestick(
                         x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
                         low=final_df['Low'], close=final_df['Close'], name='K線',
                         increasing_line_color='#ef5350', decreasing_line_color='#00bfa5' 
                     ), row=1, col=1)
-                    
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', 
-                                            line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
-                                            line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', line=dict(color='yellow', width=1), name='停損線'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
                     # 買賣點標記
-                    final_df['Buy_Y'] = final_df['Low'] * 0.92
-                    final_df['Sell_Y'] = final_df['High'] * 1.08
-                    
+                    final_df['Buy_Y'] = final_df['Low'] * 0.92; final_df['Sell_Y'] = final_df['High'] * 1.08
                     buy_pts = final_df[final_df['Action'] == 'Buy']
                     if not buy_pts.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_pts['Date'], y=buy_pts['Buy_Y'], mode='markers',
-                            marker=dict(symbol='triangle-up', size=14, color='#FFD700'), name='買進'
-                        ), row=1, col=1)
-                    
+                        fig.add_trace(go.Scatter(x=buy_pts['Date'], y=buy_pts['Buy_Y'], mode='markers', marker=dict(symbol='triangle-up', size=14, color='#FFD700'), name='買進'), row=1, col=1)
                     sell_pts = final_df[final_df['Action'] == 'Sell']
                     if not sell_pts.empty:
-                        fig.add_trace(go.Scatter(
-                            x=sell_pts['Date'], y=sell_pts['Sell_Y'], mode='markers',
-                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF'), name='賣出'
-                        ), row=1, col=1)
+                        fig.add_trace(go.Scatter(x=sell_pts['Date'], y=sell_pts['Sell_Y'], mode='markers', marker=dict(symbol='triangle-down', size=14, color='#FF00FF'), name='賣出'), row=1, col=1)
 
-                    # --- Row 2: Alpha Score + Dynamic SMA Line ---
+                    # --- Row 2: Alpha Score + MA Line ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
-                    fig.add_trace(go.Bar(
-                        x=final_df['Date'], y=final_df['Alpha_Score'], 
-                        name='Alpha Score', marker_color=colors_score
-                    ), row=2, col=1)
-                    
-                    # 繪製動態均線
-                    fig.add_trace(go.Scatter(
-                        x=final_df['Date'], y=final_df['Alpha_MA_Dynamic'],
-                        name=f'Alpha SMA{ma_window}', mode='lines',
-                        line=dict(color='yellow', width=1.5), hoverinfo='skip'
-                    ), row=2, col=1)
-                    
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Score'], name='Alpha Score', marker_color=colors_score), row=2, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Alpha_MA_Dynamic'], name=f'Alpha SMA{ma_window}', mode='lines', line=dict(color='yellow', width=1.5), hoverinfo='skip'), row=2, col=1)
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
-                    # --- Row 3: 原始 Slope (柱狀) + MA Slope (黃線) ---
-                    # 1. 柱狀圖：顯示單日原始變化
+                    # --- [修改重點] Row 3: 雙 Y 軸設定 ---
+                    
+                    # 1. 左軸 (Primary): 繪製柱狀圖 (Raw Slope)
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Slope'],
-                        name='Raw Slope', marker_color=colors_slope, opacity=0.6
-                    ), row=3, col=1)
+                        name='Raw Slope (左軸)', marker_color=colors_slope, opacity=0.5
+                    ), row=3, col=1, secondary_y=False)
                     
-                    # 2. 折線圖：顯示趨勢變化 (Dynamic MA Slope)
+                    # 2. 右軸 (Secondary): 繪製黃線 (MA Slope)
+                    # 這樣黃線會自動根據自己的數值範圍填滿高度，不會被壓扁
                     fig.add_trace(go.Scatter(
                         x=final_df['Date'], y=final_df['Alpha_MA_Slope'],
-                        name=f'MA{ma_window} Slope', mode='lines',
-                        line=dict(color='yellow', width=1.5)
-                    ), row=3, col=1)
+                        name='Trend Slope (右軸)', mode='lines',
+                        line=dict(color='yellow', width=2)
+                    ), row=3, col=1, secondary_y=True)
                     
+                    # 3. [關鍵] 強制對稱縮放 (Symmetric Scaling)
+                    # 確保左右兩軸的 0 線對齊，這對判斷多空至關重要
+                    max_bar = max(abs(final_df['Alpha_Slope'].max()), abs(final_df['Alpha_Slope'].min())) * 1.1 if not final_df.empty else 10
+                    max_line = max(abs(final_df['Alpha_MA_Slope'].max()), abs(final_df['Alpha_MA_Slope'].min())) * 1.1 if not final_df.empty else 10
+                    
+                    # 防呆：避免 max 為 0 導致報錯
+                    max_bar = max_bar if max_bar > 0 else 10
+                    max_line = max_line if max_line > 0 else 2
+                    
+                    fig.update_yaxes(range=[-max_bar, max_bar], row=3, col=1, secondary_y=False) # 左軸
+                    fig.update_yaxes(range=[-max_line, max_line], row=3, col=1, secondary_y=True) # 右軸
+                    
+                    # 畫 0 軸線 (參考用)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
 
-                    # --- Row 4: 成交量 ---
+                    # --- Row 4, 5, 6: 其他指標 ---
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=4, col=1)
                     
-                    # --- Row 5: OBV ---
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=5, col=1)
                     
-                    # --- Row 6: RSI ---
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=6, col=1)
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=6, col=1)
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
                     
                     # Layout 設定
-                    fig.update_layout(height=1200, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
+                    fig.update_layout(height=1300, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
                                       legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
                     
-                    fig.update_yaxes(side='right')
+                    fig.update_yaxes(side='right', secondary_y=False) # 所有主軸在右
+                    fig.update_yaxes(side='left', row=3, col=1, secondary_y=True) # 只有 Row 3 的黃線軸在左
+                    
                     st.plotly_chart(fig, use_container_width=True)
 
                 # [Tab 2: 權益曲線]
