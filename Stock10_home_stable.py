@@ -435,81 +435,126 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold_score, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003):
     """
-    Alpha Score v5.0 回測系統 (寬鬆出場版)
+    執行策略回測，計算含成本淨報酬，並加入「AI 信心值」計算
     """
-    # 計算分數
-    df = calculate_alpha_score(data, pd.DataFrame(), pd.DataFrame())
-    
+    df = data.copy()
     positions = []; reasons = []; actions = []; target_prices = []
-    return_labels = []; confidences = []
+    return_labels = []; confidences = [] # [新增] 信心值列表
     
-    position = 0; entry_price = 0.0
-    close = df['Close'].values
-    scores = df['Alpha_Score'].values
+    position = 0; days_held = 0; entry_price = 0.0; trade_type = 0
     
+    # 轉為 numpy array 加速迭代
+    close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
+    bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
+    volume = df['Volume'].values; vol_ma20 = df['Vol_MA20'].values
+    obv = df['OBV'].values; obv_ma20 = df['OBV_MA20'].values
+    market_panic = df['Is_Market_Panic'].values
+    
+    # [新增] 預先計算布林帶寬，用於判斷壓縮
+    bb_width = (df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']
+    bb_width_vals = bb_width.values
+
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
         this_target = entry_price * 1.15 if position == 1 else np.nan
-        ret_label = ""; conf_score = 0 
-
-        current_score = scores[i]
-        current_close = close[i]
+        ret_label = ""; conf_score = 0 # [新增] 預設信心分數
 
         # --- 進場邏輯 ---
         if position == 0:
-            # 買進門檻：建議設為 30 或 40，確認趨勢成形才進場
-            if current_score >= buy_threshold_score:
-                signal = 1; entry_price = current_close
-                action_code = "Buy"
-                reason_str = f"趨勢轉強 ({int(current_score)})"
-                conf_score = int(current_score)
-
-        # --- 出場邏輯 (關鍵修改) ---
+            is_buy = False
+            # 策略 A: 動能突破
+            if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>55 and obv[i]>obv_ma20[i]):
+                is_buy=True; trade_type=1; reason_str="動能突破"
+            # 策略 B: 均線回測
+            elif trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
+                is_buy=True; trade_type=1; reason_str="均線回測"
+            # 策略 C: 籌碼佈局
+            elif close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
+                is_buy=True; trade_type=3; reason_str="籌碼佈局"
+            # 策略 D: 超賣反彈
+            elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
+                is_buy=True; trade_type=2; reason_str="超賣反彈"
+            
+            if is_buy:
+                signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
+                
+                # === [核心演算法] 計算信心值 (0-99) ===
+                base_score = 60 # 基礎分
+                
+                # 1. 量能因子 (+15)
+                if volume[i] > vol_ma20[i] * 1.5: base_score += 15
+                elif volume[i] > vol_ma20[i]: base_score += 8
+                
+                # 2. 趨勢因子 (+10)
+                # 判斷 MA60 斜率 (簡單判定：當前 > 5天前)
+                if i > 5 and ma60[i] > ma60[i-5] and close[i] > ma60[i]: base_score += 10
+                
+                # 3. RSI 位階因子 (+10)
+                # 突破策略在 60-75 最強，反彈策略在 <25 最強
+                if trade_type == 1 and 60 <= rsi[i] <= 75: base_score += 10
+                elif trade_type == 2 and rsi[i] <= 25: base_score += 10
+                
+                # 4. 波動壓縮因子 (+5)
+                # 如果前幾天布林帶寬很窄 (小於 0.1)，現在擴大，代表噴出
+                if i > 3 and bb_width_vals[i-1] < 0.15: base_score += 5
+                
+                conf_score = min(base_score, 99) # 上限 99
+        
+        # --- 出場邏輯 ---
         elif position == 1:
-            drawdown = (current_close - entry_price) / entry_price
+            days_held+=1
+            drawdown=(close[i]-entry_price)/entry_price
+            
+            # 動態調整策略類型
+            if trade_type==2 and trend[i]==1: trade_type=1; reason_str="反彈轉波段"
+            if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1; reason_str="佈局完成發動"
             
             is_sell = False
-            
-            # 1. 硬停損
+            # 停損
             if drawdown < -0.10:
-                is_sell = True; reason_str = "觸發停損"
-            
-            # 2. 趨勢轉弱出場
-            # [關鍵] 不要 < 0 就賣，要 < -20 才賣
-            # 這給予了分數在 30 -> 0 -> -10 之間震盪的空間 (容錯區間)
-            elif current_score < -20:
-                is_sell = True; reason_str = f"趨勢破壞 ({int(current_score)})"
+                is_sell=True; reason_str="觸發停損"; action_code="Sell"
+            # 鎖倉期
+            elif days_held <= 3:
+                action_code="Hold"; reason_str="鎖倉觀察"
+            # 條件出場
+            else:
+                if trade_type==1 and trend[i]==-1: is_sell=True; reason_str="趨勢轉弱"
+                elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
+                elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
                 
             if is_sell:
-                signal = 0; action_code = "Sell"
-                pnl = (current_close - entry_price) / entry_price * 100
+                signal=0; action_code="Sell"
+                pnl = (close[i] - entry_price) / entry_price * 100
                 sign = "+" if pnl > 0 else ""
                 ret_label = f"{sign}{pnl:.1f}%"
 
-        position = signal
+        position=signal
         positions.append(signal); reasons.append(reason_str); actions.append(action_code)
         target_prices.append(this_target); return_labels.append(ret_label)
-        confidences.append(conf_score if action_code == "Buy" else 0)
+        confidences.append(conf_score if action_code == "Buy" else 0) # 記錄信心值
         
-    df['Position'] = positions; df['Reason'] = reasons; df['Action'] = actions
-    df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
-    df['Confidence'] = confidences
+    df['Position']=positions; df['Reason']=reasons; df['Action']=actions
+    df['Target_Price']=target_prices; df['Return_Label']=return_labels
+    df['Confidence'] = confidences # [新增]
     
-    # 計算報酬
+    # === 計算含成本報酬 ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
+    
+    # 1. 策略毛利
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     
+    # 2. 扣除成本 (Buy: 手續費, Sell: 手續費+稅)
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
     
     df['Strategy_Return'] = df['Strategy_Return'] - cost_series
-    df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
-    df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
+    df['Cum_Strategy']=(1+df['Strategy_Return']).cumprod()
+    df['Cum_Market']=(1+df['Market_Return']).cumprod()
     return df
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
@@ -730,101 +775,112 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.0 (Regime Separation): 恐慌/空頭分離版
-    核心哲學：
-    1. 「恐慌大跌」是買點 (Score = +100)。
-    2. 「非恐慌空頭」是賣點 (Score = -100)。
-    3. 「正常多頭」是持倉 (Score = +60)。
+    Alpha Score v3.1 (Robust Fix): 修復索引對齊與數據缺失問題
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據與防呆
+    # 1. 基礎數據準備與防呆
     # ====================================================
-    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
+    # 填充基礎欄位，防止因某天無交易量導致運算崩潰
+    if 'Volume' in df.columns:
+        df['Volume'] = df['Volume'].fillna(0)
     
-    # 均線
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['MA60'] = df['Close'].rolling(60).mean()
+    # 均線 (若無則補算)
+    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
+    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
-    # 乖離率
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
+    # MACD
+    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
+    dif = exp12 - exp26
+    dea = dif.ewm(span=9, adjust=False).mean()
     
-    # KD 指標 (判斷是否超跌)
-    low_min = df['Low'].rolling(9).min()
-    high_max = df['High'].rolling(9).max()
-    rsv = (df['Close'] - low_min) / (high_max - low_min).replace(0, 1) * 100
-    k_val = rsv.ewm(com=2).mean()
+    # 布林通道 %B
+    std20 = df['Close'].rolling(20).std()
+    bb_up = df['MA20'] + 2 * std20
+    bb_low = df['MA20'] - 2 * std20
+    bb_width = (bb_up - bb_low).replace(0, 1) # 防除以零
+    pct_b = (df['Close'] - bb_low) / bb_width
 
-    # VIX (恐慌指數) - 關鍵指標
+    # ====================================================
+    # 2. 四大因子量化計分
+    # ====================================================
+    
+    # A. 趨勢因子
+    # 使用 ffill 避免當天 MA60 缺值
+    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
+    score_trend = (bias_60 / 0.20) * 100
+    score_trend = score_trend.clip(-100, 100)
+    
+    # B. 動能因子
+    # RSI 若有空值填補 50 (中性)
+    curr_rsi = df['RSI'].fillna(50)
+    score_rsi = (curr_rsi - 50) * 2
+    score_macd = np.where(dif > dea, 50, -50)
+    score_mom = (score_rsi + score_macd) / 1.5
+    score_mom = score_mom.clip(-100, 100)
+    
+    # C. 波動位置因子
+    score_pos = (pct_b.fillna(0.5) - 0.5) * 200
+    score_pos = score_pos.clip(-100, 100)
+
+    # D. 籌碼/量能因子
+    vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
+    vol_ratio = df['Volume'] / vol_ma
+    # 填補可能的空值
+    vol_ratio = vol_ratio.fillna(1.0)
+    price_dir = np.sign(df['Close'].diff().fillna(0))
+    score_vol = (vol_ratio - 1) * price_dir * 30
+    score_vol = score_vol.clip(-50, 50)
+
+    # ====================================================
+    # 3. 綜合加權
+    # ====================================================
+    raw_score = (
+        score_trend * 0.35 + 
+        score_mom * 0.30 + 
+        score_pos * 0.25 + 
+        score_vol * 0.10
+    )
+
+    # ====================================================
+    # 4. 市場體制修正 (Panic Correction)
+    # ====================================================
+    # 確保 VIX 有值
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].fillna(20.0)
+    
+    is_panic = (df['VIX'] > 25) & ((curr_rsi < 30) | (bias_60 < -0.15))
+    
+    # 恐慌修正邏輯
+    panic_score = abs(raw_score) + (df['VIX'] - 20) * 2
+    final_score_array = np.where(is_panic, panic_score, raw_score)
 
     # ====================================================
-    # 2. 邏輯分支 (Regime Logic)
+    # 5. [關鍵修正] 平滑化與索引對齊
     # ====================================================
+    # 重點：必須指定 index=df.index，否則會因為索引錯位導致全部變成 NaN
+    final_series = pd.Series(final_score_array, index=df.index)
     
-    # --- 情境 A: 恐慌大跌 (Panic Crash) -> 進場做多 ---
-    # 定義：VIX 飆高 (>25) 且 (KD 低檔鈍化 < 20 或 負乖離過大 < -15%)
-    # 意義：市場情緒崩潰，通常是短線黃金坑
-    cond_panic = (df['VIX'] > 25) & ((k_val < 20) | (bias_60 < -0.15))
-    
-    # --- 情境 B: 非恐慌空頭 (Structural Bear) -> 離場觀望 ---
-    # 定義：股價在季線下，但 VIX 不高 (< 25) 且 KD 沒有超賣 (> 30)
-    # 意義：這是「陰跌」或「趨勢走空」，沒有恐慌買盤支撐，必須清倉
-    cond_bear = (df['Close'] < df['MA60']) & (df['VIX'] <= 25) & (k_val > 30)
-    
-    # --- 情境 C: 正常多頭 (Normal Bull) -> 順勢持倉 ---
-    # 定義：股價在季線上
-    cond_bull = (df['Close'] >= df['MA60'])
-
-    # --- 情境 D: 多頭過熱 (Overheat) -> 減碼 ---
-    # 定義：乖離率過大
-    cond_overheat = (bias_60 > 0.20)
-
-    # ====================================================
-    # 3. 給分 (Scoring)
-    # ====================================================
-    # 預設為 0 (觀望)
-    raw_score = np.zeros(len(df))
-    
-    # 1. 優先處理多頭 (Base)
-    raw_score = np.where(cond_bull, 60, raw_score) # 正常多頭給 60 分 (持倉)
-    
-    # 2. 處理過熱 (Trim)
-    raw_score = np.where(cond_overheat, 20, raw_score) # 過熱降為 20 分 (減碼)
-    
-    # 3. 處理空頭 (Sell) - 權重高於多頭
-    raw_score = np.where(cond_bear, -100, raw_score) # 非恐慌空頭，直接 -100 (清倉)
-    
-    # 4. 處理恐慌 (Buy) - 權重最高 (Override everything)
-    # 即使跌破季線 (符合空頭條件)，只要是恐慌狀態，就反轉為買進
-    raw_score = np.where(cond_panic, 100, raw_score) # 恐慌大跌，給 100 分 (All-in)
-
-    # ====================================================
-    # 5. 平滑化與輸出
-    # ====================================================
-    # 建立 Series
-    final_series = pd.Series(raw_score, index=df.index)
-    
-    # 使用 rolling(3) 稍微過濾單日雜訊，但因為有 +/- 100 的極端值，反應依然會很快
+    # 進行滾動平均 (填補空缺，確保連續性)
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
     
-    # 填補
-    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0).clip(-100, 100)
+    # [最後防線]：如果最後幾天計算出來是 NaN (可能因即時資料缺失)，
+    # 強制向前填充 (Forward Fill)，確保圖表不會斷頭
+    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0)
     
-    # 生成建議文字 (Logs)
-    conditions = [
-        (df['Alpha_Score'] >= 80), # 恐慌買進 或 強勢突破
-        (df['Alpha_Score'] <= -80), # 空頭清倉
-        (df['Alpha_Score'] > 0),    # 多頭持有
-        (df['Alpha_Score'] <= 0)    # 震盪/觀察
-    ]
-    choices = ["危機入市/強力買進", "趨勢轉空/清倉", "多頭續抱", "保守觀望"]
-    df['Score_Log'] = np.select(conditions, choices, default="中性")
-    
-    # 建議倉位
+    # 限制範圍
+    df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
+
+    # ====================================================
+    # 6. 生成建議
+    # ====================================================
+    df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭", 
+                      np.where(df['Alpha_Score'] < -60, "弱勢空頭", "盤整震盪"))
+    df['Score_Log'] = np.where(is_panic, "恐慌超跌(修正轉正)", df['Score_Log'])
+
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
