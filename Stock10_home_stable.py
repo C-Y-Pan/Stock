@@ -437,17 +437,17 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略邏輯：動能斜率策略 (Slope Momentum)
-    slope_threshold: 定義什麼叫「長紅」斜率 (例如單日評分增加 5 分以上)
+    策略邏輯 v6.0: 動能噴出 (Slope Breakout)
+    slope_threshold: 評分單日變化量門檻 (建議 5~15)
     """
     df = data.copy()
     
-    # 確保有 Alpha Score
+    # 1. 確保有 Alpha Score
     if 'Alpha_Score' not in df.columns:
         df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
-    # [關鍵新增] 計算 Alpha Slope (評分變化率)
-    # diff(1) 代表今天的評分減昨天的評分
+    # 2. 計算 Alpha Slope (變化率)
+    # diff(1) = 今天分數 - 昨天分數
     df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
 
     positions = []; reasons = []; actions = []; target_prices = []
@@ -456,46 +456,50 @@ def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.0
     position = 0; entry_price = 0.0
     
     alpha = df['Alpha_Score'].values
-    slope = df['Alpha_Slope'].values # 這是買賣決策的核心
+    slope = df['Alpha_Slope'].values 
     close = df['Close'].values
     
+    # 防呆
+    ma60 = df['EMA60'].values if 'EMA60' in df.columns else close
+
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
         ret_label = ""; conf_score = 0
         
-        # --- 進場邏輯 (Buy Logic) ---
+        # --- 進場邏輯 ---
         if position == 0:
-            # 條件：出現「長紅 Alpha Slope」
-            # 也就是評分急速拉升，變化量超過門檻 (slope_threshold)
-            # 額外濾網：Alpha Score 最好不要已經是負的太離譜 (例如不要在極度過熱時追高)
-            if slope[i] >= slope_threshold:
+            # 條件：Alpha Slope 出現長紅 (大於門檻)
+            # 意義：評分急速轉強，代表動能點火
+            # 濾網：Alpha Score 至少要大於 0 (避免在深水區的騙線)
+            if slope[i] >= slope_threshold and alpha[i] > 0:
                 signal = 1
                 entry_price = close[i]
                 action_code = "Buy"
-                reason_str = f"評分噴出 (Slope:+{int(slope[i])})"
-                
-                # 信心度：斜率越陡，信心越高
-                base_conf = 60 + int(slope[i]) * 2
-                conf_score = min(base_conf, 99)
+                reason_str = f"動能噴出 (Slope:+{int(slope[i])})"
+                conf_score = min(60 + int(slope[i])*2, 99)
 
-        # --- 出場邏輯 (Sell Logic) ---
+        # --- 出場邏輯 ---
         elif position == 1:
             pnl = (close[i] - entry_price) / entry_price
             
             is_sell = False
             
-            # 1. 雙綠出場 (Double Green Exit)
-            # Alpha Score 為綠 (負分，代表進入風險區) 
-            # AND Alpha Slope 為綠 (負值，代表評分開始下滑)
+            # 1. 雙綠燈出場 (Trend Breakdown)
+            # 評分進入空方 (Score < 0) 且 動能持續衰退 (Slope < 0)
             if alpha[i] < 0 and slope[i] < 0:
                 is_sell = True
-                reason_str = f"雙綠燈警示 (Score:{int(alpha[i])})"
+                reason_str = "雙綠燈轉空"
             
-            # 2. 停損保護 (Stop Loss)
-            # 雖然依靠斜率，但仍需防止假突破
+            # 2. 停損 (Stop Loss) - 設寬一點給趨勢發展
             elif pnl < -0.10:
                 is_sell = True
                 reason_str = "觸發停損"
+                
+            # (可選) 3. 季線保護
+            # 如果跌破季線，無論分數如何都先跑
+            elif close[i] < ma60[i] and pnl < -0.05:
+                is_sell = True
+                reason_str = "破季線停損"
 
             if is_sell:
                 signal = 0
@@ -510,10 +514,9 @@ def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.0
     df['Position'] = positions; df['Reason'] = reasons; df['Action'] = actions
     df['Return_Label'] = return_labels; df['Confidence'] = confidences
     
-    # === 計算權益曲線 (含 Cum_Market 修正) ===
+    # === 績效計算 ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
-    
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     
     cost_series = pd.Series(0.0, index=df.index)
@@ -521,37 +524,26 @@ def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.0
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
     
     df['Strategy_Return'] = df['Strategy_Return'] - cost_series
-    
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
-    """
-    優化邏輯：尋找最佳的 Slope (評分變化率) 進場門檻
-    """
     best_ret = -999; best_params = None; best_df = None
     target_start = pd.to_datetime(user_start_date)
     
-    # 1. 基礎指標
-    df_ind = calculate_indicators(raw_df, 10, 3.0, market_df)
+    # 1. 預先計算 (使用 v6.0 順勢算法)
+    # 注意：這裡的計算會讓 Alpha Score 在漲勢中變高
+    df_scored = calculate_alpha_score(raw_df, pd.DataFrame(), pd.DataFrame())
     
-    # 2. 預先計算 Alpha Score (加速)
-    df_scored = calculate_alpha_score(df_ind, pd.DataFrame(), pd.DataFrame())
-    
-    # 3. 切割數據
     df_slice = df_scored[df_scored['Date'] >= target_start].copy()
     if df_slice.empty: return None, None
 
-    # 4. 參數空間搜尋
-    # 搜尋 Slope Threshold：
-    # 5:  小幅轉強就買 (頻繁)
-    # 10: 顯著轉強才買 (中庸)
-    # 15: 暴力噴出才買 (嚴格/追強勢)
-    for slope_thresh in [5, 8, 10, 12, 15]:
-        
-        # 執行策略
+    # 2. 搜尋 Slope 門檻
+    # 5: 敏感，容易買進
+    # 15: 嚴格，只有大漲噴出時才買
+    for slope_thresh in [5, 8, 10, 15]:
         df_res = run_simple_strategy(df_slice, slope_thresh, fee_rate, tax_rate)
         
         if df_res['Cum_Strategy'].empty: continue
@@ -559,8 +551,7 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
         
         if ret > best_ret:
             best_ret = ret
-            # 這裡的 'RSI_Buy' 欄位借用來存 Slope Threshold，方便顯示
-            best_params = {'Mult': 3.0, 'RSI_Buy': slope_thresh, 'Return': ret}
+            best_params = {'Mult': 0, 'RSI_Buy': slope_thresh, 'Return': ret}
             best_df = df_res
             
     return best_params, best_df
@@ -755,11 +746,8 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.0 (Contrarian / Mean Reversion): 逆勢策略版
-    核心邏輯：
-    1. 買進機會 (高分)：RSI 低檔鈍化、跌破布林下軌、乖離率過大 (負乖離)。
-    2. 賣出風險 (低分/負分)：RSI 高檔鈍化、突破布林上軌、乖離率過大 (正乖離)。
-    3. 評分越高代表「超賣程度」越嚴重 (適合買進)；評分越低代表「超買程度」越嚴重 (適合賣出)。
+    Alpha Score v6.0 (Momentum Trend): 動能順勢版
+    目的：配合「Slope 買入策略」，股價上漲時分數必須上升，才能創造正向斜率。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -767,7 +755,12 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 1. 基礎指標運算
     # ====================================================
-    # RSI (相對強弱)
+    # EMA (反應比 SMA 快)
+    df['EMA10'] = df['Close'].ewm(span=10, adjust=False).mean()
+    df['EMA20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA60'] = df['Close'].ewm(span=60, adjust=False).mean()
+    
+    # RSI
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(14).mean()
@@ -775,80 +768,57 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['RSI'] = 100 - (100 / (1 + rs))
     df['RSI'] = df['RSI'].fillna(50)
 
-    # 布林通道 (Bollinger Bands)
-    df['MA20'] = df['Close'].rolling(20).mean()
-    df['Std20'] = df['Close'].rolling(20).std()
-    df['BB_Upper'] = df['MA20'] + 2.0 * df['Std20']
-    df['BB_Lower'] = df['MA20'] - 2.0 * df['Std20']
-    
-    # %B 指標 (股價在通道的位置，<0 代表跌破下軌，>1 代表突破上軌)
-    bb_width = (df['BB_Upper'] - df['BB_Lower']).replace(0, 1)
-    df['Pct_B'] = (df['Close'] - df['BB_Lower']) / bb_width
-
-    # 乖離率 (Bias)
-    df['MA60'] = df['Close'].rolling(60).mean()
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 # 百分比
+    # MACD
+    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
+    dif = exp12 - exp26
+    dea = dif.ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = (dif - dea) * 2
 
     # ====================================================
-    # 2. 逆勢因子計分 (總分範圍約 -100 ~ +100)
+    # 2. 順勢因子計分 (總分 -100 ~ +100)
     # ====================================================
-    
-    # 初始化分數
     score = np.zeros(len(df))
 
-    # --- A. 恐慌買進因子 (加分項) ---
+    # A. 均線趨勢 (Trend) - 佔 40%
+    # 收盤在月線之上，且月線向上
+    ma20_slope = df['EMA20'].diff()
+    c1 = (df['Close'] > df['EMA20']) & (ma20_slope > 0)
+    score = np.where(c1, score + 20, score)
     
-    # 1. RSI 超賣偵測
-    # RSI < 30 (超賣) -> 開始加分
-    # RSI < 20 (極度恐慌) -> 大幅加分
-    rsi_val = df['RSI'].values
-    score = np.where(rsi_val < 30, score + (30 - rsi_val) * 2, score) 
-    score = np.where(rsi_val < 20, score + 20, score) # 極端值額外獎勵
+    # 多頭排列 (季線向上且股價在季線上)
+    c2 = (df['Close'] > df['EMA60']) & (df['EMA60'] > df['EMA60'].shift(1))
+    score = np.where(c2, score + 20, score)
 
-    # 2. 布林通道下軌偵測
-    # 跌破下軌 (%B < 0) 代表非理性殺盤
-    pct_b = df['Pct_B'].values
-    score = np.where(pct_b < 0, score + (0 - pct_b) * 100, score)
-    
-    # 3. 負乖離過大 (乖離率 < -10%)
-    bias_val = bias_60.values
-    score = np.where(bias_val < -10, score + abs(bias_val + 10) * 2, score)
+    # B. 動能爆發 (Momentum) - 佔 40%
+    # RSI 處於強勢區 (50~80)
+    score = np.where((df['RSI'] > 50) & (df['RSI'] <= 80), score + 20, score)
+    # MACD 柱狀圖翻紅或擴大
+    score = np.where(df['MACD_Hist'] > 0, score + 20, score)
 
-    # --- B. 狂熱賣出因子 (扣分項) ---
-    
-    # 1. RSI 高檔鈍化 (狂熱)
-    # RSI > 70 -> 開始扣分
-    # RSI > 80 -> 大幅扣分 (強烈賣訊)
-    score = np.where(rsi_val > 70, score - (rsi_val - 70) * 2, score)
-    score = np.where(rsi_val > 80, score - 30, score) # 鈍化懲罰
+    # C. 量能確認 (Volume) - 佔 20%
+    vol_ma = df['Volume'].rolling(20).mean()
+    # 這裡防除以零
+    vol_ratio = df['Volume'] / vol_ma.replace(0, 1)
+    # 價漲量增
+    score = np.where((df['Close'] > df['Close'].shift(1)) & (vol_ratio > 1.1), score + 20, score)
 
-    # 2. 布林通道上軌偵測
-    # 突破上軌 (%B > 1)
-    score = np.where(pct_b > 1, score - (pct_b - 1) * 100, score)
-    
-    # 3. 正乖離過大 (乖離率 > 15%)
-    score = np.where(bias_val > 15, score - (bias_val - 15) * 3, score)
-
-    # --- C. VIX 恐慌乘數 ---
-    # 當市場整體恐慌時 (VIX 高)，個股的超賣訊號可信度更高，給予分數加成
-    if 'VIX' in df.columns:
-        vix = df['VIX'].fillna(20).values
-        # 當 VIX > 25 且目前處於加分狀態 (Score > 0)，放大買進訊號
-        score = np.where((vix > 25) & (score > 0), score * 1.2, score)
+    # D. 過熱修正 (不強制扣分，僅微調，避免 Slope 轉負)
+    # 只有極度過熱 (RSI > 85) 才稍微壓抑分數，不要讓它直接跳水
+    score = np.where(df['RSI'] > 85, score - 10, score)
 
     # ====================================================
-    # 3. 數據輸出
+    # 3. 輸出處理
     # ====================================================
     final_series = pd.Series(score, index=df.index)
     
-    # 平滑化 (避免訊號閃爍)
+    # 平滑化 (重要：讓斜率不要太抖動)
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
     df['Alpha_Score'] = df['Alpha_Score'].fillna(0).clip(-100, 100)
     
-    # 生成對應評語 (逆勢邏輯)
-    df['Score_Log'] = np.where(df['Alpha_Score'] > 40, "恐慌超跌 (買進區)",
-                      np.where(df['Alpha_Score'] < -40, "過熱鈍化 (賣出區)",
-                      "中性/持有"))
+    # 評語
+    df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭",
+                      np.where(df['Alpha_Score'] < 0, "空頭/盤整", "多方整理"))
                       
     return df
 
