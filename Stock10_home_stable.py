@@ -437,22 +437,17 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold_score, fee_rate=0.001425, tax_rate=0.003):
     """
-    基於 Alpha Score v4.0 的回測系統
-    buy_threshold_score: 設定買進的積極度 (例如 20~30 分才買)
+    Alpha Score v5.0 回測系統 (寬鬆出場版)
     """
-    # 1. 先計算 Alpha Score
-    # 這裡傳入空籌碼資料，僅進行技術面與量能回測
-    # 注意：calculate_alpha_score 必須已經是 v4.0 版本
+    # 計算分數
     df = calculate_alpha_score(data, pd.DataFrame(), pd.DataFrame())
     
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
     
-    position = 0; days_held = 0; entry_price = 0.0
-    
-    # 轉為 numpy array 加速迭代
+    position = 0; entry_price = 0.0
     close = df['Close'].values
-    scores = df['Alpha_Score'].values # 取出計算好的分數
+    scores = df['Alpha_Score'].values
     
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
@@ -462,30 +457,30 @@ def run_simple_strategy(data, buy_threshold_score, fee_rate=0.001425, tax_rate=0
         current_score = scores[i]
         current_close = close[i]
 
-        # --- 進場邏輯 (Buy) ---
+        # --- 進場邏輯 ---
         if position == 0:
-            # 當分數超過買進門檻 (例如 30分)，代表動能與趨勢確認轉強
+            # 買進門檻：建議設為 30 或 40，確認趨勢成形才進場
             if current_score >= buy_threshold_score:
-                signal = 1; days_held = 0; entry_price = current_close
+                signal = 1; entry_price = current_close
                 action_code = "Buy"
-                reason_str = f"Alpha轉強 ({int(current_score)})"
-                conf_score = int(current_score) # 信心值即為當下分數
+                reason_str = f"趨勢轉強 ({int(current_score)})"
+                conf_score = int(current_score)
 
-        # --- 出場邏輯 (Sell) ---
+        # --- 出場邏輯 (關鍵修改) ---
         elif position == 1:
-            days_held += 1
             drawdown = (current_close - entry_price) / entry_price
             
             is_sell = False
             
-            # 1. 硬停損 (Hard Stop Loss) - 保護本金
+            # 1. 硬停損
             if drawdown < -0.10:
                 is_sell = True; reason_str = "觸發停損"
             
-            # 2. 訊號轉弱出場 (Alpha Exit)
-            # 分數跌破 0，代表動能消失或轉空 (v4.0 跌破 MA5 或 MACD 翻綠都會導致負分)
-            elif current_score < 0:
-                is_sell = True; reason_str = f"動能轉弱 ({int(current_score)})"
+            # 2. 趨勢轉弱出場
+            # [關鍵] 不要 < 0 就賣，要 < -20 才賣
+            # 這給予了分數在 30 -> 0 -> -10 之間震盪的空間 (容錯區間)
+            elif current_score < -20:
+                is_sell = True; reason_str = f"趨勢破壞 ({int(current_score)})"
                 
             if is_sell:
                 signal = 0; action_code = "Sell"
@@ -502,10 +497,9 @@ def run_simple_strategy(data, buy_threshold_score, fee_rate=0.001425, tax_rate=0
     df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # === 計算含成本報酬 ===
+    # 計算報酬
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
-    
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     
     cost_series = pd.Series(0.0, index=df.index)
@@ -513,7 +507,6 @@ def run_simple_strategy(data, buy_threshold_score, fee_rate=0.001425, tax_rate=0
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
     
     df['Strategy_Return'] = df['Strategy_Return'] - cost_series
-    
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
@@ -737,117 +730,90 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v4.0 (Leading Sensitive): 領先敏銳版
-    修正「買高賣低」的滯後問題。
+    Alpha Score v5.0 (Trend Stability): 趨勢穩定版
+    修正過度交易問題。
     特色：
-    1. 高檔乖離過大會扣分 (提早獲利了結)。
-    2. 跌破 MA5 立即反應 (敏感出場)。
-    3. 移除平滑化延遲。
+    1. 移除 MA5 敏感因子，改用 MA10/MA20。
+    2. 引入平滑化過濾雜訊。
+    3. 保留恐慌時的瞬間反應，但過濾平時的盤整震盪。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
-    # ====================================================
     # 1. 基礎數據準備
-    # ====================================================
-    # 填補空值
     if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
     
-    # 必須計算 MA5 (作為短線敏感開關)
-    df['MA5'] = df['Close'].rolling(5).mean()
-    if 'MA10' not in df.columns: df['MA10'] = df['Close'].rolling(10).mean()
-    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    df['MA10'] = df['Close'].rolling(10).mean()
+    df['MA20'] = df['Close'].rolling(20).mean()
+    df['MA60'] = df['Close'].rolling(60).mean()
     
-    # MACD (動能指標)
+    # MACD
     exp12 = df['Close'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     dif = exp12 - exp26
     dea = dif.ewm(span=9, adjust=False).mean()
-    macd_hist = (dif - dea) * 2
-
-    # KD 指標 (比 RSI 更敏感)
+    
+    # KD
     low_min = df['Low'].rolling(9).min()
     high_max = df['High'].rolling(9).max()
     rsv = (df['Close'] - low_min) / (high_max - low_min).replace(0, 1) * 100
     k_val = rsv.ewm(com=2).mean()
     
-    # 乖離率
     bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
 
     # ====================================================
-    # 2. 因子計分 (改用更敏感的邏輯)
+    # 2. 因子計分 (更穩健的邏輯)
     # ====================================================
     
-    # --- A. 趨勢因子 (Trend) - 權重降低，加入高檔懲罰 ---
-    # 原始趨勢分
-    score_trend = np.where(df['Close'] > df['MA60'], 40, -40)
+    # A. 趨勢因子 (Trend) - 看長做短
+    # 站上季線給分，季線向上再加分
+    ma60_slope = df['MA60'].diff()
+    score_trend = np.where(df['Close'] > df['MA60'], 30, -30)
+    score_trend = np.where((df['Close'] > df['MA60']) & (ma60_slope > 0), 50, score_trend)
     
-    # [關鍵修正1] 高檔懲罰 (Mean Reversion Penalty)
-    # 如果乖離率 > 20% (過熱)，趨勢分反而要減少，提示風險
-    overheated = bias_60 > 0.20
-    score_trend = np.where(overheated, score_trend * 0.5, score_trend) # 過熱時趨勢分砍半
-
-    # --- B. 動能因子 (Momentum) - 權重提高 ---
-    # 使用 MACD 柱狀體方向 (比 MACD 值更領先)
-    macd_delta = macd_hist.diff()
-    score_mom = np.where(macd_delta > 0, 30, -30)
+    # B. 動能因子 (Momentum) - 使用 MA20 作為波段生命線
+    # 不再使用 MA5，避免洗盤
+    score_short = np.where(df['Close'] > df['MA20'], 30, -30)
     
-    # --- C. 短線轉折因子 (Sensitive Reversal) - 新增 ---
-    # 站上 MA5 給分，跌破 MA5 扣分 (最即時的反應)
-    score_short = np.where(df['Close'] > df['MA5'], 30, -30)
-    
-    # --- D. 波動位置 (KD) ---
-    # KD > 80 過熱(扣分), KD < 20 超賣(加分)
-    score_osc = np.where(k_val > 80, -10, np.where(k_val < 20, 20, 0))
+    # C. MACD 趨勢確認
+    score_macd = np.where(dif > dea, 20, -20)
 
     # ====================================================
     # 3. 綜合計算
     # ====================================================
-    # 初始總分
-    raw_score = score_trend + score_mom + score_short + score_osc
+    raw_score = score_trend + score_short + score_macd
     
     # ====================================================
-    # 4. 關鍵修正邏輯 (Rule-based Overrides)
+    # 4. 特殊修正 (Overrides)
     # ====================================================
     
-    # [修正2] 致命一擊：高檔爆量長黑 (主力出貨)
-    # 條件：乖離大 + 跌破開盤價 + 量大
-    vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
-    cond_dump = (bias_60 > 0.15) & (df['Close'] < df['Open']) & (df['Volume'] > vol_ma * 1.5)
-    # 若發生主力出貨，直接扣 50 分，不管其他指標多好
-    raw_score = np.where(cond_dump, raw_score - 50, raw_score)
+    # [過熱修正] 乖離過大且 KD 死叉 -> 減碼 (不是清倉，是降低分數)
+    cond_overheat = (bias_60 > 0.25) & (k_val > 80)
+    raw_score = np.where(cond_overheat, raw_score - 40, raw_score)
     
-    # [修正3] 敏感出場：跌破 MA10 且 MACD 翻綠
-    cond_exit = (df['Close'] < df['MA10']) & (macd_hist < 0)
-    # 強制轉為負分 (賣訊)
-    raw_score = np.where(cond_exit, -30, raw_score)
-    
-    # [修正4] 恐慌體制修正 (Panic Buy)
-    # VIX 高且 KD 低檔 -> 黃金坑 (分數轉正)
+    # [恐慌修正] VIX 高且超跌 -> 黃金坑 (強制加分)
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].fillna(20.0)
+    is_panic = (df['VIX'] > 25) & (k_val < 20)
     
-    is_panic_bottom = (df['VIX'] > 25) & (k_val < 20)
-    raw_score = np.where(is_panic_bottom, abs(raw_score) + 30, raw_score)
+    # 若恐慌發生，直接給予高分，無視均線跌破
+    raw_score = np.where(is_panic, 80, raw_score)
 
     # ====================================================
-    # 5. 收尾處理
+    # 5. 平滑化與輸出
     # ====================================================
-    
-    # 建立 Series 確保索引對齊
     final_series = pd.Series(raw_score, index=df.index)
     
-    # [關鍵修正] 移除 rolling(3) 平滑化，改用最原始的靈敏數值
-    # 這樣訊號才會是「即時」的，不會滯後 3 天
-    df['Alpha_Score'] = final_series
+    # [關鍵] 使用 rolling(3) 消除單日雜訊
+    # 只有在連續 3 天平均分數都高時，才確認趨勢
+    df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
     
-    # 防呆填充
-    df['Alpha_Score'] = df['Alpha_Score'].fillna(0).clip(-100, 100)
+    # 填補與限制
+    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0).clip(-100, 100)
     
-    # 產生建議
-    df['Score_Log'] = np.where(df['Alpha_Score'] > 50, "強勢", 
-                      np.where(df['Alpha_Score'] < -20, "轉弱", "盤整"))
+    # 生成建議
+    df['Score_Log'] = np.where(df['Alpha_Score'] > 40, "波段持有", 
+                      np.where(df['Alpha_Score'] < -20, "空手觀望", "震盪整理"))
     
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
