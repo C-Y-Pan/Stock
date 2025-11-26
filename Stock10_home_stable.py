@@ -435,10 +435,10 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, slope_threshold=5, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略邏輯：逆勢操作 (Mean Reversion) - 修正版
-    修正：補回 Cum_Market 計算，解決 KeyError
+    策略邏輯：動能斜率策略 (Slope Momentum)
+    slope_threshold: 定義什麼叫「長紅」斜率 (例如單日評分增加 5 分以上)
     """
     df = data.copy()
     
@@ -446,51 +446,56 @@ def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rat
     if 'Alpha_Score' not in df.columns:
         df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
+    # [關鍵新增] 計算 Alpha Slope (評分變化率)
+    # diff(1) 代表今天的評分減昨天的評分
+    df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
+
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
     
     position = 0; entry_price = 0.0
     
     alpha = df['Alpha_Score'].values
+    slope = df['Alpha_Slope'].values # 這是買賣決策的核心
     close = df['Close'].values
-    rsi = df['RSI'].values
-    # 防呆：確保有 MA60，若無則用 Close 代替
-    ma60 = df['MA60'].values if 'MA60' in df.columns else close
     
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
         ret_label = ""; conf_score = 0
         
-        # --- 進場邏輯 (Buy on Panic) ---
+        # --- 進場邏輯 (Buy Logic) ---
         if position == 0:
-            # 當 Alpha Score 高於門檻 (代表市場極度恐慌/超跌)
-            if alpha[i] >= alpha_buy_threshold:
+            # 條件：出現「長紅 Alpha Slope」
+            # 也就是評分急速拉升，變化量超過門檻 (slope_threshold)
+            # 額外濾網：Alpha Score 最好不要已經是負的太離譜 (例如不要在極度過熱時追高)
+            if slope[i] >= slope_threshold:
                 signal = 1
                 entry_price = close[i]
                 action_code = "Buy"
-                reason_str = f"恐慌抄底 (Score:{int(alpha[i])})"
-                conf_score = int(alpha[i])
+                reason_str = f"評分噴出 (Slope:+{int(slope[i])})"
+                
+                # 信心度：斜率越陡，信心越高
+                base_conf = 60 + int(slope[i]) * 2
+                conf_score = min(base_conf, 99)
 
-        # --- 出場邏輯 (Sell on Euphoria/Dullness) ---
+        # --- 出場邏輯 (Sell Logic) ---
         elif position == 1:
             pnl = (close[i] - entry_price) / entry_price
             
             is_sell = False
             
-            # 1. 狂熱賣出 (Euphoria Sell)
-            if alpha[i] < -30 or rsi[i] > 80:
+            # 1. 雙綠出場 (Double Green Exit)
+            # Alpha Score 為綠 (負分，代表進入風險區) 
+            # AND Alpha Slope 為綠 (負值，代表評分開始下滑)
+            if alpha[i] < 0 and slope[i] < 0:
                 is_sell = True
-                reason_str = "狂熱/鈍化賣出"
+                reason_str = f"雙綠燈警示 (Score:{int(alpha[i])})"
             
-            # 2. 均值回歸完成 (Mean Reversion Target)
-            elif close[i] > ma60[i] and pnl > 0.10:
-                 is_sell = True
-                 reason_str = "乖離修正完畢"
-
-            # 3. 停損
-            elif pnl < -0.15:
+            # 2. 停損保護 (Stop Loss)
+            # 雖然依靠斜率，但仍需防止假突破
+            elif pnl < -0.10:
                 is_sell = True
-                reason_str = "接刀失敗停損"
+                reason_str = "觸發停損"
 
             if is_sell:
                 signal = 0
@@ -505,64 +510,57 @@ def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rat
     df['Position'] = positions; df['Reason'] = reasons; df['Action'] = actions
     df['Return_Label'] = return_labels; df['Confidence'] = confidences
     
-    # === 計算報酬與權益曲線 ===
+    # === 計算權益曲線 (含 Cum_Market 修正) ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     
-    # 策略報酬
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     
-    # 扣除成本
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
     
     df['Strategy_Return'] = df['Strategy_Return'] - cost_series
     
-    # 計算累積淨值
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
-    
-    # [關鍵修正] 補上這行：計算大盤累積報酬，供繪圖使用
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
     """
-    優化邏輯：尋找最佳的 Alpha 進場門檻
+    優化邏輯：尋找最佳的 Slope (評分變化率) 進場門檻
     """
     best_ret = -999; best_params = None; best_df = None
     target_start = pd.to_datetime(user_start_date)
     
-    # 1. 先計算基礎指標 (RSI, Bollinger等)
-    # 使用預設參數 3.0 計算指標，因為 Alpha Score 計算依賴這些欄位
-    # 注意：這裡的 multiplier 3.0 主要影響 SuperTrend，但 Alpha Score 內部有自己的邏輯
+    # 1. 基礎指標
     df_ind = calculate_indicators(raw_df, 10, 3.0, market_df)
     
-    # 2. [關鍵] 在迴圈外先計算 Alpha Score
-    # 這樣回測時就不需要重複計算，大幅加速
+    # 2. 預先計算 Alpha Score (加速)
     df_scored = calculate_alpha_score(df_ind, pd.DataFrame(), pd.DataFrame())
     
-    # 3. 切割時間段
+    # 3. 切割數據
     df_slice = df_scored[df_scored['Date'] >= target_start].copy()
     if df_slice.empty: return None, None
 
     # 4. 參數空間搜尋
-    # 這裡的 r 代表 "Alpha Threshold" (進場分數門檻)
-    # 測試：20分(積極), 40分(穩健), 60分(確認趨勢)
-    for alpha_thresh in [20, 30, 40, 50, 60]:
+    # 搜尋 Slope Threshold：
+    # 5:  小幅轉強就買 (頻繁)
+    # 10: 顯著轉強才買 (中庸)
+    # 15: 暴力噴出才買 (嚴格/追強勢)
+    for slope_thresh in [5, 8, 10, 12, 15]:
         
         # 執行策略
-        df_res = run_simple_strategy(df_slice, alpha_thresh, fee_rate, tax_rate)
+        df_res = run_simple_strategy(df_slice, slope_thresh, fee_rate, tax_rate)
         
-        # 評估績效
         if df_res['Cum_Strategy'].empty: continue
         ret = df_res['Cum_Strategy'].iloc[-1] - 1
         
         if ret > best_ret:
             best_ret = ret
-            # Mult 參數在此策略中影響較小，保留以兼容舊格式，重點是 Alpha_Threshold
-            best_params = {'Mult': 3.0, 'RSI_Buy': alpha_thresh, 'Return': ret}
+            # 這裡的 'RSI_Buy' 欄位借用來存 Slope Threshold，方便顯示
+            best_params = {'Mult': 3.0, 'RSI_Buy': slope_thresh, 'Return': ret}
             best_df = df_res
             
     return best_params, best_df
