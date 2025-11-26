@@ -1538,23 +1538,14 @@ elif page == "📊 單股深度分析":
                 # ... (請保留原本的 Tabs 繪圖代碼) ...
                 tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
                 
-# [Tab 1: K線圖] (修改版：新增 Alpha Score 子圖)
+                # [Tab 1: K線圖]
                 with tab1:
-                    # [關鍵步驟] 將 Alpha Score 數據合併回 final_df 以供繪圖
-                    # 注意：這裡繪製的是基礎評分序列，能反映歷史變化
-                    final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-
-                    # 建立子圖：改為 5 列 (Row 2 插入評分圖)
-                    fig = make_subplots(
-                        rows=5, cols=1, 
-                        shared_xaxes=True, 
-                        vertical_spacing=0.02, 
-                        # 調整高度比例：主圖最大，其餘副圖平均分配
-                        row_heights=[0.4, 0.15, 0.15, 0.15, 0.15], 
-                        subplot_titles=("", "買賣評等 (Alpha Score)", "成交量", "法人籌碼 (OBV)", "相對強弱指標 (RSI)")
-                    )
+                    # 建立子圖
+                    fig = make_subplots(rows=4, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
+                                        row_heights=[0.5, 0.15, 0.15, 0.20], 
+                                        subplot_titles=("", "成交量", "法人籌碼 (OBV)", "相對強弱指標 (RSI)"))
             
-                    # --- Row 1: 主圖 K 線 ---
+                    # 主圖 K 線
                     fig.add_trace(go.Candlestick(
                         x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
                         low=final_df['Low'], close=final_df['Close'], name='K線',
@@ -1572,6 +1563,7 @@ elif page == "📊 單股深度分析":
                     final_df['Sell_Y'] = final_df['High'] * 1.08
 
                     def get_buy_text(sub_df):
+                        # 在圖表上顯示該次買進時的信心分數
                         return [f"<b>{score}</b>" for score in sub_df['Confidence']]
 
                     def get_sell_text(sub_df):
@@ -1582,7 +1574,8 @@ elif page == "📊 單股深度分析":
                             labels.append(f"{ret}<br>({reason_str})")
                         return labels
 
-                    # 繪製買點 (維持原邏輯)
+                    # 繪製不同類型的買點
+                    # A. 趨勢/突破
                     buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
                     if not buy_trend.empty:
                         fig.add_trace(go.Scatter(
@@ -1593,6 +1586,7 @@ elif page == "📊 單股深度分析":
                             name='買進 (趨勢)', hovertext=buy_trend['Reason']
                         ), row=1, col=1)
                     
+                    # B. 反彈/超賣
                     buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
                     if not buy_panic.empty:
                         fig.add_trace(go.Scatter(
@@ -1603,6 +1597,7 @@ elif page == "📊 單股深度分析":
                             name='買進 (反彈)', hovertext=buy_panic['Reason']
                         ), row=1, col=1)
                     
+                    # C. 籌碼/佈局
                     buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
                     if not buy_chip.empty:
                         fig.add_trace(go.Scatter(
@@ -1613,6 +1608,7 @@ elif page == "📊 單股深度分析":
                             name='買進 (籌碼)', hovertext=buy_chip['Reason']
                         ), row=1, col=1)
 
+                    # 賣出點
                     sell_all = final_df[final_df['Action'] == 'Sell']
                     if not sell_all.empty:
                         fig.add_trace(go.Scatter(
@@ -1623,37 +1619,18 @@ elif page == "📊 單股深度分析":
                             name='賣出', hovertext=sell_all['Reason']
                         ), row=1, col=1)
                     
-                    # --- Row 2: Alpha Score (新增) ---
-                    # 顏色邏輯：紅漲(正分) / 綠跌(負分)
-                    colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
-                    fig.add_trace(go.Bar(
-                        x=final_df['Date'], y=final_df['Alpha_Score'], 
-                        name='Alpha Score', marker_color=colors_score
-                    ), row=2, col=1)
-                    # 固定 Y 軸範圍讓視覺更穩定 (-100 ~ 100)
-                    fig.update_yaxes(range=[-110, 110], row=2, col=1)
-
-                    # --- Row 3: 成交量 ---
+                    # 副圖
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=3, col=1)
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=2, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=3, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=4, col=1)
+                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=4, col=1)
+                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=4, col=1)
                     
-                    # --- Row 4: OBV ---
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=4, col=1)
-                    
-                    # --- Row 5: RSI ---
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=5, col=1)
-                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=5, col=1)
-                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=5, col=1)
-                    
-                    # Layout 設定
-                    fig.update_layout(height=1000, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
-                                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
-                    
-                    # 統一右側 Y 軸 (讓圖表整齊)
-                    fig.update_yaxes(side='right')
-                    
+                    fig.update_layout(height=800, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1))
                     st.plotly_chart(fig, use_container_width=True)
-                                        
+                    
                 # [Tab 2: 權益曲線]
                 with tab2:
                     fig_c = go.Figure()
