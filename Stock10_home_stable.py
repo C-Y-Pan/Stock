@@ -605,42 +605,44 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
-    執行嚴謹的樣本外測試 (Walk-Forward Analysis 簡化版)
-    Split Ratio: 訓練集佔比 (預設 70%)
+    [修正版] 樣本外測試：適配 Alpha Momentum 策略參數
     """
     # 1. 資料切割
     total_len = len(raw_df)
-    if total_len < 100: return None # 資料過少無法驗證
+    if total_len < 100: return None 
     
     split_idx = int(total_len * split_ratio)
     train_data_raw = raw_df.iloc[:split_idx].copy()
     test_data_raw = raw_df.iloc[split_idx:].copy()
     
-    # 確保切分後的測試集有足夠數據
     if len(test_data_raw) < 30: return None
 
-    # 2. 訓練階段 (In-Sample): 在過去數據找最佳參數
-    # 注意：start_date 設為訓練集的第一天
+    # 2. 訓練階段 (In-Sample): 找出最佳 buy_thresh 與 sell_slope
     train_start_date = train_data_raw['Date'].min()
     best_params_train, train_res_df = run_optimization(train_data_raw, market_df, train_start_date, fee_rate, tax_rate)
     
     if best_params_train is None: return None
 
-    # 3. 測試階段 (Out-of-Sample): 用訓練好的參數去跑未來的數據
-    # 關鍵：這裡不能再做 run_optimization，必須固定參數
+    # 3. 測試階段 (Out-of-Sample): 固定參數跑未來數據
     
-    # 先計算測試集的指標 (使用訓練集找出的最佳 Multiplier)
-    test_ind = calculate_indicators(test_data_raw, 10, best_params_train['Mult'], market_df)
+    # [修正點 1] 指標計算：Multiplier 固定為 3.0 (與 run_optimization 一致)
+    # 因為新的優化器不再調整 Mult，所以這裡不能讀取 best_params_train['Mult']
+    test_ind = calculate_indicators(test_data_raw, 10, 3.0, market_df)
     
-    # 執行策略 (使用訓練集找出的最佳 RSI 閾值)
-    test_res_df = run_simple_strategy(test_ind, best_params_train['RSI_Buy'], fee_rate, tax_rate)
+    # [修正點 2] 策略執行：改呼叫 run_alpha_momentum_strategy 並傳入正確參數
+    test_res_df = run_alpha_momentum_strategy(
+        test_ind, 
+        buy_score_thresh=best_params_train['buy_thresh'], 
+        sell_slope_thresh=best_params_train['sell_slope'],
+        fee_rate=fee_rate, 
+        tax_rate=tax_rate
+    )
     
     # 4. 績效比較與指標計算
     def get_metrics(df):
-        if df.empty: return 0, 0
+        if df.empty: return 0, 0, 0
         cum_ret = df['Cum_Strategy'].iloc[-1] - 1
         mdd = calculate_mdd(df['Cum_Strategy'])
-        # 年化報酬估算
         days = (df['Date'].max() - df['Date'].min()).days
         cagr = ((1 + cum_ret) ** (365/days) - 1) if days > 0 else 0
         return cum_ret, mdd, cagr
