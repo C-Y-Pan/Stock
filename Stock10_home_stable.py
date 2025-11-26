@@ -747,7 +747,7 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v3.2 (Trend Enhanced): 加入均線排列結構判定
+    Alpha Score v3.1 (Robust Fix): 修復索引對齊與數據缺失問題
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -755,20 +755,21 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 1. 基礎數據準備與防呆
     # ====================================================
+    # 填充基礎欄位，防止因某天無交易量導致運算崩潰
     if 'Volume' in df.columns:
         df['Volume'] = df['Volume'].fillna(0)
     
-    # 均線計算 (若無則補算)
+    # 均線 (若無則補算)
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
-    # MACD 計算
+    # MACD
     exp12 = df['Close'].ewm(span=12, adjust=False).mean()
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     dif = exp12 - exp26
     dea = dif.ewm(span=9, adjust=False).mean()
     
-    # 布林通道 %B 計算
+    # 布林通道 %B
     std20 = df['Close'].rolling(20).std()
     bb_up = df['MA20'] + 2 * std20
     bb_low = df['MA20'] - 2 * std20
@@ -779,46 +780,28 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 2. 四大因子量化計分
     # ====================================================
     
-    # --- [修改重點] A. 趨勢因子 (Trend) ---
-    # 邏輯更新：結合「乖離率(位階)」與「均線形態(方向)」
-    
-    # A-1. 乖離率 (Bias): 衡量股價偏離季線的程度 (反映超漲/超跌)
-    # 基準：偏離 20% 視為極端值 (100分)
+    # A. 趨勢因子
+    # 使用 ffill 避免當天 MA60 缺值
     bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
-    score_bias = (bias_60 / 0.20) * 100
-    score_bias = score_bias.clip(-100, 100)
-    
-    # A-2. 均線結構 (MA Structure): 衡量均線排列狀態 (反映趨勢穩固性)
-    # 多頭排列: 收盤 > 月線 且 月線 > 季線 (最強勢)
-    bull_align = (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60'])
-    # 空頭排列: 收盤 < 月線 且 月線 < 季線 (最弱勢)
-    bear_align = (df['Close'] < df['MA20']) & (df['MA20'] < df['MA60'])
-    
-    # 針對結構給予分數
-    # 多頭排列給 100，空頭排列給 -100
-    # 若非上述兩者(震盪或轉換期)，則看股價是否在季線之上 (給予微幅多方分數 20)
-    score_structure = np.where(bull_align, 100, 
-                      np.where(bear_align, -100, 
-                      np.where(df['Close'] > df['MA60'], 20, -20)))
-    
-    # 趨勢總分：乖離率佔 50% + 均線結構佔 50%
-    score_trend = (score_bias * 0.5) + (score_structure * 0.5)
+    score_trend = (bias_60 / 0.20) * 100
     score_trend = score_trend.clip(-100, 100)
-
-    # --- B. 動能因子 (Momentum) ---
+    
+    # B. 動能因子
+    # RSI 若有空值填補 50 (中性)
     curr_rsi = df['RSI'].fillna(50)
     score_rsi = (curr_rsi - 50) * 2
     score_macd = np.where(dif > dea, 50, -50)
     score_mom = (score_rsi + score_macd) / 1.5
     score_mom = score_mom.clip(-100, 100)
     
-    # --- C. 波動位置因子 (Position) ---
+    # C. 波動位置因子
     score_pos = (pct_b.fillna(0.5) - 0.5) * 200
     score_pos = score_pos.clip(-100, 100)
 
-    # --- D. 籌碼/量能因子 (Volume) ---
+    # D. 籌碼/量能因子
     vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
     vol_ratio = df['Volume'] / vol_ma
+    # 填補可能的空值
     vol_ratio = vol_ratio.fillna(1.0)
     price_dir = np.sign(df['Close'].diff().fillna(0))
     score_vol = (vol_ratio - 1) * price_dir * 30
@@ -827,7 +810,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 3. 綜合加權
     # ====================================================
-    # 權重分配：趨勢 35%, 動能 30%, 位置 25%, 量能 10%
     raw_score = (
         score_trend * 0.35 + 
         score_mom * 0.30 + 
@@ -838,27 +820,34 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 4. 市場體制修正 (Panic Correction)
     # ====================================================
+    # 確保 VIX 有值
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].fillna(20.0)
     
-    # 修正邏輯：在極度恐慌時(VIX>25)，若乖離率過大(bias < -0.15)或RSI極低，視為超跌機會
     is_panic = (df['VIX'] > 25) & ((curr_rsi < 30) | (bias_60 < -0.15))
     
+    # 恐慌修正邏輯
     panic_score = abs(raw_score) + (df['VIX'] - 20) * 2
     final_score_array = np.where(is_panic, panic_score, raw_score)
 
     # ====================================================
-    # 5. 平滑化與索引對齊
+    # 5. [關鍵修正] 平滑化與索引對齊
     # ====================================================
+    # 重點：必須指定 index=df.index，否則會因為索引錯位導致全部變成 NaN
     final_series = pd.Series(final_score_array, index=df.index)
     
-    # 使用 3 日滾動平均使曲線平滑，避免訊號過於躁動
+    # 進行滾動平均 (填補空缺，確保連續性)
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
+    
+    # [最後防線]：如果最後幾天計算出來是 NaN (可能因即時資料缺失)，
+    # 強制向前填充 (Forward Fill)，確保圖表不會斷頭
     df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0)
+    
+    # 限制範圍
     df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
 
     # ====================================================
-    # 6. 生成建議標籤
+    # 6. 生成建議
     # ====================================================
     df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭", 
                       np.where(df['Alpha_Score'] < -60, "弱勢空頭", "盤整震盪"))
@@ -1527,126 +1516,139 @@ elif page == "📊 單股深度分析":
                 # ... (請保留原本的 Tabs 繪圖代碼) ...
                 tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
                 
-                # [Tab 1: K線圖]
+# [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
                 with tab1:
-                    # ==========================================
-                    # 1. 使用者互動控制項
-                    # ==========================================
-                    st.write("") 
-                    c_ctrl, c_blank = st.columns([1, 3])
-                    with c_ctrl:
-                        ma_window = st.slider("Alpha 均線天數 (平滑度)", min_value=2, max_value=20, value=5)
-
-                    # ==========================================
-                    # 2. 數據計算
-                    # ==========================================
+                    # 1. 準備數據
+                    # 將 Alpha Score 寫入 final_df
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    final_df['Alpha_MA_Dynamic'] = final_df['Alpha_Score'].rolling(ma_window).mean()
-                    final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
-                    final_df['Alpha_MA_Slope'] = final_df['Alpha_MA_Dynamic'].diff().fillna(0)
-
-                    # ==========================================
-                    # 3. 準備繪圖 (雙 Y 軸設定)
-                    # ==========================================
                     
-                    # 定義 Subplot 結構：Row 3 啟用 secondary_y (雙軸)
-                    specs_list = [
-                        [{"secondary_y": False}], 
-                        [{"secondary_y": False}], 
-                        [{"secondary_y": True}],  # <--- Row 3 啟用雙軸
-                        [{"secondary_y": False}], 
-                        [{"secondary_y": False}], 
-                        [{"secondary_y": False}]
-                    ]
+                    # [關鍵新增] 計算 Alpha Score 的斜率 (對時間微分/一階差分)
+                    # 意義：衡量評分變化的方向與力道
+                    final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
 
+                    # 2. 建立子圖：擴增為 6 列
                     fig = make_subplots(
                         rows=6, cols=1, 
                         shared_xaxes=True, 
-                        vertical_spacing=0.03, # 稍微拉開間距避免刻度重疊
+                        vertical_spacing=0.02, 
+                        # 調整高度比例：主圖最大，其餘副圖平均分配
                         row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13], 
-                        specs=specs_list,
                         subplot_titles=(
                             "", 
-                            f"買賣評等 (Alpha Score + SMA{ma_window})", 
-                            f"評分動能 (柱狀=Raw / 黃線=SMA{ma_window} Slope)", 
+                            "買賣評等 (Alpha Score)", 
+                            "評分動能 (Alpha Slope / 變化率)", # 新增標題
                             "成交量", 
                             "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)"
                         )
                     )
             
-                    # --- Row 1: K線 (維持不變) ---
+                    # --- Row 1: 主圖 K 線 ---
                     fig.add_trace(go.Candlestick(
                         x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
                         low=final_df['Low'], close=final_df['Close'], name='K線',
                         increasing_line_color='#ef5350', decreasing_line_color='#00bfa5' 
                     ), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', line=dict(color='yellow', width=1), name='停損線'), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
+                    
+                    # 均線
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', 
+                                            line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
+                                            line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # 買賣點標記
-                    final_df['Buy_Y'] = final_df['Low'] * 0.92; final_df['Sell_Y'] = final_df['High'] * 1.08
-                    buy_pts = final_df[final_df['Action'] == 'Buy']
-                    if not buy_pts.empty:
-                        fig.add_trace(go.Scatter(x=buy_pts['Date'], y=buy_pts['Buy_Y'], mode='markers', marker=dict(symbol='triangle-up', size=14, color='#FFD700'), name='買進'), row=1, col=1)
-                    sell_pts = final_df[final_df['Action'] == 'Sell']
-                    if not sell_pts.empty:
-                        fig.add_trace(go.Scatter(x=sell_pts['Date'], y=sell_pts['Sell_Y'], mode='markers', marker=dict(symbol='triangle-down', size=14, color='#FF00FF'), name='賣出'), row=1, col=1)
+                    # 買賣點標記函式
+                    final_df['Buy_Y'] = final_df['Low'] * 0.92
+                    final_df['Sell_Y'] = final_df['High'] * 1.08
 
-                    # --- Row 2: Alpha Score + MA Line ---
+                    def get_buy_text(sub_df):
+                        return [f"<b>{score}</b>" for score in sub_df['Confidence']]
+
+                    def get_sell_text(sub_df):
+                        labels = []
+                        for idx, row in sub_df.iterrows():
+                            ret = row['Return_Label']
+                            reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
+                            labels.append(f"{ret}<br>({reason_str})")
+                        return labels
+
+                    # 繪製買點
+                    buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
+                    if not buy_trend.empty:
+                        fig.add_trace(go.Scatter(
+                            x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text',
+                            text=get_buy_text(buy_trend), textposition="bottom center",
+                            textfont=dict(color='#FFD700', size=11),
+                            marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), 
+                            name='買進 (趨勢)', hovertext=buy_trend['Reason']
+                        ), row=1, col=1)
+                    
+                    buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
+                    if not buy_panic.empty:
+                        fig.add_trace(go.Scatter(
+                            x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text',
+                            text=get_buy_text(buy_panic), textposition="bottom center",
+                            textfont=dict(color='#00FFFF', size=11),
+                            marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), 
+                            name='買進 (反彈)', hovertext=buy_panic['Reason']
+                        ), row=1, col=1)
+                    
+                    buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
+                    if not buy_chip.empty:
+                        fig.add_trace(go.Scatter(
+                            x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text',
+                            text=get_buy_text(buy_chip), textposition="bottom center",
+                            textfont=dict(color='#DDA0DD', size=11),
+                            marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), 
+                            name='買進 (籌碼)', hovertext=buy_chip['Reason']
+                        ), row=1, col=1)
+
+                    sell_all = final_df[final_df['Action'] == 'Sell']
+                    if not sell_all.empty:
+                        fig.add_trace(go.Scatter(
+                            x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', 
+                            text=get_sell_text(sell_all), textposition="top center",
+                            textfont=dict(color='white', size=11),
+                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), 
+                            name='賣出', hovertext=sell_all['Reason']
+                        ), row=1, col=1)
+                    
+                    # --- Row 2: Alpha Score (狀態) ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Score'], name='Alpha Score', marker_color=colors_score), row=2, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Alpha_MA_Dynamic'], name=f'Alpha SMA{ma_window}', mode='lines', line=dict(color='yellow', width=1.5), hoverinfo='skip'), row=2, col=1)
+                    fig.add_trace(go.Bar(
+                        x=final_df['Date'], y=final_df['Alpha_Score'], 
+                        name='Alpha Score', marker_color=colors_score
+                    ), row=2, col=1)
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
-                    # --- [修改重點] Row 3: 雙 Y 軸設定 ---
-                    
-                    # 1. 左軸 (Primary): 繪製柱狀圖 (Raw Slope)
+                    # --- Row 3: Alpha Slope (動能/微分) [新增] ---
+                    # 邏輯：斜率 > 0 代表評分正在改善 (轉強) -> 紅色
+                    #       斜率 < 0 代表評分正在惡化 (轉弱) -> 綠色
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Slope'],
-                        name='Raw Slope (左軸)', marker_color=colors_slope, opacity=0.5
-                    ), row=3, col=1, secondary_y=False)
-                    
-                    # 2. 右軸 (Secondary): 繪製黃線 (MA Slope)
-                    # 這樣黃線會自動根據自己的數值範圍填滿高度，不會被壓扁
-                    fig.add_trace(go.Scatter(
-                        x=final_df['Date'], y=final_df['Alpha_MA_Slope'],
-                        name='Trend Slope (右軸)', mode='lines',
-                        line=dict(color='yellow', width=2)
-                    ), row=3, col=1, secondary_y=True)
-                    
-                    # 3. [關鍵] 強制對稱縮放 (Symmetric Scaling)
-                    # 確保左右兩軸的 0 線對齊，這對判斷多空至關重要
-                    max_bar = max(abs(final_df['Alpha_Slope'].max()), abs(final_df['Alpha_Slope'].min())) * 1.1 if not final_df.empty else 10
-                    max_line = max(abs(final_df['Alpha_MA_Slope'].max()), abs(final_df['Alpha_MA_Slope'].min())) * 1.1 if not final_df.empty else 10
-                    
-                    # 防呆：避免 max 為 0 導致報錯
-                    max_bar = max_bar if max_bar > 0 else 10
-                    max_line = max_line if max_line > 0 else 2
-                    
-                    fig.update_yaxes(range=[-max_bar, max_bar], row=3, col=1, secondary_y=False) # 左軸
-                    fig.update_yaxes(range=[-max_line, max_line], row=3, col=1, secondary_y=True) # 右軸
-                    
-                    # 畫 0 軸線 (參考用)
+                        name='Alpha Slope', marker_color=colors_slope
+                    ), row=3, col=1)
+                    # 加一條零軸線
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
 
-                    # --- Row 4, 5, 6: 其他指標 ---
+                    # --- Row 4: 成交量 ---
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=4, col=1)
                     
+                    # --- Row 5: OBV ---
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=5, col=1)
                     
+                    # --- Row 6: RSI ---
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=6, col=1)
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=6, col=1)
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
                     
                     # Layout 設定
-                    fig.update_layout(height=1300, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
-                                      legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
+                    # 增加總高度以容納 6 張圖
+                    fig.update_layout(height=1200, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
                     
-                    fig.update_yaxes(side='right', secondary_y=False) # 所有主軸在右
-                    fig.update_yaxes(side='left', row=3, col=1, secondary_y=True) # 只有 Row 3 的黃線軸在左
+                    fig.update_yaxes(side='right')
                     
                     st.plotly_chart(fig, use_container_width=True)
 
