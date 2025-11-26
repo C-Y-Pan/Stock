@@ -1472,7 +1472,15 @@ elif page == "📊 單股深度分析":
                         if final_df['Volume'].iloc[-1] > final_df['Vol_MA20'].iloc[-1]:
                             adjusted_score += 5; adjustment_log += "[量增+5]"
 
+                # 限制分數範圍 (-100 ~ 100)
                 final_composite_score = max(min(adjusted_score, 100), -100)
+                
+                # [關鍵修正] 防呆處理：如果分數是 NaN (無效值)，強制設為 0，避免 int() 報錯
+                import math
+                if math.isnan(final_composite_score):
+                    final_composite_score = 0
+                
+                # 組合最終顯示日誌
                 full_log_text = f"{base_log} {adjustment_log}" if base_log or adjustment_log else "無顯著特徵"
                 
                 # 計算其餘指標
@@ -1481,23 +1489,29 @@ elif page == "📊 單股深度分析":
                 real_win_rate, real_wins, real_total, avg_pnl = calculate_realized_win_rate(final_df)
                 risk_metrics = calculate_risk_metrics(final_df)
                 
-                # UI 顯示部分 (請確保這部分與您原本的代碼一致)
+                # UI 顯示部分
                 st.markdown(f"## {ticker_input} {name}")
                 st.caption(f"策略邏輯: {reason} | 波動率: {vol}")
                 
-                # ... (接續原本的 UI 繪圖代碼) ...
-                
-                # 這裡簡單寫出最重要的評分區塊，確保您知道接在哪裡
                 st.markdown("### 🏆 AI 綜合評分與決策依據")
                 score_col, log_col = st.columns([1, 3])
+                
                 with score_col:
                     s_color = "normal"
                     if final_composite_score >= 60: s_color = "off" 
                     elif final_composite_score <= -20: s_color = "inverse"
-                    st.metric("綜合評分 (Alpha Score)", f"{int(final_composite_score)} 分", delta=action, delta_color=s_color)
+                    
+                    # 這裡現在安全了，因為我們確保了 final_composite_score 一定是數字
+                    st.metric(
+                        label="綜合評分 (Alpha Score)",
+                        value=f"{int(final_composite_score)} 分",
+                        delta=action,
+                        delta_color=s_color
+                    )
+                
                 with log_col:
                     st.info(f"**🧮 演算歷程解析：**\n\n{full_log_text}")
-                
+
                 # ... (後續的 Tabs 繪圖部分完全不用動) ...
                 strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
                 strat_ret = best_params['Return'] * 100
