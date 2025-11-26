@@ -908,7 +908,7 @@ def calculate_alpha_score(df, margin_df, short_df):
 
 def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5, fee_rate=0.001425, tax_rate=0.003):
     """
-    Alpha 策略 v5.0 (Chip Fix): 針對「籌碼佈局」加入 MA5 與趨勢濾網，大幅降低接刀失敗率。
+    Alpha 策略 v6.0 (Panic Hold): 加入「恐慌停損豁免」機制，避免在非理性殺盤時砍在阿呆谷。
     """
     df = data.copy()
     
@@ -921,20 +921,24 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
     
     position = 0; entry_price = 0.0
     
-    # 轉為 numpy array 加速
+    # 數據快取 (Numpy Array 加速)
     close = df['Close'].values
+    open_p = df['Open'].values
     score = df['Alpha_Score'].values
     slope = df['Alpha_Slope'].values
-    ma5 = df['Close'].rolling(5).mean().values # [新增] 計算 MA5
+    ma5 = df['Close'].rolling(5).mean().values
     ma20 = df['MA20'].values
     ma60 = df['MA60'].values if 'MA60' in df.columns else df['Close'].values
     obv = df['OBV'].values
     obv_ma = df['OBV_MA20'].values
     rsi = df['RSI'].values
     
+    # 嘗試讀取 VIX，若無則設為預設值 20
+    vix = df['VIX'].values if 'VIX' in df.columns else np.full(len(df), 20.0)
+    
     # [參數設定]
-    stop_loss_pct = 0.08      # 固定 8% 停損
-
+    stop_loss_pct = 0.08       # 基礎停損: 8%
+    
     for i in range(len(df)):
         signal = position
         reason_str = ""
@@ -943,69 +947,78 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
         ret_label = ""
         conf_score = 0
         
-        # 防止索引越界
         if i < 5: 
             positions.append(0); reasons.append(""); actions.append("Wait"); 
             target_prices.append(np.nan); return_labels.append(""); confidences.append(0)
             continue
 
-        # --- 進場邏輯 (Buy) ---
+        # =========================================
+        # 1. 定義恐慌狀態 (Panic State)
+        # =========================================
+        # 邏輯：當指標極度超賣或乖離過大時，視為恐慌，此時股價隨時可能強彈
+        is_oversold = (rsi[i] < 25)
+        is_deep_bias = (close[i] < ma60[i] * 0.85) # 負乖離超過 15%
+        is_market_crash = (vix[i] > 30) # 市場極度恐慌
+        
+        is_panic_state = is_oversold or is_deep_bias or is_market_crash
+
+        # =========================================
+        # 2. 進場邏輯 (Buy)
+        # =========================================
         if position == 0:
             is_buy = False
             
-            # --- 策略 A: Alpha 動能突破 (既有邏輯 - 追強) ---
-            # 條件: 評分高 + 動能由負轉正 + 股價站穩季線
-            cond_score_strength = (score[i] >= buy_score_thresh)
-            cond_slope_reversal = (slope[i] > 0.5) and (slope[i-1] <= 0)
-            cond_trend_up = (close[i] > ma60[i])
+            # 策略 A: 動能回調重啟 (Trend Following)
+            cond_score = (score[i] >= buy_score_thresh)
+            cond_slope = (slope[i] > 0.5) and (slope[i-1] <= 0)
+            cond_trend = (close[i] > ma60[i])
             
-            if cond_score_strength and cond_slope_reversal and cond_trend_up:
-                is_buy = True; reason_str = "動能回調重啟"
-                conf_score = 85
+            if cond_score and cond_slope and cond_trend:
+                is_buy = True; reason_str = "動能回調重啟"; conf_score = 85
 
-            # --- 策略 B: 籌碼佈局 (優化版 - 修正接刀問題) ---
-            # 原本失敗率高是因為「價跌量縮」就買。現在要求:
-            # 1. 季線向上 (長多保護)
-            # 2. 籌碼背離 (價跌但 OBV 守住)
-            # 3. [關鍵] 收盤站上 MA5 (確認止跌)
-            # 4. [關鍵] RSI 不能殺太低 (>40)
+            # 策略 B: 籌碼止跌確認 (Bottom Fishing)
+            # 需滿足：季線向上 + 籌碼背離 + 站上MA5 (右側確認)
             elif not is_buy:
-                # 長線趨勢檢查：季線斜率要向上 (當前 > 5天前)
                 trend_is_up = (ma60[i] > ma60[i-5]) and (close[i] > ma60[i])
-                
-                # 籌碼背離檢查：價格在月線下(回調)，但OBV在均線上
                 chip_divergence = (close[i] < ma20[i]) and (obv[i] > obv_ma[i])
-                
-                # [核心修正] 止跌訊號：站上 5 日線 且 帶有紅K (收 > 開)
-                price_trigger = (close[i] > ma5[i]) and (df['Close'].iloc[i] > df['Open'].iloc[i])
-                
-                # 防殺盤濾網
-                safe_zone = (rsi[i] > 40)
+                price_trigger = (close[i] > ma5[i]) and (close[i] > open_p[i])
+                safe_zone = (rsi[i] > 40) # 避免在剛殺下來時接刀
                 
                 if trend_is_up and chip_divergence and price_trigger and safe_zone:
-                    is_buy = True; reason_str = "籌碼止跌確認"
-                    conf_score = 75 # 屬於左側偏右，信心稍低於突破
+                    is_buy = True; reason_str = "籌碼止跌確認"; conf_score = 75
 
             if is_buy:
                 signal = 1; entry_price = close[i]; action_code = "Buy"
 
-        # --- 出場邏輯 (Sell) ---
+        # =========================================
+        # 3. 出場邏輯 (Sell)
+        # =========================================
         elif position == 1:
             drawdown = (close[i] - entry_price) / entry_price
             is_sell = False
             
-            # 1. 停損
+            # --- 情境 A: 觸發停損線 ---
             if drawdown < -stop_loss_pct:
-                is_sell = True; reason_str = "觸發停損"
+                if is_panic_state:
+                    # [關鍵邏輯]：雖然賠錢，但現在是恐慌區，禁止砍單！
+                    is_sell = False
+                    action_code = "Hold"
+                    reason_str = "恐慌豁免停損" # 紀錄原因
+                else:
+                    # 正常情況：執行紀律停損
+                    is_sell = True
+                    reason_str = "觸發停損"
             
-            # 2. 智能出場: 評分轉負 且 動能急殺
-            # (稍微放寬條件，避免盤整被洗掉)
-            elif (score[i] < 20) and (slope[i] < sell_slope_thresh):
-                is_sell = True; reason_str = "動能衰竭"
-            
-            # 3. 破線出場: 針對籌碼策略，如果跌破季線要快跑
-            elif (close[i] < ma60[i] * 0.98):
-                is_sell = True; reason_str = "趨勢破壞"
+            # --- 情境 B: 獲利回吐或趨勢改變 ---
+            # 只有在「非恐慌」狀態下才執行這些賣出邏輯
+            elif not is_panic_state:
+                # 智能出場：評分轉弱且動能大跌
+                if (score[i] < 20) and (slope[i] < sell_slope_thresh):
+                    is_sell = True; reason_str = "動能衰竭"
+                
+                # 破線出場：跌破季線
+                elif (close[i] < ma60[i] * 0.98):
+                    is_sell = True; reason_str = "趨勢破壞"
 
             if is_sell:
                 signal = 0; action_code = "Sell"
