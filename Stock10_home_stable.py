@@ -730,91 +730,101 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.0 (Trend Stability): 趨勢穩定版
-    修正過度交易問題。
-    特色：
-    1. 移除 MA5 敏感因子，改用 MA10/MA20。
-    2. 引入平滑化過濾雜訊。
-    3. 保留恐慌時的瞬間反應，但過濾平時的盤整震盪。
+    Alpha Score v6.0 (Regime Separation): 恐慌/空頭分離版
+    核心哲學：
+    1. 「恐慌大跌」是買點 (Score = +100)。
+    2. 「非恐慌空頭」是賣點 (Score = -100)。
+    3. 「正常多頭」是持倉 (Score = +60)。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
-    # 1. 基礎數據準備
+    # ====================================================
+    # 1. 基礎數據與防呆
+    # ====================================================
     if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
     
-    df['MA10'] = df['Close'].rolling(10).mean()
+    # 均線
     df['MA20'] = df['Close'].rolling(20).mean()
     df['MA60'] = df['Close'].rolling(60).mean()
     
-    # MACD
-    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
-    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
-    dif = exp12 - exp26
-    dea = dif.ewm(span=9, adjust=False).mean()
+    # 乖離率
+    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
     
-    # KD
+    # KD 指標 (判斷是否超跌)
     low_min = df['Low'].rolling(9).min()
     high_max = df['High'].rolling(9).max()
     rsv = (df['Close'] - low_min) / (high_max - low_min).replace(0, 1) * 100
     k_val = rsv.ewm(com=2).mean()
-    
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
 
-    # ====================================================
-    # 2. 因子計分 (更穩健的邏輯)
-    # ====================================================
-    
-    # A. 趨勢因子 (Trend) - 看長做短
-    # 站上季線給分，季線向上再加分
-    ma60_slope = df['MA60'].diff()
-    score_trend = np.where(df['Close'] > df['MA60'], 30, -30)
-    score_trend = np.where((df['Close'] > df['MA60']) & (ma60_slope > 0), 50, score_trend)
-    
-    # B. 動能因子 (Momentum) - 使用 MA20 作為波段生命線
-    # 不再使用 MA5，避免洗盤
-    score_short = np.where(df['Close'] > df['MA20'], 30, -30)
-    
-    # C. MACD 趨勢確認
-    score_macd = np.where(dif > dea, 20, -20)
-
-    # ====================================================
-    # 3. 綜合計算
-    # ====================================================
-    raw_score = score_trend + score_short + score_macd
-    
-    # ====================================================
-    # 4. 特殊修正 (Overrides)
-    # ====================================================
-    
-    # [過熱修正] 乖離過大且 KD 死叉 -> 減碼 (不是清倉，是降低分數)
-    cond_overheat = (bias_60 > 0.25) & (k_val > 80)
-    raw_score = np.where(cond_overheat, raw_score - 40, raw_score)
-    
-    # [恐慌修正] VIX 高且超跌 -> 黃金坑 (強制加分)
+    # VIX (恐慌指數) - 關鍵指標
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].fillna(20.0)
-    is_panic = (df['VIX'] > 25) & (k_val < 20)
+
+    # ====================================================
+    # 2. 邏輯分支 (Regime Logic)
+    # ====================================================
     
-    # 若恐慌發生，直接給予高分，無視均線跌破
-    raw_score = np.where(is_panic, 80, raw_score)
+    # --- 情境 A: 恐慌大跌 (Panic Crash) -> 進場做多 ---
+    # 定義：VIX 飆高 (>25) 且 (KD 低檔鈍化 < 20 或 負乖離過大 < -15%)
+    # 意義：市場情緒崩潰，通常是短線黃金坑
+    cond_panic = (df['VIX'] > 25) & ((k_val < 20) | (bias_60 < -0.15))
+    
+    # --- 情境 B: 非恐慌空頭 (Structural Bear) -> 離場觀望 ---
+    # 定義：股價在季線下，但 VIX 不高 (< 25) 且 KD 沒有超賣 (> 30)
+    # 意義：這是「陰跌」或「趨勢走空」，沒有恐慌買盤支撐，必須清倉
+    cond_bear = (df['Close'] < df['MA60']) & (df['VIX'] <= 25) & (k_val > 30)
+    
+    # --- 情境 C: 正常多頭 (Normal Bull) -> 順勢持倉 ---
+    # 定義：股價在季線上
+    cond_bull = (df['Close'] >= df['MA60'])
+
+    # --- 情境 D: 多頭過熱 (Overheat) -> 減碼 ---
+    # 定義：乖離率過大
+    cond_overheat = (bias_60 > 0.20)
+
+    # ====================================================
+    # 3. 給分 (Scoring)
+    # ====================================================
+    # 預設為 0 (觀望)
+    raw_score = np.zeros(len(df))
+    
+    # 1. 優先處理多頭 (Base)
+    raw_score = np.where(cond_bull, 60, raw_score) # 正常多頭給 60 分 (持倉)
+    
+    # 2. 處理過熱 (Trim)
+    raw_score = np.where(cond_overheat, 20, raw_score) # 過熱降為 20 分 (減碼)
+    
+    # 3. 處理空頭 (Sell) - 權重高於多頭
+    raw_score = np.where(cond_bear, -100, raw_score) # 非恐慌空頭，直接 -100 (清倉)
+    
+    # 4. 處理恐慌 (Buy) - 權重最高 (Override everything)
+    # 即使跌破季線 (符合空頭條件)，只要是恐慌狀態，就反轉為買進
+    raw_score = np.where(cond_panic, 100, raw_score) # 恐慌大跌，給 100 分 (All-in)
 
     # ====================================================
     # 5. 平滑化與輸出
     # ====================================================
+    # 建立 Series
     final_series = pd.Series(raw_score, index=df.index)
     
-    # [關鍵] 使用 rolling(3) 消除單日雜訊
-    # 只有在連續 3 天平均分數都高時，才確認趨勢
+    # 使用 rolling(3) 稍微過濾單日雜訊，但因為有 +/- 100 的極端值，反應依然會很快
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
     
-    # 填補與限制
+    # 填補
     df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0).clip(-100, 100)
     
-    # 生成建議
-    df['Score_Log'] = np.where(df['Alpha_Score'] > 40, "波段持有", 
-                      np.where(df['Alpha_Score'] < -20, "空手觀望", "震盪整理"))
+    # 生成建議文字 (Logs)
+    conditions = [
+        (df['Alpha_Score'] >= 80), # 恐慌買進 或 強勢突破
+        (df['Alpha_Score'] <= -80), # 空頭清倉
+        (df['Alpha_Score'] > 0),    # 多頭持有
+        (df['Alpha_Score'] <= 0)    # 震盪/觀察
+    ]
+    choices = ["危機入市/強力買進", "趨勢轉空/清倉", "多頭續抱", "保守觀望"]
+    df['Score_Log'] = np.select(conditions, choices, default="中性")
     
+    # 建議倉位
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
