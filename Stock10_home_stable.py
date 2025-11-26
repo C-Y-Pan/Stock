@@ -1532,62 +1532,67 @@ elif page == "📊 單股深度分析":
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
                                             line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # 買賣點標記函式
-                    final_df['Buy_Y'] = final_df['Low'] * 0.92
-                    final_df['Sell_Y'] = final_df['High'] * 1.08
-
-                    def get_buy_text(sub_df):
-                        return [f"<b>{score}</b>" for score in sub_df['Confidence']]
-
-                    def get_sell_text(sub_df):
-                        labels = []
-                        for idx, row in sub_df.iterrows():
-                            ret = row['Return_Label']
-                            reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
-                            labels.append(f"{ret}<br>({reason_str})")
-                        return labels
-
-                    # 繪製買點
-                    buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
-                    if not buy_trend.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_trend), textposition="bottom center",
-                            textfont=dict(color='#FFD700', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), 
-                            name='買進 (趨勢)', hovertext=buy_trend['Reason']
-                        ), row=1, col=1)
+                    # ====================================================
+                    # [核心修正] 繪製買賣訊號標記 (Unified Signal Plotting)
+                    # ====================================================
                     
-                    buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
-                    if not buy_panic.empty:
+                    # 1. 定義標記的 Y 軸位置 (為了不擋住 K 線，買點在低點下方，賣點在高點上方)
+                    # 這裡乘以一個係數，讓標記稍微遠離 K 線
+                    final_df['Marker_Buy_Y'] = final_df['Low'] * 0.97  # 在最低價下方 3% 位置
+                    final_df['Marker_Sell_Y'] = final_df['High'] * 1.03 # 在最高價上方 3% 位置
+
+                    # ----------------------------------------------------
+                    # 2. 繪製「買進」訊號 (金色向上箭頭)
+                    # ----------------------------------------------------
+                    buy_df = final_df[final_df['Action'] == 'Buy'].copy()
+                    if not buy_df.empty:
+                        # 準備顯示的文字：顯示「買進」與「AI信心分數」
+                        buy_text_list = [f"<b>買進</b><br>(信心:{conf})" for conf in buy_df['Confidence']]
+                        
                         fig.add_trace(go.Scatter(
-                            x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_panic), textposition="bottom center",
-                            textfont=dict(color='#00FFFF', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), 
-                            name='買進 (反彈)', hovertext=buy_panic['Reason']
-                        ), row=1, col=1)
-                    
-                    buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
-                    if not buy_chip.empty:
+                            x=buy_df['Date'],
+                            y=buy_df['Marker_Buy_Y'],
+                            mode='markers+text', # 同時顯示圖標和文字
+                            marker=dict(
+                                symbol='triangle-up', # 向上三角形
+                                size=18,              # 圖標大小
+                                color='#FFD700',      # 金色 (Gold)
+                                line=dict(width=2, color='black') # 黑色邊框增加對比度
+                            ),
+                            text=buy_text_list,           # 顯示的文字
+                            textposition="bottom center", # 文字在圖標下方
+                            textfont=dict(color='#FFD700', size=12, family="Arial Black"), # 文字樣式
+                            name='AI 買進訊號',
+                            hovertext=buy_df['Reason'],   # 滑鼠懸停時顯示詳細理由
+                            hoverinfo="x+text+name"
+                        ), row=1, col=1) # 加到第一張子圖
+
+                    # ----------------------------------------------------
+                    # 3. 繪製「賣出」訊號 (洋紅色向下箭頭) - 讓圖表更完整
+                    # ----------------------------------------------------
+                    sell_df = final_df[final_df['Action'] == 'Sell'].copy()
+                    if not sell_df.empty:
+                        # 準備顯示的文字：顯示「賣出」與「當筆報酬率」
+                        sell_text_list = [f"<b>賣出</b><br>{ret}" for ret in sell_df['Return_Label']]
+                        
                         fig.add_trace(go.Scatter(
-                            x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_chip), textposition="bottom center",
-                            textfont=dict(color='#DDA0DD', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), 
-                            name='買進 (籌碼)', hovertext=buy_chip['Reason']
+                            x=sell_df['Date'],
+                            y=sell_df['Marker_Sell_Y'],
+                            mode='markers+text',
+                            marker=dict(
+                                symbol='triangle-down', # 向下三角形
+                                size=18,
+                                color='#FF00FF',        # 洋紅色 (Magenta)
+                                line=dict(width=2, color='black')
+                            ),
+                            text=sell_text_list,
+                            textposition="top center", # 文字在圖標上方
+                            textfont=dict(color='#FF00FF', size=12, family="Arial Black"),
+                            name='AI 賣出訊號',
+                            hovertext=sell_df['Reason'],
+                            hoverinfo="x+text+name"
                         ), row=1, col=1)
 
-                    sell_all = final_df[final_df['Action'] == 'Sell']
-                    if not sell_all.empty:
-                        fig.add_trace(go.Scatter(
-                            x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', 
-                            text=get_sell_text(sell_all), textposition="top center",
-                            textfont=dict(color='white', size=11),
-                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), 
-                            name='賣出', hovertext=sell_all['Reason']
-                        ), row=1, col=1)
-                    
                     # --- Row 2: Alpha Score (狀態) ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
                     fig.add_trace(go.Bar(
