@@ -775,17 +775,19 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v3.0 (Deep Quant Wave): 深度量化波浪版
-    生成連續的 -100 ~ +100 分數，呈現波浪狀走勢。
-    邏輯：加權綜合「趨勢、動能、波動、籌碼」四大因子，並針對恐慌體制進行非線性修正。
+    Alpha Score v3.1 (Robust Fix): 修復索引對齊與數據缺失問題
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據準備
+    # 1. 基礎數據準備與防呆
     # ====================================================
-    # 均線
+    # 填充基礎欄位，防止因某天無交易量導致運算崩潰
+    if 'Volume' in df.columns:
+        df['Volume'] = df['Volume'].fillna(0)
+    
+    # 均線 (若無則補算)
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
@@ -794,53 +796,48 @@ def calculate_alpha_score(df, margin_df, short_df):
     exp26 = df['Close'].ewm(span=26, adjust=False).mean()
     dif = exp12 - exp26
     dea = dif.ewm(span=9, adjust=False).mean()
-    macd_hist = (dif - dea) * 2
     
-    # 布林通道 %B (Band Position)
+    # 布林通道 %B
     std20 = df['Close'].rolling(20).std()
     bb_up = df['MA20'] + 2 * std20
     bb_low = df['MA20'] - 2 * std20
-    # 防除以零
-    bb_width = bb_up - bb_low
-    bb_width = bb_width.replace(0, 1) 
-    pct_b = (df['Close'] - bb_low) / bb_width # 0=下軌, 0.5=中軌, 1=上軌
+    bb_width = (bb_up - bb_low).replace(0, 1) # 防除以零
+    pct_b = (df['Close'] - bb_low) / bb_width
 
     # ====================================================
-    # 2. 四大因子量化計分 (Continuous Scoring)
+    # 2. 四大因子量化計分
     # ====================================================
     
-    # --- A. 趨勢因子 (Trend Score) - 範圍約 -100 ~ 100 ---
-    # 乖離率標準化：假設乖離 +/- 20% 為極限
-    bias_60 = (df['Close'] - df['MA60']) / df['MA60']
+    # A. 趨勢因子
+    # 使用 ffill 避免當天 MA60 缺值
+    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']).fillna(0)
     score_trend = (bias_60 / 0.20) * 100
     score_trend = score_trend.clip(-100, 100)
     
-    # --- B. 動能因子 (Momentum Score) - 範圍 -100 ~ 100 ---
-    # RSI 中心化 (50為中心) 放大 2 倍
-    score_rsi = (df['RSI'] - 50) * 2
-    # MACD 動能方向
+    # B. 動能因子
+    # RSI 若有空值填補 50 (中性)
+    curr_rsi = df['RSI'].fillna(50)
+    score_rsi = (curr_rsi - 50) * 2
     score_macd = np.where(dif > dea, 50, -50)
-    score_mom = (score_rsi + score_macd) / 1.5 # 平均化
+    score_mom = (score_rsi + score_macd) / 1.5
     score_mom = score_mom.clip(-100, 100)
     
-    # --- C. 波動位置因子 (Position Score) - 範圍 -100 ~ 100 ---
-    # %B 轉換：0.5 -> 0, 1 -> 100, 0 -> -100
-    score_pos = (pct_b - 0.5) * 200
+    # C. 波動位置因子
+    score_pos = (pct_b.fillna(0.5) - 0.5) * 200
     score_pos = score_pos.clip(-100, 100)
 
-    # --- D. 籌碼/量能因子 (Volume Score) - 範圍 -50 ~ 50 ---
-    # 量增價漲(+), 量增價跌(-)
-    vol_ma = df['Volume'].rolling(20).mean()
-    vol_ratio = df['Volume'] / vol_ma.replace(0, 1)
-    # 價格變動方向
-    price_dir = np.sign(df['Close'].diff())
-    score_vol = (vol_ratio - 1) * price_dir * 30 # 放大係數
+    # D. 籌碼/量能因子
+    vol_ma = df['Volume'].rolling(20).mean().replace(0, 1)
+    vol_ratio = df['Volume'] / vol_ma
+    # 填補可能的空值
+    vol_ratio = vol_ratio.fillna(1.0)
+    price_dir = np.sign(df['Close'].diff().fillna(0))
+    score_vol = (vol_ratio - 1) * price_dir * 30
     score_vol = score_vol.clip(-50, 50)
 
     # ====================================================
-    # 3. 綜合加權 (Weighted Sum)
+    # 3. 綜合加權
     # ====================================================
-    # 權重分配：趨勢(35%) + 動能(30%) + 位置(25%) + 量能(10%)
     raw_score = (
         score_trend * 0.35 + 
         score_mom * 0.30 + 
@@ -849,42 +846,41 @@ def calculate_alpha_score(df, margin_df, short_df):
     )
 
     # ====================================================
-    # 4. 市場體制非線性修正 (Regime Correction) - 深度分析核心
+    # 4. 市場體制修正 (Panic Correction)
     # ====================================================
-    # 定義恐慌：VIX高 且 (RSI低 或 負乖離大)
-    is_panic = (df['VIX'] > 25) & ((df['RSI'] < 30) | (bias_60 < -0.15))
+    # 確保 VIX 有值
+    if 'VIX' not in df.columns: df['VIX'] = 20.0
+    df['VIX'] = df['VIX'].fillna(20.0)
     
-    # [關鍵邏輯]：在恐慌體制下，原本的「負分」代表超跌，應轉為「正分」訊號 (黃金坑)
-    # 使用 np.where 進行向量化處理
+    is_panic = (df['VIX'] > 25) & ((curr_rsi < 30) | (bias_60 < -0.15))
     
-    # 修正值：當恐慌發生時，將負分反轉，並加上 VIX 的溢價
+    # 恐慌修正邏輯
     panic_score = abs(raw_score) + (df['VIX'] - 20) * 2
-    
-    # 最終分數：若是恐慌狀態，使用修正後的分數；否則使用原始加權分數
-    final_score = np.where(is_panic, panic_score, raw_score)
+    final_score_array = np.where(is_panic, panic_score, raw_score)
 
     # ====================================================
-    # 5. 平滑化 (Smoothing) - 形成漂亮的波浪
+    # 5. [關鍵修正] 平滑化與索引對齊
     # ====================================================
-    # 使用 3 日移動平均來消除雜訊，讓曲線更滑順 (便於微分計算斜率)
-    df['Alpha_Score'] = pd.Series(final_score).rolling(3).mean().fillna(0)
+    # 重點：必須指定 index=df.index，否則會因為索引錯位導致全部變成 NaN
+    final_series = pd.Series(final_score_array, index=df.index)
     
-    # 限制最終範圍
+    # 進行滾動平均 (填補空缺，確保連續性)
+    df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
+    
+    # [最後防線]：如果最後幾天計算出來是 NaN (可能因即時資料缺失)，
+    # 強制向前填充 (Forward Fill)，確保圖表不會斷頭
+    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0)
+    
+    # 限制範圍
     df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
 
-    # 簡單生成日誌 (取最後一日狀態即可，為了效能不逐行生成)
-    # 這裡僅標記極端狀態
+    # ====================================================
+    # 6. 生成建議
+    # ====================================================
     df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭", 
                       np.where(df['Alpha_Score'] < -60, "弱勢空頭", "盤整震盪"))
-    
-    # 若是恐慌修正狀態
     df['Score_Log'] = np.where(is_panic, "恐慌超跌(修正轉正)", df['Score_Log'])
 
-    # ====================================================
-    # 6. 計算建議倉位 (映射到 0~100)
-    # ====================================================
-    # 將 -100~100 的分數映射到 0~100 的持倉建議
-    # 負分代表建議空手或做空(0%)，正分代表建議持倉
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
