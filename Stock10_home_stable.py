@@ -1526,7 +1526,7 @@ elif page == "📊 單股深度分析":
                 final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
 
                 # [新增] 計算 Alpha Score 10日均線
-                final_df['Alpha_MA10'] = final_df['Alpha_Score'].rolling(10).mean()
+                final_df['Alpha_MA5'] = final_df['Alpha_Score'].rolling(5).mean()
 
                 # 2. 建立子圖：擴增為 6 列
                 fig = make_subplots(
@@ -1622,10 +1622,10 @@ elif page == "📊 單股深度分析":
                     name='Alpha Score', marker_color=colors_score
                 ), row=2, col=1)
                 
-                # [新增] 10日均線
+                # [新增] 5日均線
                 fig.add_trace(go.Scatter(
-                    x=final_df['Date'], y=final_df['Alpha_MA10'], 
-                    name='Alpha MA10', mode='lines',
+                    x=final_df['Date'], y=final_df['Alpha_MA5'], 
+                    name='Alpha MA5', mode='lines',
                     line=dict(color='yellow', width=1.5)
                 ), row=2, col=1)
 
