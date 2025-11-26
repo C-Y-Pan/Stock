@@ -1534,7 +1534,7 @@ elif page == "📊 單股深度分析":
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
                     
                     # [新增] 計算 Alpha Score 的 5 日均線，用於判斷評分趨勢
-                    final_df['Alpha_MA5'] = final_df['Alpha_Score'].rolling(5).mean()
+                    final_df['Alpha_MA5'] = final_df['Alpha_Score'].rolling(20).mean()
 
                     # 2. 建立子圖 (維持原本設定)
                     fig = make_subplots(
