@@ -330,18 +330,39 @@ def get_margin_data(start_date_str):
     return pd.DataFrame()
 
 # ==========================================
-# 2. 指標計算 (Updated)
+# 2. 指標計算 (修復數據時間差導致的 NaN 問題)
 # ==========================================
 def calculate_indicators(df, atr_period, multiplier, market_df):
     data = df.copy()
+    
+    # [關鍵修正] 合併大盤數據並處理空值
     if not market_df.empty:
+        # 確保日期格式一致
+        data['Date'] = pd.to_datetime(data['Date']).dt.normalize()
+        market_df['Date'] = pd.to_datetime(market_df['Date']).dt.normalize()
+        
+        # Left Join: 保留個股所有日期
         data = pd.merge(data, market_df, on='Date', how='left', suffixes=('', '_Market'))
-        data['Market_RSI'] = data['Market_RSI'].ffill().fillna(50)
-        data['Market_MA20'] = data['Market_MA20'].ffill().fillna(0)
+        
+        # [Fix] 若個股有最新日資料但大盤尚未更新，合併後會產生 NaN
+        # 使用 ffill() 讓今天的 VIX/Market_RSI 沿用昨日數值，避免計算 Alpha Score 時變成 NaN
+        cols_to_fill = ['Market_RSI', 'Market_MA20', 'Market_MA60', 'VIX']
+        for c in cols_to_fill:
+            if c in data.columns:
+                data[c] = data[c].ffill()
+                
+        # 防呆：若 ffill 後仍有空值 (例如第一天就沒資料)，填入預設值
+        if 'Market_RSI' in data.columns: data['Market_RSI'] = data['Market_RSI'].fillna(50)
+        if 'Market_MA20' in data.columns: data['Market_MA20'] = data['Market_MA20'].fillna(0)
+        if 'VIX' in data.columns: data['VIX'] = data['VIX'].fillna(20)
+
     else:
+        # 若無大盤資料，給予預設值以防報錯
         data['Market_RSI'] = 50
         data['Market_MA20'] = 0
+        data['VIX'] = 20
     
+    # --- 以下維持原有指標計算邏輯 ---
     data['OBV'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum()
     data['OBV_MA20'] = data['OBV'].rolling(20).mean()
     data['Vol_MA20'] = data['Volume'].rolling(20).mean().replace(0, 1).fillna(1)
@@ -393,7 +414,7 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['SuperTrend'] = supertrend
     data['Trend'] = trend
     
-    # RSI
+    # RSI (個股)
     delta = data['Close'].diff()
     gain = (delta.where(delta>0, 0)).rolling(14).mean()
     loss = (-delta.where(delta<0, 0)).rolling(14).mean()
@@ -406,7 +427,10 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['BB_Upper'] = data['BB_Mid'] + (2.0 * data['BB_Std'])
     
     data['Is_Market_Panic'] = data['Market_RSI'] < 50 
-    return data.dropna(subset=['MA60', 'SuperTrend', 'RSI'])
+    
+    # [重要] 這裡不再 dropna，改用 fillna 確保資料完整性，避免把最近幾天刪掉
+    # 只要 SuperTrend 有值即可
+    return data.dropna(subset=['SuperTrend'])
 
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
