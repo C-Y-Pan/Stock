@@ -908,31 +908,31 @@ def calculate_alpha_score(df, margin_df, short_df):
 
 def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5, fee_rate=0.001425, tax_rate=0.003):
     """
-    基於 Alpha Score 與 Alpha Slope 的動能順勢策略 (Robust Version)
-    
-    參數:
-    - buy_score_thresh: 買入時 Score 必須高於此值 (例如 60 或 70)，確保位於多頭區。
-    - sell_slope_thresh: 賣出時 Slope 必須低於此值 (例如 -5)，確認動能顯著衰退。
+    Alpha 策略 v5.0 (Chip Fix): 針對「籌碼佈局」加入 MA5 與趨勢濾網，大幅降低接刀失敗率。
     """
     df = data.copy()
     
-    # 確保有 Alpha Score 數據 (若無則現場計算，傳入空的籌碼表即可，因為策略回測主要看價量生成的Score)
+    # 若無 Alpha Score 則現場計算
     if 'Alpha_Score' not in df.columns or 'Alpha_Slope' not in df.columns:
         df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
     
-    position = 0; days_held = 0; entry_price = 0.0
+    position = 0; entry_price = 0.0
     
     # 轉為 numpy array 加速
     close = df['Close'].values
     score = df['Alpha_Score'].values
-    slope = df['Alpha_Slope'].values  # 使用平滑後的斜率
+    slope = df['Alpha_Slope'].values
+    ma5 = df['Close'].rolling(5).mean().values # [新增] 計算 MA5
+    ma20 = df['MA20'].values
     ma60 = df['MA60'].values if 'MA60' in df.columns else df['Close'].values
+    obv = df['OBV'].values
+    obv_ma = df['OBV_MA20'].values
+    rsi = df['RSI'].values
     
     # [參數設定]
-    min_slope_strength = 0.5  # 買入時，斜率必須大於此正值 (過濾微幅震盪)
     stop_loss_pct = 0.08      # 固定 8% 停損
 
     for i in range(len(df)):
@@ -942,55 +942,70 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
         this_target = entry_price * 1.15 if position == 1 else np.nan
         ret_label = ""
         conf_score = 0
+        
+        # 防止索引越界
+        if i < 5: 
+            positions.append(0); reasons.append(""); actions.append("Wait"); 
+            target_prices.append(np.nan); return_labels.append(""); confidences.append(0)
+            continue
 
         # --- 進場邏輯 (Buy) ---
-        # 邏輯：Score 在高檔區 (趨勢強) + Slope 由負轉正 (回調結束) 或 動能強勢加速
         if position == 0:
             is_buy = False
             
-            # 條件 1: 基礎趨勢確立 (Score 足夠高)
-            cond_trend = score[i] >= buy_score_thresh
+            # --- 策略 A: Alpha 動能突破 (既有邏輯 - 追強) ---
+            # 條件: 評分高 + 動能由負轉正 + 股價站穩季線
+            cond_score_strength = (score[i] >= buy_score_thresh)
+            cond_slope_reversal = (slope[i] > 0.5) and (slope[i-1] <= 0)
+            cond_trend_up = (close[i] > ma60[i])
             
-            # 條件 2: 動能轉強確認
-            # Case A: 負轉正 (回調買點) - 最理想的買點
-            cond_reversal = (slope[i] > min_slope_strength) and (slope[i-1] <= 0)
-            
-            # Case B: 強勢加速 (突破買點) - 避免錯過急漲，但要求斜率非常高
-            cond_breakout = (slope[i] > 5) and (score[i] > score[i-1])
-            
-            # 綜合判斷
-            if cond_trend and (cond_reversal or cond_breakout):
-                is_buy = True
-                reason_str = "強勢回調啟動" if cond_reversal else "動能加速突破"
+            if cond_score_strength and cond_slope_reversal and cond_trend_up:
+                is_buy = True; reason_str = "動能回調重啟"
+                conf_score = 85
+
+            # --- 策略 B: 籌碼佈局 (優化版 - 修正接刀問題) ---
+            # 原本失敗率高是因為「價跌量縮」就買。現在要求:
+            # 1. 季線向上 (長多保護)
+            # 2. 籌碼背離 (價跌但 OBV 守住)
+            # 3. [關鍵] 收盤站上 MA5 (確認止跌)
+            # 4. [關鍵] RSI 不能殺太低 (>40)
+            elif not is_buy:
+                # 長線趨勢檢查：季線斜率要向上 (當前 > 5天前)
+                trend_is_up = (ma60[i] > ma60[i-5]) and (close[i] > ma60[i])
+                
+                # 籌碼背離檢查：價格在月線下(回調)，但OBV在均線上
+                chip_divergence = (close[i] < ma20[i]) and (obv[i] > obv_ma[i])
+                
+                # [核心修正] 止跌訊號：站上 5 日線 且 帶有紅K (收 > 開)
+                price_trigger = (close[i] > ma5[i]) and (df['Close'].iloc[i] > df['Open'].iloc[i])
+                
+                # 防殺盤濾網
+                safe_zone = (rsi[i] > 40)
+                
+                if trend_is_up and chip_divergence and price_trigger and safe_zone:
+                    is_buy = True; reason_str = "籌碼止跌確認"
+                    conf_score = 75 # 屬於左側偏右，信心稍低於突破
 
             if is_buy:
-                signal = 1; days_held = 0; entry_price = close[i]; action_code = "Buy"
-                
-                # 計算信心值 based on Score 強度
-                base = 60
-                if score[i] > 80: base += 20
-                if slope[i] > 5: base += 15
-                conf_score = min(base, 99)
+                signal = 1; entry_price = close[i]; action_code = "Buy"
 
         # --- 出場邏輯 (Sell) ---
         elif position == 1:
-            days_held += 1
             drawdown = (close[i] - entry_price) / entry_price
-            
             is_sell = False
             
-            # 1. 硬性停損
+            # 1. 停損
             if drawdown < -stop_loss_pct:
                 is_sell = True; reason_str = "觸發停損"
             
-            # 2. 趨勢轉弱訊號 (根據您的圖表邏輯)
-            # 邏輯：Score 還是正的，但 Slope 已經殺到負值深處 (漲不動了)
-            elif (score[i] > 0) and (slope[i] < sell_slope_thresh):
-                is_sell = True; reason_str = "動能顯著衰退"
+            # 2. 智能出場: 評分轉負 且 動能急殺
+            # (稍微放寬條件，避免盤整被洗掉)
+            elif (score[i] < 20) and (slope[i] < sell_slope_thresh):
+                is_sell = True; reason_str = "動能衰竭"
             
-            # 3. 趨勢反轉 (Score 直接翻黑)
-            elif score[i] < 0:
-                is_sell = True; reason_str = "趨勢翻空"
+            # 3. 破線出場: 針對籌碼策略，如果跌破季線要快跑
+            elif (close[i] < ma60[i] * 0.98):
+                is_sell = True; reason_str = "趨勢破壞"
 
             if is_sell:
                 signal = 0; action_code = "Sell"
@@ -1007,7 +1022,7 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
     df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
     df['Confidence'] = confidences
 
-    # === 計算含成本報酬 (維持原邏輯) ===
+    # === 計算績效 ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
