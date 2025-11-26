@@ -1529,19 +1529,32 @@ elif page == "📊 單股深度分析":
                 
                 # [Tab 1: K線圖]
                 with tab1:
-                    # 1. 準備數據
+                    # ==========================================
+                    # 1. [新增] 使用者互動控制項
+                    # ==========================================
+                    st.write("") # 排版留白
+                    c_ctrl, c_blank = st.columns([1, 3])
+                    with c_ctrl:
+                        # 讓使用者調整 Alpha Score 的平滑天數
+                        ma_window = st.slider("Alpha 均線天數 (平滑度)", min_value=2, max_value=20, value=5)
+
+                    # ==========================================
+                    # 2. 數據計算 (動態調整)
+                    # ==========================================
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
                     
-                    # 計算 Alpha Score 的 5 日均線 (用於 Row 2)
-                    final_df['Alpha_MA5'] = final_df['Alpha_Score'].rolling(5).mean()
+                    # [動態] 計算指定天數的 Alpha 均線
+                    final_df['Alpha_MA_Dynamic'] = final_df['Alpha_Score'].rolling(ma_window).mean()
                     
-                    # [保留] 原始 Alpha Slope (原始分數的變化量) -> 用於畫柱狀圖
+                    # [保留] 原始 Alpha Slope (原始分數的變化量) -> 柱狀圖
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
                     
-                    # [新增] 均線的 Slope (MA5 的變化量) -> 用於畫黃色曲線
-                    final_df['Alpha_MA_Slope'] = final_df['Alpha_MA5'].diff().fillna(0)
+                    # [動態] 均線的 Slope (MA 的變化量) -> 黃色曲線
+                    final_df['Alpha_MA_Slope'] = final_df['Alpha_MA_Dynamic'].diff().fillna(0)
 
-                    # 2. 建立子圖
+                    # ==========================================
+                    # 3. 繪圖邏輯
+                    # ==========================================
                     fig = make_subplots(
                         rows=6, cols=1, 
                         shared_xaxes=True, 
@@ -1549,15 +1562,15 @@ elif page == "📊 單股深度分析":
                         row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13], 
                         subplot_titles=(
                             "", 
-                            "買賣評等 (Alpha Score + SMA5)", 
-                            "評分動能 (Raw Slope + MA Slope)", # 修改標題
+                            f"買賣評等 (Alpha Score + SMA{ma_window})",  # 標題動態顯示天數
+                            f"評分動能 (Raw Slope + MA{ma_window} Slope)", # 標題動態顯示天數
                             "成交量", 
                             "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)"
                         )
                     )
             
-                    # --- Row 1: 主圖 K 線 (維持不變) ---
+                    # --- Row 1: 主圖 K 線 ---
                     fig.add_trace(go.Candlestick(
                         x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
                         low=final_df['Low'], close=final_df['Close'], name='K線',
@@ -1569,9 +1582,7 @@ elif page == "📊 單股深度分析":
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
                                             line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # (買賣點標記代碼，請保留原有的邏輯)
-                    # ... [請保留原本 fig.add_trace(go.Scatter(... mode='markers+text' ...)) 的部分] ...
-                    # 為了確保代碼可運行，這裡補上必要的變數定義
+                    # 買賣點標記
                     final_df['Buy_Y'] = final_df['Low'] * 0.92
                     final_df['Sell_Y'] = final_df['High'] * 1.08
                     
@@ -1589,33 +1600,34 @@ elif page == "📊 單股深度分析":
                             marker=dict(symbol='triangle-down', size=14, color='#FF00FF'), name='賣出'
                         ), row=1, col=1)
 
-                    # --- Row 2: Alpha Score + SMA5 Line ---
+                    # --- Row 2: Alpha Score + Dynamic SMA Line ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Score'], 
                         name='Alpha Score', marker_color=colors_score
                     ), row=2, col=1)
                     
+                    # 繪製動態均線
                     fig.add_trace(go.Scatter(
-                        x=final_df['Date'], y=final_df['Alpha_MA5'],
-                        name='Alpha SMA5', mode='lines',
+                        x=final_df['Date'], y=final_df['Alpha_MA_Dynamic'],
+                        name=f'Alpha SMA{ma_window}', mode='lines',
                         line=dict(color='yellow', width=1.5), hoverinfo='skip'
                     ), row=2, col=1)
                     
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
-                    # --- [修改重點] Row 3: 原始 Slope (柱狀) + MA Slope (黃線) ---
-                    # 1. 柱狀圖：顯示單日原始變化 (Raw Slope)
+                    # --- Row 3: 原始 Slope (柱狀) + MA Slope (黃線) ---
+                    # 1. 柱狀圖：顯示單日原始變化
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Slope'],
-                        name='Raw Slope', marker_color=colors_slope, opacity=0.6 # 稍微調透明一點，讓黃線更明顯
+                        name='Raw Slope', marker_color=colors_slope, opacity=0.6
                     ), row=3, col=1)
                     
-                    # 2. 折線圖：顯示趨勢變化 (MA Slope)
+                    # 2. 折線圖：顯示趨勢變化 (Dynamic MA Slope)
                     fig.add_trace(go.Scatter(
                         x=final_df['Date'], y=final_df['Alpha_MA_Slope'],
-                        name='MA Slope', mode='lines',
+                        name=f'MA{ma_window} Slope', mode='lines',
                         line=dict(color='yellow', width=1.5)
                     ), row=3, col=1)
                     
