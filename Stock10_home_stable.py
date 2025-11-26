@@ -603,26 +603,6 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
             
     return best_params, best_df
 
-# 修改後：傳遞成本參數
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
-    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
-    
-    # 為了節省運算，這裡只展示部分參數組合，實務上可擴增
-    for m in [3.0, 3.5]:
-        for r in [25, 30]:
-            df_ind = calculate_indicators(raw_df, 10, m, market_df)
-            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
-            if df_slice.empty: continue
-            
-            # [關鍵] 傳入成本參數
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate)
-            
-            ret = df_res['Cum_Strategy'].iloc[-1] - 1
-            if ret > best_ret:
-                best_ret = ret
-                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
-                best_df = df_res
-    return best_params, best_df
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
@@ -908,7 +888,10 @@ def calculate_alpha_score(df, margin_df, short_df):
 
 def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5, fee_rate=0.001425, tax_rate=0.003):
     """
-    Alpha 策略 v6.0 (Panic Hold): 加入「恐慌停損豁免」機制，避免在非理性殺盤時砍在阿呆谷。
+    Alpha 策略 v7.0 (Persistence Added): 
+    1. 加入「Score 連續 5 日 > 50」買入規則，捕捉主升段慣性。
+    2. 保留「恐慌豁免停損」機制。
+    3. 保留「籌碼止跌」與「動能回調」策略。
     """
     df = data.copy()
     
@@ -933,7 +916,7 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
     obv_ma = df['OBV_MA20'].values
     rsi = df['RSI'].values
     
-    # 嘗試讀取 VIX，若無則設為預設值 20
+    # 嘗試讀取 VIX
     vix = df['VIX'].values if 'VIX' in df.columns else np.full(len(df), 20.0)
     
     # [參數設定]
@@ -947,19 +930,18 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
         ret_label = ""
         conf_score = 0
         
+        # 確保有足夠的歷史數據進行回溯 (至少 5 天)
         if i < 5: 
             positions.append(0); reasons.append(""); actions.append("Wait"); 
             target_prices.append(np.nan); return_labels.append(""); confidences.append(0)
             continue
 
         # =========================================
-        # 1. 定義恐慌狀態 (Panic State)
+        # 1. 定義恐慌狀態 (Panic State) - 用於豁免停損
         # =========================================
-        # 邏輯：當指標極度超賣或乖離過大時，視為恐慌，此時股價隨時可能強彈
         is_oversold = (rsi[i] < 25)
-        is_deep_bias = (close[i] < ma60[i] * 0.85) # 負乖離超過 15%
-        is_market_crash = (vix[i] > 30) # 市場極度恐慌
-        
+        is_deep_bias = (close[i] < ma60[i] * 0.85)
+        is_market_crash = (vix[i] > 30)
         is_panic_state = is_oversold or is_deep_bias or is_market_crash
 
         # =========================================
@@ -968,7 +950,8 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
         if position == 0:
             is_buy = False
             
-            # 策略 A: 動能回調重啟 (Trend Following)
+            # --- 策略 A: 動能回調重啟 (Reversal) ---
+            # 邏輯：評分高位 + 動能由負轉正 + 趨勢向上
             cond_score = (score[i] >= buy_score_thresh)
             cond_slope = (slope[i] > 0.5) and (slope[i-1] <= 0)
             cond_trend = (close[i] > ma60[i])
@@ -976,16 +959,29 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
             if cond_score and cond_slope and cond_trend:
                 is_buy = True; reason_str = "動能回調重啟"; conf_score = 85
 
-            # 策略 B: 籌碼止跌確認 (Bottom Fishing)
-            # 需滿足：季線向上 + 籌碼背離 + 站上MA5 (右側確認)
+            # --- 策略 B: 籌碼止跌確認 (Bottom Fishing) ---
+            # 邏輯：季線向上 + 籌碼背離 + 站上MA5
             elif not is_buy:
                 trend_is_up = (ma60[i] > ma60[i-5]) and (close[i] > ma60[i])
                 chip_divergence = (close[i] < ma20[i]) and (obv[i] > obv_ma[i])
                 price_trigger = (close[i] > ma5[i]) and (close[i] > open_p[i])
-                safe_zone = (rsi[i] > 40) # 避免在剛殺下來時接刀
+                safe_zone = (rsi[i] > 40)
                 
                 if trend_is_up and chip_divergence and price_trigger and safe_zone:
                     is_buy = True; reason_str = "籌碼止跌確認"; conf_score = 75
+
+            # --- [新增] 策略 C: 趨勢慣性延續 (Persistence) ---
+            # 邏輯：Alpha Score 連續 5 日大於 50 (強勢慣性)
+            elif not is_buy:
+                # 檢查過去 5 天 (包含今天 i, i-1, i-2, i-3, i-4)
+                recent_scores = score[i-4 : i+1]
+                
+                # 條件：全數 > 50 且 股價位於季線之上 (避免空頭反彈騙線)
+                persistence_check = np.all(recent_scores > 50)
+                trend_check = (close[i] > ma60[i])
+                
+                if persistence_check and trend_check:
+                    is_buy = True; reason_str = "強勢動能延續"; conf_score = 80
 
             if is_buy:
                 signal = 1; entry_price = close[i]; action_code = "Buy"
@@ -997,22 +993,17 @@ def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5,
             drawdown = (close[i] - entry_price) / entry_price
             is_sell = False
             
-            # --- 情境 A: 觸發停損線 ---
+            # 情境 A: 觸發停損線
             if drawdown < -stop_loss_pct:
                 if is_panic_state:
-                    # [關鍵邏輯]：雖然賠錢，但現在是恐慌區，禁止砍單！
-                    is_sell = False
-                    action_code = "Hold"
-                    reason_str = "恐慌豁免停損" # 紀錄原因
+                    # 恐慌狀態下豁免賣出
+                    is_sell = False; action_code = "Hold"; reason_str = "恐慌豁免停損"
                 else:
-                    # 正常情況：執行紀律停損
-                    is_sell = True
-                    reason_str = "觸發停損"
+                    is_sell = True; reason_str = "觸發停損"
             
-            # --- 情境 B: 獲利回吐或趨勢改變 ---
-            # 只有在「非恐慌」狀態下才執行這些賣出邏輯
+            # 情境 B: 獲利回吐或趨勢改變 (非恐慌狀態下執行)
             elif not is_panic_state:
-                # 智能出場：評分轉弱且動能大跌
+                # 智能出場：評分轉弱 且 動能轉負
                 if (score[i] < 20) and (slope[i] < sell_slope_thresh):
                     is_sell = True; reason_str = "動能衰竭"
                 
