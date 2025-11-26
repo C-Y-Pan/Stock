@@ -437,8 +437,8 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略邏輯：逆勢操作 (Mean Reversion)
-    alpha_buy_threshold: 買進門檻 (建議 30~40，越高代表越恐慌才買)
+    策略邏輯：逆勢操作 (Mean Reversion) - 修正版
+    修正：補回 Cum_Market 計算，解決 KeyError
     """
     df = data.copy()
     
@@ -454,6 +454,7 @@ def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rat
     alpha = df['Alpha_Score'].values
     close = df['Close'].values
     rsi = df['RSI'].values
+    # 防呆：確保有 MA60，若無則用 Close 代替
     ma60 = df['MA60'].values if 'MA60' in df.columns else close
     
     for i in range(len(df)):
@@ -464,9 +465,6 @@ def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rat
         if position == 0:
             # 當 Alpha Score 高於門檻 (代表市場極度恐慌/超跌)
             if alpha[i] >= alpha_buy_threshold:
-                # 過濾：避免在主跌段的半山腰接刀
-                # 簡單過濾：雖然恐慌，但至少要有一根紅K或下影線 (這裡用 Close > Open 或 Close > Low*1.01 簡化判定)
-                # 這裡為了單純化，直接依賴 Score 的極端值
                 signal = 1
                 entry_price = close[i]
                 action_code = "Buy"
@@ -480,21 +478,16 @@ def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rat
             is_sell = False
             
             # 1. 狂熱賣出 (Euphoria Sell)
-            # Alpha Score 轉為大幅負值 (代表超買/過熱)
-            # 或者 RSI 進入鈍化區 (> 80)
             if alpha[i] < -30 or rsi[i] > 80:
                 is_sell = True
                 reason_str = "狂熱/鈍化賣出"
             
             # 2. 均值回歸完成 (Mean Reversion Target)
-            # 股價回到季線 (MA60) 且有獲利，代表乖離修正完畢
             elif close[i] > ma60[i] and pnl > 0.10:
-                 # 這裡不一定全賣，但在量化測試中先設為出場
                  is_sell = True
                  reason_str = "乖離修正完畢"
 
-            # 3. 停損 (雖然是逆勢，但若接刀後繼續暴跌，仍需止血)
-            # 設定較寬的停損 (15%)，因為逆勢策略波動大
+            # 3. 停損
             elif pnl < -0.15:
                 is_sell = True
                 reason_str = "接刀失敗停損"
@@ -512,17 +505,25 @@ def run_simple_strategy(data, alpha_buy_threshold=30, fee_rate=0.001425, tax_rat
     df['Position'] = positions; df['Reason'] = reasons; df['Action'] = actions
     df['Return_Label'] = return_labels; df['Confidence'] = confidences
     
-    # 計算報酬 (維持原樣)
+    # === 計算報酬與權益曲線 ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
+    
+    # 策略報酬
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     
+    # 扣除成本
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
     
     df['Strategy_Return'] = df['Strategy_Return'] - cost_series
+    
+    # 計算累積淨值
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
+    
+    # [關鍵修正] 補上這行：計算大盤累積報酬，供繪圖使用
+    df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
 
