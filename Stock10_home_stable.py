@@ -559,30 +559,48 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
     """
-    在指定時間範圍內尋找最佳參數
+    優化：針對 Alpha 策略尋找最佳的 [買入評分門檻]
     """
-    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
+    best_ret = -999; best_params = None; best_df = None
+    target_start = pd.to_datetime(user_start_date)
     
-    # 參數空間搜尋 (Grid Search)
-    for m in [3.0, 3.5]:
-        for r in [25, 30]:
-            # 計算指標 (耗時操作建議移至迴圈外，但在這裡為了簡單保持結構)
-            df_ind = calculate_indicators(raw_df, 10, m, market_df)
-            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
+    # 1. 先計算好所有指標與 Alpha Score (避免在迴圈內重複計算，提升效能)
+    #    注意：這裡必須先呼叫一次 calculate_alpha_score
+    df_ind = calculate_indicators(raw_df, 10, 3.0, market_df)
+    df_scored = calculate_alpha_score(df_ind, pd.DataFrame(), pd.DataFrame()) # 先算出 Slope
+    
+    df_slice = df_scored[df_scored['Date'] >= target_start].copy()
+    if df_slice.empty: return None, None
+
+    # 2. 參數網格搜尋
+    # 我們測試不同的 "買入評分門檻" (60, 70, 75) 與 "賣出動能門檻" (-3, -5, -8)
+    param_grid = [
+        {'buy_thresh': 60, 'sell_slope': -3},
+        {'buy_thresh': 60, 'sell_slope': -5},
+        {'buy_thresh': 70, 'sell_slope': -5}, # 較嚴謹
+        {'buy_thresh': 75, 'sell_slope': -8}, # 極嚴謹
+    ]
+
+    for params in param_grid:
+        # 呼叫新的策略函式
+        df_res = run_alpha_momentum_strategy(
+            df_slice, 
+            buy_score_thresh=params['buy_thresh'], 
+            sell_slope_thresh=params['sell_slope'],
+            fee_rate=fee_rate, 
+            tax_rate=tax_rate
+        )
+        
+        # 評估績效
+        ret = df_res['Cum_Strategy'].iloc[-1] - 1
+        
+        if ret > best_ret:
+            best_ret = ret
+            # 這裡為了相容原本的 UI 顯示 key，我們保留 'Return' key
+            best_params = params
+            best_params['Return'] = ret
+            best_df = df_res
             
-            if df_slice.empty: continue
-            
-            # 帶入成本進行回測
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate)
-            
-            # 使用累積報酬率作為評分標準
-            ret = df_res['Cum_Strategy'].iloc[-1] - 1
-            
-            if ret > best_ret:
-                best_ret = ret
-                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
-                best_df = df_res
-                
     return best_params, best_df
 
 # 修改後：傳遞成本參數
@@ -861,21 +879,24 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 5. [關鍵修正] 平滑化與索引對齊
     # ====================================================
-    # 重點：必須指定 index=df.index，否則會因為索引錯位導致全部變成 NaN
     final_series = pd.Series(final_score_array, index=df.index)
     
-    # 進行滾動平均 (填補空缺，確保連續性)
+    # 第一次平滑：計算 Alpha Score (3日平均，減少單日雜訊)
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean()
-    
-    # [最後防線]：如果最後幾天計算出來是 NaN (可能因即時資料缺失)，
-    # 強制向前填充 (Forward Fill)，確保圖表不會斷頭
-    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0)
-    
-    # 限制範圍
-    df['Alpha_Score'] = df['Alpha_Score'].clip(-100, 100)
+    df['Alpha_Score'] = df['Alpha_Score'].ffill().fillna(0).clip(-100, 100)
 
     # ====================================================
-    # 6. 生成建議
+    # [NEW] 6. 計算 Alpha Slope (評分動能)
+    # ====================================================
+    # 1. 原始斜率 (一階差分)
+    df['Alpha_Slope_Raw'] = df['Alpha_Score'].diff().fillna(0)
+    
+    # 2. 平滑斜率 (3日平均)：這是為了避免單日數值跳動造成的假訊號 (Anti-Whipsaw)
+    #    所有的交易訊號將基於這個平滑後的 Slope
+    df['Alpha_Slope'] = df['Alpha_Slope_Raw'].rolling(3, min_periods=1).mean().fillna(0)
+
+    # ====================================================
+    # 7. 生成文字建議 (Log)
     # ====================================================
     df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢多頭", 
                       np.where(df['Alpha_Score'] < -60, "弱勢空頭", "盤整震盪"))
@@ -883,6 +904,122 @@ def calculate_alpha_score(df, margin_df, short_df):
 
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
+    return df
+
+def run_alpha_momentum_strategy(data, buy_score_thresh=60, sell_slope_thresh=-5, fee_rate=0.001425, tax_rate=0.003):
+    """
+    基於 Alpha Score 與 Alpha Slope 的動能順勢策略 (Robust Version)
+    
+    參數:
+    - buy_score_thresh: 買入時 Score 必須高於此值 (例如 60 或 70)，確保位於多頭區。
+    - sell_slope_thresh: 賣出時 Slope 必須低於此值 (例如 -5)，確認動能顯著衰退。
+    """
+    df = data.copy()
+    
+    # 確保有 Alpha Score 數據 (若無則現場計算，傳入空的籌碼表即可，因為策略回測主要看價量生成的Score)
+    if 'Alpha_Score' not in df.columns or 'Alpha_Slope' not in df.columns:
+        df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
+
+    positions = []; reasons = []; actions = []; target_prices = []
+    return_labels = []; confidences = []
+    
+    position = 0; days_held = 0; entry_price = 0.0
+    
+    # 轉為 numpy array 加速
+    close = df['Close'].values
+    score = df['Alpha_Score'].values
+    slope = df['Alpha_Slope'].values  # 使用平滑後的斜率
+    ma60 = df['MA60'].values if 'MA60' in df.columns else df['Close'].values
+    
+    # [參數設定]
+    min_slope_strength = 0.5  # 買入時，斜率必須大於此正值 (過濾微幅震盪)
+    stop_loss_pct = 0.08      # 固定 8% 停損
+
+    for i in range(len(df)):
+        signal = position
+        reason_str = ""
+        action_code = "Hold" if position == 1 else "Wait"
+        this_target = entry_price * 1.15 if position == 1 else np.nan
+        ret_label = ""
+        conf_score = 0
+
+        # --- 進場邏輯 (Buy) ---
+        # 邏輯：Score 在高檔區 (趨勢強) + Slope 由負轉正 (回調結束) 或 動能強勢加速
+        if position == 0:
+            is_buy = False
+            
+            # 條件 1: 基礎趨勢確立 (Score 足夠高)
+            cond_trend = score[i] >= buy_score_thresh
+            
+            # 條件 2: 動能轉強確認
+            # Case A: 負轉正 (回調買點) - 最理想的買點
+            cond_reversal = (slope[i] > min_slope_strength) and (slope[i-1] <= 0)
+            
+            # Case B: 強勢加速 (突破買點) - 避免錯過急漲，但要求斜率非常高
+            cond_breakout = (slope[i] > 5) and (score[i] > score[i-1])
+            
+            # 綜合判斷
+            if cond_trend and (cond_reversal or cond_breakout):
+                is_buy = True
+                reason_str = "強勢回調啟動" if cond_reversal else "動能加速突破"
+
+            if is_buy:
+                signal = 1; days_held = 0; entry_price = close[i]; action_code = "Buy"
+                
+                # 計算信心值 based on Score 強度
+                base = 60
+                if score[i] > 80: base += 20
+                if slope[i] > 5: base += 15
+                conf_score = min(base, 99)
+
+        # --- 出場邏輯 (Sell) ---
+        elif position == 1:
+            days_held += 1
+            drawdown = (close[i] - entry_price) / entry_price
+            
+            is_sell = False
+            
+            # 1. 硬性停損
+            if drawdown < -stop_loss_pct:
+                is_sell = True; reason_str = "觸發停損"
+            
+            # 2. 趨勢轉弱訊號 (根據您的圖表邏輯)
+            # 邏輯：Score 還是正的，但 Slope 已經殺到負值深處 (漲不動了)
+            elif (score[i] > 0) and (slope[i] < sell_slope_thresh):
+                is_sell = True; reason_str = "動能顯著衰退"
+            
+            # 3. 趨勢反轉 (Score 直接翻黑)
+            elif score[i] < 0:
+                is_sell = True; reason_str = "趨勢翻空"
+
+            if is_sell:
+                signal = 0; action_code = "Sell"
+                pnl = (close[i] - entry_price) / entry_price * 100
+                sign = "+" if pnl > 0 else ""
+                ret_label = f"{sign}{pnl:.1f}%"
+
+        position = signal
+        positions.append(signal); reasons.append(reason_str); actions.append(action_code)
+        target_prices.append(this_target); return_labels.append(ret_label)
+        confidences.append(conf_score if action_code == "Buy" else 0)
+
+    df['Position'] = positions; df['Reason'] = reasons; df['Action'] = actions
+    df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
+    df['Confidence'] = confidences
+
+    # === 計算含成本報酬 (維持原邏輯) ===
+    df['Real_Position'] = df['Position'].shift(1).fillna(0)
+    df['Market_Return'] = df['Close'].pct_change().fillna(0)
+    df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
+    
+    cost_series = pd.Series(0.0, index=df.index)
+    cost_series[df['Action'] == 'Buy'] = fee_rate
+    cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
+    
+    df['Strategy_Return'] = df['Strategy_Return'] - cost_series
+    df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
+    df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
+    
     return df
 
 # ==========================================
