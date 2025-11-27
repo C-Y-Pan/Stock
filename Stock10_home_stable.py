@@ -499,14 +499,10 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v14.0 (Zen Mode):
-    解決「過度交易磨損利潤」的問題。
-    
-    [核心進化] 泰坦禪意 (Titan Zen)
-    對於權值股 (Titan)：
-    1. 買進：只要分數轉正 (>50) 且趨勢向上，就買。
-    2. 賣出：**廢除所有震盪停利**。唯一的賣點是「收盤價跌破季線」。
-    3. 這將確保吃到 90% 的主升段，中間無論怎麼洗都不下車。
+    策略引擎 v14.1 (NaN Fix):
+    修復 ValueError。
+    針對 Alpha Score 可能出現 NaN 或 Inf 的情況加入防呆機制。
+    確保在轉換 int() 之前，數值是有效的，否則預設為 0。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -520,14 +516,17 @@ def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.00
     # 身份識別
     close_val = df['Close'].values
     vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
-    avg_dollar_vol = np.mean(close_val * vol_val)
+    
+    # 防呆：計算平均成交額時忽略 NaN
+    avg_dollar_vol = np.nanmean(close_val * vol_val)
     if np.isnan(avg_dollar_vol): avg_dollar_vol = 0
+    
     is_titan = avg_dollar_vol > 5_000_000_000 
     
     ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
     scores = df['Alpha_Score'].values
     
-    # 計算 ATR (僅供小型股使用)
+    # 計算 ATR
     high = df['High']; low = df['Low']
     tr = pd.concat([high - low, (high - close_val).abs(), (low - close_val).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().fillna(0).values
@@ -543,55 +542,43 @@ def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.00
         curr_score = scores[i]
         curr_ma60 = ma60[i]
         
+        # [核心修復] 處理 NaN/Inf 分數
+        # 如果分數無效，強制設為 0，避免 int() 報錯
+        if np.isnan(curr_score) or np.isinf(curr_score):
+            valid_score = 0
+        else:
+            valid_score = int(curr_score)
+        
         # --- 進場邏輯 ---
         if position == 0:
-            # 門檻稍微放寬到 50，因為我們用 Z-Score 計算，50 已經是很強的標準差了
-            if curr_score >= buy_threshold:
-                # 額外濾網：如果是權值股，必須在季線上才買 (順勢)
-                # 除非是恐慌抄底 (>80分)
-                if is_titan and curr_price < curr_ma60 and curr_score < 80:
-                    pass # 權值股空頭不接刀
+            if valid_score >= buy_threshold:
+                if is_titan and curr_price < curr_ma60 and valid_score < 80:
+                    pass 
                 else:
                     signal = 1
                     entry_price = curr_price
                     highest_price = curr_price
                     action_code = "Buy"
-                    reason_str = "趨勢啟動" if curr_score < 80 else "恐慌抄底"
+                    reason_str = "趨勢啟動" if valid_score < 80 else "恐慌抄底"
         
         # --- 出場邏輯 ---
         elif position == 1:
             if curr_price > highest_price: highest_price = curr_price
             is_sell = False
             
-            # ============================================
-            # [核心差異] 泰坦股 vs 游擊股
-            # ============================================
-            
             if is_titan:
-                # --- 泰坦禪意模式 (Titan Zen) ---
-                # 只有一條規則：破季線就跑。
-                # 只要季線有撐，就算回檔 20%、法人大賣、分數歸零，都視為雜訊。
-                # (除非是恐慌抄底單，那邊有另外的深停損保護，這裡簡化為統一邏輯)
-                
                 if curr_price < curr_ma60:
-                    # 給予 1% 的緩衝，避免假跌破
                     if curr_price < curr_ma60 * 0.99:
                         is_sell = True
                         reason_str = "跌破季線(趨勢結束)"
-                
-                # 唯一的例外：災難停損 (防黑天鵝)
                 elif (curr_price - entry_price) / entry_price < -0.15:
                     is_sell = True
                     reason_str = "災難停損"
-                    
             else:
-                # --- 游擊靈活模式 (Guerrilla) ---
-                # 維持原本的敏捷邏輯：吊燈停利 + 評分轉弱
                 chandelier_stop = highest_price - (3 * atr[i])
-                
                 if curr_price < chandelier_stop:
                     is_sell = True; reason_str = "吊燈停利"
-                elif curr_score < -20:
+                elif valid_score < -20:
                     is_sell = True; reason_str = "評分轉空"
                 elif curr_price < curr_ma60:
                     is_sell = True; reason_str = "破季線"
@@ -608,7 +595,7 @@ def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.00
         reasons.append(reason_str)
         actions.append(action_code)
         return_labels.append(ret_label)
-        confidences.append(int(curr_score))
+        confidences.append(valid_score) # 使用處理過的安全分數
 
     df['Position'] = positions
     df['Reason'] = reasons
