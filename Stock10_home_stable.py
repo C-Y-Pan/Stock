@@ -189,10 +189,10 @@ import urllib3
 # 忽略 SSL 不安全警告，保持介面乾淨
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=3600, show_spinner=False)
 def get_master_stock_data():
     """
-    從證交所與櫃買中心獲取全市場股票清單與基本面數據 (修復上市資料遺失問題)
+    從證交所與櫃買中心獲取全市場股票與 ETF 清單 (修復 ETF 搜尋不到的問題)
     """
     stock_list = []
     headers = {
@@ -200,11 +200,12 @@ def get_master_stock_data():
         'Accept': 'application/json'
     }
     
-    # 1. 上市 (TWSE) - 增加 verify=False 解決憑證問題
+    # ---------------------------------------
+    # 1. 上市個股 (TWSE Equities)
+    # ---------------------------------------
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
-        # verify=False 是關鍵，許多環境連線證交所需要關閉驗證
-        res = requests.get(url_twse, headers=headers, timeout=15, verify=False) 
+        res = requests.get(url_twse, headers=headers, timeout=10, verify=False) 
         if res.status_code == 200:
             data = res.json()
             for row in data:
@@ -213,15 +214,15 @@ def get_master_stock_data():
                         "代號": row.get('Code'), "名稱": row.get('Name'), "市場": "上市",
                         "本益比": row.get('PEratio', '-'), "殖利率(%)": row.get('DividendYield', '-'), "股價淨值比": row.get('PBratio', '-')
                     })
-        else:
-            st.warning(f"⚠️ 連線證交所 (上市) 失敗，狀態碼: {res.status_code}")
     except Exception as e:
-        st.warning(f"⚠️ 無法獲取上市資料 (可能為網路阻擋或API維護): {e}")
+        print(f"TWSE Equities Error: {e}")
 
-    # 2. 上櫃 (TPEx)
+    # ---------------------------------------
+    # 2. 上櫃個股 (TPEx Equities)
+    # ---------------------------------------
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
-        res = requests.get(url_tpex, headers=headers, timeout=15, verify=False)
+        res = requests.get(url_tpex, headers=headers, timeout=10, verify=False)
         if res.status_code == 200:
             data = res.json()
             for row in data:
@@ -231,12 +232,49 @@ def get_master_stock_data():
                         "本益比": row.get('PriceEarningRatio', '-'), "殖利率(%)": row.get('YieldRatio', '-'), "股價淨值比": row.get('PriceBookRatio', '-')
                     })
     except Exception as e:
-        print(f"TPEx API Error: {e}") # 上櫃失敗通常較少見，僅後台印出
-    
+        print(f"TPEx Equities Error: {e}")
+
+    # ---------------------------------------
+    # 3. [新增] 上市 ETF (TWSE ETFs)
+    # ---------------------------------------
+    try:
+        # 使用證交所證券編碼 API 獲取 ETF
+        url_etf = "https://openapi.twse.com.tw/v1/securities/ETF"
+        res = requests.get(url_etf, headers=headers, timeout=10, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            for row in data:
+                if row.get('Code') and row.get('Name'):
+                    stock_list.append({
+                        "代號": row.get('Code'), "名稱": row.get('Name'), "市場": "上市ETF",
+                        "本益比": "-", "殖利率(%)": "-", "股價淨值比": "-"
+                    })
+    except Exception as e:
+        print(f"TWSE ETF Error: {e}")
+        
+    # ---------------------------------------
+    # 4. [防呆] 如果 API 失敗，補入熱門 ETF
+    # ---------------------------------------
+    # 檢查是否已包含 0050，若無則手動加入常用清單，確保斷線時至少能用熱門股
+    current_codes = {x['代號'] for x in stock_list}
+    fallback_etfs = [
+        ("0050", "元大台灣50"), ("0056", "元大高股息"), ("00878", "國泰永續高股息"), 
+        ("00929", "復華台灣科技優息"), ("00919", "群益台灣精選高息"), ("006208", "富邦台50"),
+        ("00713", "元大台灣高息低波"), ("00679B", "元大美債20年"), ("00687B", "國泰20年美債"),
+        ("00940", "元大台灣價值高息"), ("00881", "國泰台灣5G+")
+    ]
+    for code, name in fallback_etfs:
+        if code not in current_codes:
+            stock_list.append({
+                "代號": code, "名稱": name, "市場": "ETF(Manual)",
+                "本益比": "-", "殖利率(%)": "-", "股價淨值比": "-"
+            })
+
     if not stock_list:
         return pd.DataFrame(columns=["代號", "名稱", "市場", "本益比", "殖利率(%)", "股價淨值比"])
         
     return pd.DataFrame(stock_list)
+
 
 def get_stock_name(ticker):
     code = ticker.split('.')[0]
