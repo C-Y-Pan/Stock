@@ -2083,7 +2083,11 @@ elif page == "💼 持股健診與建議":
         if st.session_state.get('logged_in'):
             save_portfolio_to_db(st.session_state['username'], new_df)
 
-    # 初始化資料 (只在第一次執行或資料被意外清空時執行)
+# ==========================================
+    # 1. [保證同步版] 準備輸入資料 (回傳值偵測 + 強制刷新)
+    # ==========================================
+
+    # 初始化資料 (只在第一次執行時執行)
     if 'portfolio_data' not in st.session_state or not isinstance(st.session_state['portfolio_data'], pd.DataFrame):
         if st.session_state.get('logged_in'):
             db_df = load_portfolio_from_db(st.session_state['username'])
@@ -2098,26 +2102,49 @@ elif page == "💼 持股健診與建議":
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
         
-        # 這裡的 key 必須對應 callback 中的名稱
-        st.data_editor(
+        # [關鍵修改] 不再使用 on_change，而是直接接收回傳值
+        edited_df = st.data_editor(
             st.session_state['portfolio_data'], 
             num_rows="dynamic", 
             use_container_width=True, 
-            key="portfolio_editor",
-            on_change=on_portfolio_change,
+            key="portfolio_editor_widget", # 換個 key 避免快取衝突
             column_config={
                 "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號"),
                 "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
 
+        # [核心邏輯] 偵測是否發生變動
+        # 如果編輯後的 dataframe 跟 session_state 裡的不一樣，代表使用者剛改過
+        if edited_df is not None and not edited_df.equals(st.session_state['portfolio_data']):
+            
+            # 1. 資料清洗 (防呆轉型)
+            # 確保持有股數是整數
+            if '持有股數' in edited_df.columns:
+                edited_df['持有股數'] = pd.to_numeric(edited_df['持有股數'], errors='coerce').fillna(0).astype(int)
+            # 確保代號是字串
+            if '代號' in edited_df.columns:
+                edited_df['代號'] = edited_df['代號'].astype(str)
+
+            # 2. 更新 Session State
+            st.session_state['portfolio_data'] = edited_df
+            
+            # 3. 更新時間戳記 (通知下方圖表刷新)
+            st.session_state['data_version'] = datetime.now().timestamp()
+            
+            # 4. 同步寫入資料庫
+            if st.session_state.get('logged_in'):
+                save_portfolio_to_db(st.session_state['username'], edited_df)
+            
+            # 5. [最重要的一步] 強制重跑！
+            # 這會強迫頁面立刻帶著新數據重新渲染，確保下方表格百分之百拿到新資料
+            st.rerun()
+
     with col_ctrl:
         st.markdown("#### 2. 監控設定")
         st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 60 秒僅更新圖表數據，不會重載整頁。")
-        
-        # [關鍵] 必須先定義這個變數，下面的 @st.fragment 才能讀取到
         enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 60 秒更新)", value=False)
-
+        
 
     # ==========================================
     # 3. 定義局部刷新片段 (The Fragment)
