@@ -499,9 +499,18 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=55, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v14.2 (Titan Fix):
-    1. 進場門檻調降至 55 (配合 v22.0 的 50分中軸)。
-    2. 再次確保泰坦股的死抱邏輯生效。
+    策略引擎 v16.0 (Neuro-Adaptive):
+    回應：「不要頭腦簡單的強制休息」。
+    
+    [核心進化] 動態信心門檻 (Dynamic Threshold)
+    1. 廢除冷卻期：不再使用 cooldown_counter 強制空手。
+    2. 引入「創傷懲罰 (Risk Penalty)」：
+       - 當交易停損時，進場門檻會瞬間提高 (例如從 55 變 75)。
+       - 這代表在剛虧損後，我們變得更挑剔，只打「必勝的仗」。
+    3. 時間衰退：懲罰分數會隨時間遞減，慢慢恢復正常標準。
+    4. 效果：
+       - 如果是盤整爛訊號 (60分)，會因為門檻提高而被過濾 (達到休息效果)。
+       - 如果是 V型反轉大訊號 (95分)，會直接突破高門檻 (達到靈活抄底)。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -513,6 +522,10 @@ def run_simple_strategy(data, buy_threshold=55, fee_rate=0.001425, tax_rate=0.00
     entry_price = 0.0
     highest_price = 0.0
     
+    # [新變數] 動態風險溢價 (Risk Premium)
+    # 用來墊高進場門檻
+    risk_premium = 0.0
+    
     # 身份識別
     close_val = df['Close'].values
     vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
@@ -523,10 +536,13 @@ def run_simple_strategy(data, buy_threshold=55, fee_rate=0.001425, tax_rate=0.00
     ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
     scores = df['Alpha_Score'].values
     
-    # ATR
-    high = df['High']; low = df['Low']
+    high = df['High']; low = df['Low']; close = df['Close']
     tr = pd.concat([high - low, (high - close_val).abs(), (low - close_val).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().fillna(0).values
+    
+    signal_low_price = 0.0
+    is_golden_pit_trade = False
+    days_in_trade = 0
 
     for i in range(len(df)):
         signal = position
@@ -537,58 +553,119 @@ def run_simple_strategy(data, buy_threshold=55, fee_rate=0.001425, tax_rate=0.00
         curr_price = close_val[i]
         curr_score = scores[i]
         curr_ma60 = ma60[i]
+        curr_low = df['Low'].values[i]
         
         # [防呆]
         if np.isnan(curr_score) or np.isinf(curr_score): valid_score = 50
         else: valid_score = int(curr_score)
         
-        # --- 進場 ---
+        # --- 1. 計算當前的動態門檻 ---
+        # 門檻 = 基礎門檻(55) + 風險溢價
+        # 風險溢價會隨時間衰退 (每天 -1，直到歸零)
+        current_threshold = buy_threshold + risk_premium
+        if risk_premium > 0:
+            risk_premium = max(0, risk_premium - 1.0)
+            
+        # --- 2. 進場邏輯 ---
         if position == 0:
-            if valid_score >= buy_threshold:
-                # 權值股濾網：空頭不接刀，除非是超級恐慌 (>85分)
+            # 使用「動態門檻」來決定是否進場
+            # 這就是靈活之處：剛停損後，門檻很高，只有超強訊號進得來
+            if valid_score >= current_threshold:
+                
+                # 泰坦股特殊濾網
                 if is_titan and curr_price < curr_ma60 and valid_score < 85:
                     pass 
                 else:
                     signal = 1
                     entry_price = curr_price
                     highest_price = curr_price
+                    days_in_trade = 0
                     action_code = "Buy"
-                    reason_str = "趨勢啟動" if valid_score < 85 else "恐慌抄底"
-        
-        # --- 出場 ---
+                    
+                    if valid_score >= 85:
+                        reason_str = "恐慌抄底"
+                        is_golden_pit_trade = True
+                        signal_low_price = curr_low 
+                    else:
+                        reason_str = "趨勢啟動"
+                        is_golden_pit_trade = False
+            else:
+                # 沒進場，如果有溢價，可以顯示在原因裡告知使用者
+                if risk_premium > 5 and valid_score > buy_threshold:
+                    # 這種情況代表：分數不錯(例如60)，但因為剛虧損(門檻75)，所以忍住不買
+                    pass # 隱性過濾
+                    
+        # --- 3. 出場邏輯 ---
         elif position == 1:
+            days_in_trade += 1
             if curr_price > highest_price: highest_price = curr_price
-            is_sell = False
+            pnl_pct = (curr_price - entry_price) / entry_price
             
+            is_sell = False
+            penalty_score = 0 # 這次賣出要罰幾分？
+            
+            # ----------------------------------------
+            # 泰坦股邏輯 (Titan)
+            # ----------------------------------------
             if is_titan:
-                # [泰坦死抱邏輯]
-                # 1. 只有跌破季線才考慮走
-                if curr_price < curr_ma60:
-                    # 給 1% 緩衝
+                if is_golden_pit_trade: # 抄底單
+                    if curr_price < curr_ma60:
+                        # 只有災難停損才走
+                        if pnl_pct < -0.20:
+                            is_sell = True
+                            reason_str = "災難停損"
+                            penalty_score = 30 # 重罰：大傷，休息久一點
+                        elif days_in_trade > 40 and pnl_pct < -0.10:
+                            is_sell = True
+                            reason_str = "時間停損"
+                            penalty_score = 10
+                        else:
+                            is_sell = False; reason_str = "築底防守"
+                    else:
+                        is_golden_pit_trade = False # 轉正
+                        
+                else: # 順勢單
                     if curr_price < curr_ma60 * 0.99:
                         is_sell = True
-                        reason_str = "趨勢結束(破季線)"
-                
-                # 2. 災難停損 (-15%)
-                elif (curr_price - entry_price) / entry_price < -0.15:
-                    is_sell = True
-                    reason_str = "災難停損"
+                        reason_str = "趨勢結束"
+                        # 正常回檔，不需要太大懲罰，微調即可
+                        penalty_score = 5 
+                        
+            # ----------------------------------------
+            # 游擊股邏輯 (Guerrilla)
+            # ----------------------------------------
             else:
-                # [游擊靈活邏輯]
                 chandelier_stop = highest_price - (3 * atr[i])
-                if curr_price < chandelier_stop:
-                    is_sell = True; reason_str = "吊燈停利"
-                elif valid_score < 40: # 分數轉弱
-                    is_sell = True; reason_str = "評分轉空"
+                
+                # 黃金坑防守
+                if is_golden_pit_trade and curr_price < curr_ma60:
+                     # 寬容防守：破進場低點 4% 才走
+                     if curr_price < signal_low_price * 0.96:
+                         is_sell = True; reason_str = "破底停損"; penalty_score = 15
+                     elif pnl_pct < -0.15:
+                         is_sell = True; reason_str = "災難停損"; penalty_score = 25
+                     else:
+                         is_sell = False
+                
+                # 一般出場
+                elif curr_price < chandelier_stop:
+                    is_sell = True; reason_str = "吊燈停利"; penalty_score = 0 # 賺錢走的，不用懲罰
+                elif valid_score < 30:
+                    is_sell = True; reason_str = "評分轉空"; penalty_score = 5
                 elif curr_price < curr_ma60:
-                    is_sell = True; reason_str = "破季線"
+                    is_sell = True; reason_str = "破季線"; penalty_score = 5
 
+            # 執行賣出
             if is_sell:
                 signal = 0
                 action_code = "Sell"
-                pnl = (curr_price - entry_price) / entry_price * 100
-                sign = "+" if pnl > 0 else ""
-                ret_label = f"{sign}{pnl:.1f}%"
+                sign = "+" if pnl_pct > 0 else ""
+                ret_label = f"{sign}{pnl_pct*100:.1f}%"
+                
+                # [核心進化] 設定風險溢價
+                # 如果是停損出場(penalty_score高)，下次進場門檻會變高 (55 + 20 = 75)
+                # 如果是獲利出場(penalty_score低)，下次進場門檻幾乎不變 (55 + 0 = 55)
+                risk_premium = penalty_score 
 
         position = signal
         positions.append(signal)
@@ -603,7 +680,7 @@ def run_simple_strategy(data, buy_threshold=55, fee_rate=0.001425, tax_rate=0.00
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 績效計算
+    # 績效...
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     cost_series = pd.Series(0.0, index=df.index)
