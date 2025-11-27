@@ -794,8 +794,8 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v4.0 (Mean Reversion Edition): 
-    基於實證數據修正，將「追高殺低」邏輯改為「低檔佈局、高檔調節」。
+    Alpha Score v4.1 (Trend-Aware Mean Reversion): 
+    修正空頭趨勢中不斷接刀的問題。加入「季線濾網」，在空頭走勢中嚴格限制加分。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -811,92 +811,82 @@ def calculate_alpha_score(df, margin_df, short_df):
     bias_20 = ((df['Close'] - df['MA20']) / df['MA20']) * 100
     curr_rsi = df['RSI'].fillna(50)
     
-    # 布林通道 %B (位置指標)
+    # 布林通道
     std20 = df['Close'].rolling(20).std()
-    bb_up = df['MA20'] + 2 * std20
-    bb_low = df['MA20'] - 2 * std20
-    bb_width = (bb_up - bb_low).replace(0, 1)
-    pct_b = (df['Close'] - bb_low) / bb_width
+    bb_width = (4 * std20) / df['MA20'] # 簡化版帶寬
 
     # ====================================================
     # 2. 原始因子計算 (Raw Score)
     # ====================================================
-    # A. 趨勢位階 (Trend)
-    # 不再單純看均線之上，而是看乖離率是否適中
-    # 乖離率過大 (>10%) 代表過熱，給予負分
+    # A. 趨勢位階
+    # 乖離率 > 10% (過熱扣分), > 0 (偏強加分), < 0 (偏弱扣分)
     score_trend = np.where(bias_20 > 10, -50, np.where(bias_20 > 0, 30, -10))
     
-    # B. 動能位階 (Momentum)
-    # RSI > 75 為超買(扣分)，RSI < 25 為超賣(加分)，中間區域中性
+    # B. 動能位階
+    # RSI > 75 (超買扣分), < 25 (超賣加分)
     score_rsi = np.where(curr_rsi > 75, -40, np.where(curr_rsi < 30, 40, 0))
     
-    # C. 波動壓縮 (Volatility Squeeze)
-    # 布林帶寬壓縮後通常會有行情，給予加分
+    # C. 波動壓縮 (加分項)
     bb_width_ma = bb_width.rolling(20).mean()
     score_vol = np.where(bb_width < bb_width_ma * 0.8, 20, 0)
 
-    # 原始綜合分 (Raw Score)
+    # 原始綜合分
     raw_score = score_trend + score_rsi + score_vol
 
     # ====================================================
-    # 3. [關鍵修正] 均值回歸邏輯 (Reality Check Logic)
+    # 3. [核心修正] 趨勢感知濾網 (Trend Filter)
     # ====================================================
-    # 根據我們剛才的 IC 分析圖表進行權重重分配
-    
-    final_score_list = []
-    log_list = []
-    
-    # 為了計算動能斜率，我們需要前一日的數據 (這裡用迭代處理較精準)
-    # 但為了效能，我們使用向量化處理後再修正
-    
-    # 先轉成 Series 方便操作
     raw_series = pd.Series(raw_score, index=df.index)
     
-    # 規則 1: 黃金區間 (-40 ~ 0) -> 轉為強力買進
-    # 這是數據驗證勝率最高 (55%+) 的區間，代表「清洗浮額後的起漲點」
+    # 判斷是否為「空頭趨勢」 (收盤價 < 60日均線)
+    is_downtrend = df['Close'] < df['MA60']
+
+    # 定義區間
+    # Sweet Spot: 弱勢回檔區 (-40 ~ 10) -> 原本會加分
     cond_sweet_spot = (raw_series > -40) & (raw_series <= 10)
     
-    # 規則 2: 過熱區間 (> 40) -> 轉為賣出/調節
-    # 這是數據驗證勝率最低 (33%) 的區間
+    # Overheat: 過熱區 (> 40)
     cond_overheat = raw_series > 40
     
-    # 規則 3: 崩盤區間 (<-60) -> 維持賣出
-    # 這代表趨勢壞死，不要接刀
+    # Crash: 崩盤區 (<-60) -> 您的數據顯示這區間其實有獲利機會(深跌反彈)
     cond_crash = raw_series < -60
 
-    # 應用修正
     final_score = raw_series.copy()
     
-    # A. 甜蜜點加分 (把原本的 0 分拉高到 60~80 分)
-    final_score = np.where(cond_sweet_spot, raw_series + 70, final_score)
+    # --- 邏輯修正開始 ---
     
-    # B. 過熱扣分 (把原本的 80 分打回 20 分甚至負分)
+    # A. 甜蜜點加分 (僅在「非空頭」或「RSI極低」時生效)
+    # 如果是空頭趨勢(is_downtrend)，我們不加分，甚至微幅扣分(因為是緩跌)
+    # 除非 RSI 已經殺到見骨 (< 25)，才視為搶反彈機會
+    
+    bonus_mask = cond_sweet_spot & (~is_downtrend) # 只有多頭回檔才加分
+    final_score = np.where(bonus_mask, raw_series + 70, final_score)
+    
+    # 空頭走勢中的弱勢盤整 -> 視為持續下跌中繼 -> 扣分
+    bear_trap_mask = cond_sweet_spot & is_downtrend & (curr_rsi > 30)
+    final_score = np.where(bear_trap_mask, raw_series - 30, final_score)
+
+    # B. 過熱扣分 (維持原判)
     final_score = np.where(cond_overheat, raw_series - 60, final_score)
     
-    # C. 崩盤維持 (確保是負分)
-    final_score = np.where(cond_crash, -80, final_score)
+    # C. 崩盤處理 (Deep Crash)
+    # 根據您的數據，<-40 的勝率高，這代表深跌反彈有效
+    # 如果真的跌爛了 (Raw < -60) 且有乖離過大，嘗試給予搶短訊號
+    final_score = np.where(cond_crash, raw_series + 80, final_score)
+    
+    # 再次確保空頭趨勢下的反彈訊號不要太高分，除非極端
+    final_score = np.where(is_downtrend & (final_score > 60) & (curr_rsi > 30), 40, final_score)
 
     # ====================================================
-    # 4. 市場體制濾網 (Market Regime Filter)
-    # ====================================================
-    # 如果大盤恐慌 (VIX > 25)，全面降分，提高現金部位
-    if 'VIX' in df.columns:
-        vix_penalty = np.where(df['VIX'] > 25, 30, 0)
-        final_score = final_score - vix_penalty
-
-    # ====================================================
-    # 5. 平滑化與輸出
+    # 4. 平滑化與輸出
     # ====================================================
     final_series = pd.Series(final_score, index=df.index)
-    
-    # 3日平均，避免訊號閃爍
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
     
-    # 重新定義標籤
-    df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "低檔佈局(強)", 
-                      np.where(df['Alpha_Score'] < -40, "過熱/破線(弱)", "區間震盪"))
-
-    # 建議持倉水位
+    # 更新文字標籤邏輯
+    df['Score_Log'] = np.where(df['Alpha_Score'] > 60, "強勢/反彈", 
+                      np.where(df['Alpha_Score'] < -30, "空頭/修正", "盤整"))
+    
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
