@@ -1185,54 +1185,63 @@ def draw_market_dashboard(market_df, start_date, end_date):
 
 def send_analysis_email(df, market_analysis_text):
     """
-    發送持股分析報告 Email (含格式優化與時區校正)
+    發送持股分析報告 Email (含分數變動顯示)
     """
-    if df.empty: return
+    if df.empty: return False
 
     # [關鍵修正] 設定台北時區
     tw = pytz.timezone('Asia/Taipei')
-    # 獲取當前台北時間
     now_tw = datetime.now(tw)
 
     # 1. 準備內容與格式化
     subject = f"📊 持股評分變動通知 - {now_tw.strftime('%H:%M')}"
     
-    # 建立副本
+    # 建立副本以免影響原始顯示
     email_df = df.copy()
     
     # 格式化收盤價
     try:
-        email_df["收盤價"] = pd.to_numeric(email_df["收盤價"], errors='coerce')
-        email_df["收盤價"] = email_df["收盤價"].map('{:,.2f}'.format)
+        if "收盤價" in email_df.columns:
+            email_df["收盤價"] = pd.to_numeric(email_df["收盤價"], errors='coerce')
+            email_df["收盤價"] = email_df["收盤價"].map('{:,.2f}'.format)
     except: pass
 
-    # 選取欄位
-    cols = ["代號", "名稱", "收盤價", "綜合評分", "AI 建議"]
+    # [修改這裡] 設定要顯示在 Email 中的欄位
+    # 我們優先顯示 "分數變動"，如果沒有這個欄位(例如第一次執行)，才顯示 "綜合評分"
+    target_score_col = "分數變動" if "分數變動" in email_df.columns else "綜合評分"
+    
+    cols = ["代號", "名稱", "收盤價", target_score_col, "AI 建議"]
     final_cols = [c for c in cols if c in email_df.columns]
     
-    # 轉為 HTML
+    # 轉為 HTML 表格 (加入 CSS 讓表格好看一點)
     html_table = email_df[final_cols].to_html(
         index=False, 
-        classes='table table-striped', 
+        classes='table', 
         border=1, 
-        justify='center'
+        justify='center',
+        escape=False # [重要] 允許 HTML 標籤 (為了讓箭頭或顏色生效)
     )
     
-    # 組合 Email 內文 (時間改用 now_tw)
+    # 優化表格樣式：將表頭背景設為深色，文字置中
+    html_table = html_table.replace('<table border="1" class="dataframe table">', '<table style="border-collapse: collapse; width: 100%; font-family: Arial, sans-serif;">')
+    html_table = html_table.replace('<th>', '<th style="background-color: #f2f2f2; padding: 8px; text-align: center; border: 1px solid #ddd;">')
+    html_table = html_table.replace('<td>', '<td style="padding: 8px; text-align: center; border: 1px solid #ddd;">')
+
+    # 組合 Email 內文
     email_body = f"""
     <html>
     <body style="font-family: Arial, sans-serif;">
         <h2 style="color: #333;">🔔 持股評分變動通知</h2>
-        <p>系統偵測到您的持股組合出現評分變化，最新狀態如下：</p>
+        <p>系統偵測到您的持股組合出現變化，詳細數據如下：</p>
         <p>時間：{now_tw.strftime('%Y-%m-%d %H:%M:%S')} (Taipei)</p>
         <hr>
+        <h3>📊 持股最新評級</h3>
+        {html_table}
+        <br>
         <h3>📋 AI 市場前瞻</h3>
         <div style='background-color: #f8f9fa; padding: 15px; border-left: 5px solid #007bff; border-radius: 4px;'>
             {market_analysis_text}
         </div>
-        <br>
-        <h3>📊 持股最新評級</h3>
-        {html_table}
         <br>
         <p style="font-size: 12px; color: #888;"><i>本信件由 Quant Pro v6.0 自動觸發，請勿直接回信。</i></p>
     </body>
@@ -1257,7 +1266,9 @@ def send_analysis_email(df, market_analysis_text):
     except Exception as e:
         print(f"❌ Email 發送失敗: {e}")
         return False
-            
+    
+
+
 # ==========================================
 # 前端介面
 # ==========================================
@@ -2144,7 +2155,7 @@ elif page == "💼 持股健診與建議":
         st.markdown("#### 2. 監控設定")
         st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 60 秒僅更新圖表數據，不會重載整頁。")
         enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 60 秒更新)", value=False)
-        
+
 
     # ==========================================
     # 3. 定義局部刷新片段 (The Fragment)
@@ -2280,21 +2291,52 @@ elif page == "💼 持股健診與建議":
             
             status.update(label="AI 分析完成！", state="complete", expanded=False)
 
-        # ==========================================
-        # 自動寄信邏輯：評分變動觸發
+# ==========================================
+        # 自動寄信邏輯：評分變動觸發 (優化版：計算具體變化)
         # ==========================================
         if enable_monitor and portfolio_results:
+            # 1. 建立當前分數快照
             current_scores_fingerprint = {
                 item['代號']: item['綜合評分'] 
                 for item in portfolio_results
             }
             
-            has_score_changed = (current_scores_fingerprint != st.session_state['last_sent_scores'])
+            # 2. 比較是否發生變動
+            last_scores = st.session_state['last_sent_scores']
+            has_score_changed = (current_scores_fingerprint != last_scores)
             
             if has_score_changed:
                 st.toast("⚡ 偵測到評分變動，準備發送通知...", icon="📧")
                 
-                res_df = pd.DataFrame(portfolio_results)
+                # 3. [關鍵] 製作 "Email 專用數據"，加入 "分數變動" 欄位
+                email_data_list = []
+                for item in portfolio_results:
+                    ticker = item['代號']
+                    new_score = item['綜合評分']
+                    old_score = last_scores.get(ticker) # 嘗試取得舊分數
+                    
+                    # 產生變動字串
+                    if old_score is None:
+                        # 如果是新加入的股票
+                        change_str = f"<span style='color:blue'>New ({new_score})</span>"
+                    elif new_score != old_score:
+                        # 有變動
+                        if new_score > old_score:
+                            change_str = f"{old_score} <b style='color:red'>➜ {new_score} (⬆️)</b>"
+                        else:
+                            change_str = f"{old_score} <b style='color:green'>➜ {new_score} (⬇️)</b>"
+                    else:
+                        # 沒變動
+                        change_str = f"{new_score}"
+                    
+                    # 複製並加入新欄位
+                    item_copy = item.copy()
+                    item_copy['分數變動'] = change_str
+                    email_data_list.append(item_copy)
+
+                res_df_for_email = pd.DataFrame(email_data_list)
+                
+                # 4. 準備市場分析文字
                 try:
                     market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
                     analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
@@ -2302,15 +2344,17 @@ elif page == "💼 持股健診與建議":
                     print(f"市場分析生成失敗: {e}")
                     analysis_html_for_email = "<p>暫無法獲取市場分析數據</p>"
                 
+                # 5. 發送 Email
                 with st.spinner("📧 評分異動，正在發送信件..."):
-                    success = send_analysis_email(res_df, analysis_html_for_email)
+                    success = send_analysis_email(res_df_for_email, analysis_html_for_email)
                     
                 if success:
+                    # 發送成功後，才更新記憶體中的 "上次分數"
                     st.session_state['last_sent_scores'] = current_scores_fingerprint
                     st.toast(f"✅ 已發送變動通知！")
                 else:
                     st.toast("❌ Email 發送失敗", icon="⚠️")
-
+                    
         # ==========================================
         # 顯示結果
         # ==========================================
