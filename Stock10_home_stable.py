@@ -497,12 +497,11 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, buy_threshold=55, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v14.1 (NaN Fix):
-    修復 ValueError。
-    針對 Alpha Score 可能出現 NaN 或 Inf 的情況加入防呆機制。
-    確保在轉換 int() 之前，數值是有效的，否則預設為 0。
+    策略引擎 v14.2 (Titan Fix):
+    1. 進場門檻調降至 55 (配合 v22.0 的 50分中軸)。
+    2. 再次確保泰坦股的死抱邏輯生效。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -512,25 +511,22 @@ def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.00
     
     position = 0
     entry_price = 0.0
+    highest_price = 0.0
     
     # 身份識別
     close_val = df['Close'].values
     vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
-    
-    # 防呆：計算平均成交額時忽略 NaN
     avg_dollar_vol = np.nanmean(close_val * vol_val)
     if np.isnan(avg_dollar_vol): avg_dollar_vol = 0
-    
     is_titan = avg_dollar_vol > 5_000_000_000 
     
     ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
     scores = df['Alpha_Score'].values
     
-    # 計算 ATR
+    # ATR
     high = df['High']; low = df['Low']
     tr = pd.concat([high - low, (high - close_val).abs(), (low - close_val).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().fillna(0).values
-    highest_price = 0.0
 
     for i in range(len(df)):
         signal = position
@@ -542,43 +538,47 @@ def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.00
         curr_score = scores[i]
         curr_ma60 = ma60[i]
         
-        # [核心修復] 處理 NaN/Inf 分數
-        # 如果分數無效，強制設為 0，避免 int() 報錯
-        if np.isnan(curr_score) or np.isinf(curr_score):
-            valid_score = 0
-        else:
-            valid_score = int(curr_score)
+        # [防呆]
+        if np.isnan(curr_score) or np.isinf(curr_score): valid_score = 50
+        else: valid_score = int(curr_score)
         
-        # --- 進場邏輯 ---
+        # --- 進場 ---
         if position == 0:
             if valid_score >= buy_threshold:
-                if is_titan and curr_price < curr_ma60 and valid_score < 80:
+                # 權值股濾網：空頭不接刀，除非是超級恐慌 (>85分)
+                if is_titan and curr_price < curr_ma60 and valid_score < 85:
                     pass 
                 else:
                     signal = 1
                     entry_price = curr_price
                     highest_price = curr_price
                     action_code = "Buy"
-                    reason_str = "趨勢啟動" if valid_score < 80 else "恐慌抄底"
+                    reason_str = "趨勢啟動" if valid_score < 85 else "恐慌抄底"
         
-        # --- 出場邏輯 ---
+        # --- 出場 ---
         elif position == 1:
             if curr_price > highest_price: highest_price = curr_price
             is_sell = False
             
             if is_titan:
+                # [泰坦死抱邏輯]
+                # 1. 只有跌破季線才考慮走
                 if curr_price < curr_ma60:
+                    # 給 1% 緩衝
                     if curr_price < curr_ma60 * 0.99:
                         is_sell = True
-                        reason_str = "跌破季線(趨勢結束)"
+                        reason_str = "趨勢結束(破季線)"
+                
+                # 2. 災難停損 (-15%)
                 elif (curr_price - entry_price) / entry_price < -0.15:
                     is_sell = True
                     reason_str = "災難停損"
             else:
+                # [游擊靈活邏輯]
                 chandelier_stop = highest_price - (3 * atr[i])
                 if curr_price < chandelier_stop:
                     is_sell = True; reason_str = "吊燈停利"
-                elif valid_score < -20:
+                elif valid_score < 40: # 分數轉弱
                     is_sell = True; reason_str = "評分轉空"
                 elif curr_price < curr_ma60:
                     is_sell = True; reason_str = "破季線"
@@ -595,7 +595,7 @@ def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.00
         reasons.append(reason_str)
         actions.append(action_code)
         return_labels.append(ret_label)
-        confidences.append(valid_score) # 使用處理過的安全分數
+        confidences.append(valid_score)
 
     df['Position'] = positions
     df['Reason'] = reasons
@@ -603,7 +603,7 @@ def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.00
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 績效...
+    # 績效計算
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     cost_series = pd.Series(0.0, index=df.index)
@@ -881,13 +881,15 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v21.0 (The Analog Signal):
-    解決「分數死板均一」的問題。
+    Alpha Score v22.0 (The Awakening):
+    緊急修復「權值股零交易」的數學錯誤。
     
-    [核心進化] 純數學推導
-    1. 移除所有 `score = 85` 這種人工賦值。
-    2. 改用 Z-Score 加權總和，讓分數呈現連續的類比變化。
-    3. 這樣您就能看到趨勢是「逐漸轉強」還是「瞬間爆發」。
+    [核心修正]
+    1. 基準回歸：將分數模型校正回 50 分為中軸。
+       - (Z-Score * 權重) 加回 50，確保正常趨勢能達到 60~80 分的買進區。
+    2. 泰坦溢價 (Titan Premium):
+       - 針對權值股，只要確認在季線之上且趨勢向上，額外給予 +15 分的「趨勢紅利」。
+       - 這確保了台積電這種緩漲股，分數能穩定維持在 65+ (持有/買進)，不會因為指標鈍化而掉下來。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -906,65 +908,62 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
     
-    # 判斷股本 (用於權重分配，但不影響分數連續性)
+    # 身份識別
     avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
     if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
     is_titan = avg_dollar_vol > 5_000_000_000 
 
     # ====================================================
-    # 2. 計算連續性因子 (Continuous Factors)
+    # 2. 統計因子 (Z-Scores)
     # ====================================================
     
-    # A. 趨勢強度 (Slope Z-Score)
+    # A. 斜率 Z
     ma60_diff = df['MA60'].diff()
-    slope_mean = ma60_diff.rolling(60).mean()
-    slope_std = ma60_diff.rolling(60).std().replace(0, 0.001)
-    slope_z = (ma60_diff - slope_mean) / slope_std
+    slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std().replace(0, 0.001)
     slope_z = slope_z.fillna(0)
     
-    # B. 籌碼動能 (Inst Z-Score)
+    # B. 籌碼 Z
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_mean = inst_rate.rolling(60).mean()
-    inst_std = inst_rate.rolling(60).std().replace(0, 0.01)
-    inst_z = (inst_rate - inst_mean) / inst_std
+    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().replace(0, 0.01)
     inst_z = inst_z.fillna(0)
     
-    # C. 乖離率倒數 (Mean Reversion Potential)
-    # 用於恐慌抄底：乖離越負，分數越高
+    # C. 乖離率 Z (用於恐慌判斷)
     bias_60 = (close - df['MA60']) / df['MA60']
     bias_z = (bias_60 - bias_60.rolling(60).mean()) / bias_60.rolling(60).std().fillna(1)
-    # 逆勢分數：當乖離率極低(負)時，給予正向分數
-    reversion_score = -bias_z 
 
     # ====================================================
     # 3. 合成總分 (Weighted Sum)
     # ====================================================
-    # 根據股性調整權重
+    
     if is_titan:
-        # 權值股：重趨勢 (60%) + 重籌碼 (40%)
-        w_trend = 0.6
-        w_chip = 0.4
-        mode_log = "🐘 泰坦"
+        w_trend = 0.7; w_chip = 0.3; mode_log = "🐘 泰坦"
     else:
-        # 小型股：籌碼決定一切 (70%)
-        w_trend = 0.3
-        w_chip = 0.7
-        mode_log = "🐆 游擊"
+        w_trend = 0.3; w_chip = 0.7; mode_log = "🐆 游擊"
     
-    # 基礎分 (趨勢 + 籌碼)
-    base_score = (slope_z * w_trend + inst_z * w_chip) * 30 
+    # [修正 1] 基礎分計算 (以 50 為中心)
+    # Z-Score 通常在 -2 ~ +2 之間
+    # 乘以 20 代表波動範圍約在 -40 ~ +40
+    # 加上 50 -> 分數範圍 10 ~ 90
+    weighted_z = (slope_z * w_trend + inst_z * w_chip)
+    base_score = 50 + (weighted_z * 20)
     
-    # 恐慌加分 (僅在極端恐慌時生效)
-    # 當 VIX 高且乖離大時，疊加逆勢分數
-    vix_panic = np.where(df['VIX'] > 25, 1, 0)
-    panic_bonus = reversion_score * 40 * vix_panic
+    # [修正 2] 泰坦趨勢溢價 (Trend Premium)
+    # 如果是權值股，且站在季線上，且季線向上 -> 直接加分
+    # 這是為了防止緩漲時 Z-Score 不夠高
+    is_bull_trend = (close > df['MA60']) & (ma60_diff > 0)
+    titan_bonus = np.where(is_titan & is_bull_trend, 15, 0)
     
-    # 最終分數 = 基礎分 + 恐慌加分
-    final_score_series = base_score + panic_bonus
+    # [修正 3] 恐慌加權 (Panic Bonus)
+    # VIX > 25 且 乖離 Z < -1.5 (負乖離大)
+    vix_panic = (df['VIX'] > 25) & (bias_z < -1.5)
+    # 恐慌時，直接給予極大加分 (讓分數衝破 90)
+    panic_bonus = np.where(vix_panic, 50, 0)
     
-    # 寫入 (平滑化處理)
-    # 使用 3日 EMA 讓曲線更滑順，不再是鋸齒狀
-    df['Alpha_Score'] = final_score_series.ewm(span=3).mean().clip(-100, 100)
+    # 總分合成
+    final_score_series = base_score + titan_bonus + panic_bonus
+    
+    # 寫入 (平滑化)
+    df['Alpha_Score'] = final_score_series.rolling(3, min_periods=1).mean().clip(0, 100)
     
     # 生成 Log
     logs = []
@@ -972,12 +971,16 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     for i in range(len(df)):
         if score_val[i] > 80: log = f"{mode_log} 極強"
-        elif score_val[i] > 50: log = f"{mode_log} 偏多"
-        elif score_val[i] < -50: log = f"{mode_log} 偏空"
+        elif score_val[i] > 60: log = f"{mode_log} 偏多"
+        elif score_val[i] < 40: log = f"{mode_log} 偏空"
         else: log = "盤整"
+        
+        if vix_panic[i]: log = "💎 恐慌機會"
+        
         logs.append(log)
         
     df['Score_Log'] = logs
+    df['Recommended_Position'] = df['Alpha_Score']
     
     # 輔助
     df['Slope_Z'] = slope_z
