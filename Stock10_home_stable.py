@@ -2076,6 +2076,8 @@ elif page == "💼 持股健診與建議":
 
         # 更新 Session State (確保它是乾淨的 DataFrame)
         st.session_state['portfolio_data'] = new_df
+
+        st.session_state['data_version'] = datetime.now().timestamp()
         
         # 如果已登入，同步寫入資料庫
         if st.session_state.get('logged_in'):
@@ -2108,7 +2110,7 @@ elif page == "💼 持股健診與建議":
                 "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
-        
+
     with col_ctrl:
         st.markdown("#### 2. 監控設定")
         st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 60 秒僅更新圖表數據，不會重載整頁。")
