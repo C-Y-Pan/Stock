@@ -1611,32 +1611,29 @@ elif page == "📊 單股深度分析":
                 tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])                
                 
                 # [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
+                # [Tab 1: K線圖與買賣點分析]
                 with tab1:
                     # 1. 準備數據
-                    # 將 Alpha Score 寫入 final_df
+                    # 將 Alpha Score 等數據寫入 final_df 以便繪圖
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    
-                    # [關鍵新增] 計算 Alpha Score 的斜率 (對時間微分/一階差分)
-                    # 意義：衡量評分變化的方向與力道
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
 
-                    # 2. 建立子圖：擴增為 6 列
+                    # 建立子圖
                     fig = make_subplots(
                         rows=6, cols=1, 
                         shared_xaxes=True, 
                         vertical_spacing=0.02, 
-                        # 調整高度比例：主圖最大，其餘副圖平均分配
-                        row_heights=[0.35, 0.13, 0.13, 0.13, 0.13, 0.13], 
+                        row_heights=[0.4, 0.12, 0.12, 0.12, 0.12, 0.12], # 加大主圖比例
                         subplot_titles=(
                             "", 
                             "買賣評等 (Alpha Score)", 
-                            "評分動能 (Alpha Slope / 變化率)", # 新增標題
+                            "評分動能 (Slope)", 
                             "成交量", 
                             "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)"
                         )
                     )
-            
+                    
                     # --- Row 1: 主圖 K 線 ---
                     fig.add_trace(go.Candlestick(
                         x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
@@ -1645,67 +1642,66 @@ elif page == "📊 單股深度分析":
                     ), row=1, col=1)
                     
                     # 均線
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', 
-                                            line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
                                             line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # 買賣點標記函式
-                    final_df['Buy_Y'] = final_df['Low'] * 0.92
-                    final_df['Sell_Y'] = final_df['High'] * 1.08
-
-                    def get_buy_text(sub_df):
-                        return [f"<b>{score}</b>" for score in sub_df['Confidence']]
-
-                    def get_sell_text(sub_df):
-                        labels = []
-                        for idx, row in sub_df.iterrows():
-                            ret = row['Return_Label']
-                            reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
-                            labels.append(f"{ret}<br>({reason_str})")
-                        return labels
-
-                    # 繪製買點
-                    buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
-                    if not buy_trend.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_trend), textposition="bottom center",
-                            textfont=dict(color='#FFD700', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), 
-                            name='買進 (趨勢)', hovertext=buy_trend['Reason']
-                        ), row=1, col=1)
+                    # ==================================================
+                    # [核心新增] 買賣點與原因標記
+                    # ==================================================
                     
-                    buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
-                    if not buy_panic.empty:
+                    # 定義標記位置 (Y軸)
+                    final_df['Buy_Y'] = final_df['Low'] * 0.98  # K線下方 2%
+                    final_df['Sell_Y'] = final_df['High'] * 1.02 # K線上方 2%
+
+                    # 篩選買賣紀錄
+                    buy_records = final_df[final_df['Action'] == 'Buy'].copy()
+                    sell_records = final_df[final_df['Action'] == 'Sell'].copy()
+
+                    # 1. 繪製買點 (Buy Signals)
+                    if not buy_records.empty:
+                        # 處理顯示文字：組合「評分」與「簡短原因」
+                        def format_buy_text(row):
+                            score = int(row['Confidence'])
+                            reason = row['Reason'].split('/')[0] # 取斜線前的簡短原因
+                            return f"<b>買 ({score}分)</b><br>{reason}"
+
+                        buy_text = buy_records.apply(format_buy_text, axis=1)
+                        
+                        # 根據原因類型設定顏色 (黃金坑用金色，一般用青色)
+                        buy_colors = ['#FFD700' if '黃金坑' in r else '#00FFFF' for r in buy_records['Reason']]
+
                         fig.add_trace(go.Scatter(
-                            x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_panic), textposition="bottom center",
-                            textfont=dict(color='#00FFFF', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), 
-                            name='買進 (反彈)', hovertext=buy_panic['Reason']
-                        ), row=1, col=1)
-                    
-                    buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
-                    if not buy_chip.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text',
-                            text=get_buy_text(buy_chip), textposition="bottom center",
-                            textfont=dict(color='#DDA0DD', size=11),
-                            marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), 
-                            name='買進 (籌碼)', hovertext=buy_chip['Reason']
+                            x=buy_records['Date'], 
+                            y=buy_records['Buy_Y'], 
+                            mode='markers+text',
+                            text=buy_text, 
+                            textposition="bottom center",
+                            textfont=dict(size=10),
+                            marker=dict(symbol='triangle-up', size=12, color=buy_colors, line=dict(width=1, color='black')), 
+                            name='買進訊號', 
+                            # 滑鼠懸停時顯示完整原因
+                            hovertext=buy_records['Reason'] 
                         ), row=1, col=1)
 
-                    sell_all = final_df[final_df['Action'] == 'Sell']
-                    if not sell_all.empty:
+                    # 2. 繪製賣點 (Sell Signals)
+                    if not sell_records.empty:
+                        # 處理賣出文字：顯示報酬率
+                        sell_text = [f"<b>賣</b><br>{label}" for label in sell_records['Return_Label']]
+                        
                         fig.add_trace(go.Scatter(
-                            x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', 
-                            text=get_sell_text(sell_all), textposition="top center",
-                            textfont=dict(color='white', size=11),
-                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), 
-                            name='賣出', hovertext=sell_all['Reason']
+                            x=sell_records['Date'], 
+                            y=sell_records['Sell_Y'], 
+                            mode='markers+text', 
+                            text=sell_text, 
+                            textposition="top center",
+                            textfont=dict(color='#ff8a80', size=10),
+                            marker=dict(symbol='triangle-down', size=12, color='#ff5252', line=dict(width=1, color='black')), 
+                            name='賣出訊號', 
+                            hovertext=sell_records['Reason']
                         ), row=1, col=1)
-                    
+
+                    # ==================================================
+
                     # --- Row 2: Alpha Score (狀態) ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
                     fig.add_trace(go.Bar(
@@ -1713,17 +1709,16 @@ elif page == "📊 單股深度分析":
                         name='Alpha Score', marker_color=colors_score
                     ), row=2, col=1)
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
+                    # 加入關鍵分數線
+                    fig.add_hline(y=80, line_dash="dot", line_color="yellow", row=2, col=1, annotation_text="黃金坑(80)")
+                    fig.add_hline(y=-20, line_dash="dot", line_color="gray", row=2, col=1)
 
-                    # --- Row 3: Alpha Slope (動能/微分) [新增] ---
-                    # 邏輯：斜率 > 0 代表評分正在改善 (轉強) -> 紅色
-                    #       斜率 < 0 代表評分正在惡化 (轉弱) -> 綠色
+                    # --- Row 3: Alpha Slope ---
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], y=final_df['Alpha_Slope'],
                         name='Alpha Slope', marker_color=colors_slope
                     ), row=3, col=1)
-                    # 加一條零軸線
-                    fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
 
                     # --- Row 4: 成交量 ---
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
@@ -1734,14 +1729,18 @@ elif page == "📊 單股深度分析":
                     
                     # --- Row 6: RSI ---
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=6, col=1)
-                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=6, col=1)
-                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
+                    fig.add_hline(y=30, line_dash="dot", line_color="green", row=6, col=1)
+                    fig.add_hline(y=70, line_dash="dot", line_color="red", row=6, col=1)
                     
                     # Layout 設定
-                    # 增加總高度以容納 6 張圖
-                    fig.update_layout(height=1200, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
-                                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
-                    
+                    fig.update_layout(
+                        height=1300, 
+                        template="plotly_dark", 
+                        xaxis_rangeslider_visible=False, 
+                        margin=dict(l=20, r=40, t=30, b=20),
+                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1),
+                        hovermode="x unified"
+                    )
                     fig.update_yaxes(side='right')
                     
                     st.plotly_chart(fig, use_container_width=True)
