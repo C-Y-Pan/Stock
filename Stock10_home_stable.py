@@ -2048,16 +2048,28 @@ elif page == "💼 持股健診與建議":
     # 1. [修正] 準備輸入資料 (使用 Callback 鎖定狀態)
     # ==========================================
     
-    # 定義 Callback：當表格被編輯時，立刻執行此函式存檔
+# 定義 Callback：當表格被編輯時，立刻執行此函式存檔
     def on_portfolio_change():
-        # 從 editor 的 key 中取出最新資料，強制更新到 portfolio_data
-        new_df = st.session_state["portfolio_editor"]
+        # 1. 取出編輯後的資料
+        edited_data = st.session_state["portfolio_editor"]
+        
+        # 2. [關鍵修正] 強制轉為 DataFrame
+        # 避免 Streamlit 回傳 List 或 Dict 導致 iterrows() 失敗
+        if not isinstance(edited_data, pd.DataFrame):
+            new_df = pd.DataFrame(edited_data)
+        else:
+            new_df = edited_data
+            
+        # 3. 更新 Session State
         st.session_state['portfolio_data'] = new_df
         
-        # 如果已登入，同步寫入資料庫
+        # 4. 如果已登入，同步寫入資料庫
         if st.session_state.get('logged_in'):
-            save_portfolio_to_db(st.session_state['username'], new_df)
+            # 確保欄位名稱正確，防止空資料導致錯誤
+            if not new_df.empty and '代號' in new_df.columns and '持有股數' in new_df.columns:
+                save_portfolio_to_db(st.session_state['username'], new_df)
 
+                
     # 初始化資料 (只在第一次執行)
     if 'portfolio_data' not in st.session_state:
         if st.session_state.get('logged_in'):
@@ -2094,7 +2106,7 @@ elif page == "💼 持股健診與建議":
         # [關鍵] 必須先定義這個變數，下面的 @st.fragment 才能讀取到
         enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 60 秒更新)", value=False)
 
-        
+
     # ==========================================
     # 3. 定義局部刷新片段 (The Fragment)
     # [注意] 這個函式必須放在 enable_monitor 定義之後
