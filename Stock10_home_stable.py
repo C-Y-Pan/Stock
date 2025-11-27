@@ -921,113 +921,164 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v25.1 (Bug Fix Edition):
-    修復 KeyError。
-    將 reversion_force 與 risk_factor 轉為 numpy array 後再進入迴圈，
-    解決日期索引與整數迴圈不兼容的問題。
+    Alpha Score v30.0 (Deep Quantitative Edition)
+    核心邏輯：VWAP成本定錨 + CMF資金流向 + 動能二階導數 + 波動率壓縮
     """
     df = df.copy()
-    if 'Score_Log' not in df.columns: df['Score_Log'] = ""
+    
+    # ==========================================
+    # 0. 基礎數據清洗與防呆
+    # ==========================================
+    if df.empty or len(df) < 30:
+        df['Alpha_Score'] = 0
+        df['Score_Log'] = "資料不足"
+        return df
 
-    # ====================================================
-    # 1. 基礎數據清洗
-    # ====================================================
-    has_chip_data = 'Inst_Net_Buy' in df.columns
-    if not has_chip_data: df['Inst_Net_Buy'] = 0 
+    # 確保必要欄位存在
+    cols = ['Open', 'High', 'Low', 'Close', 'Volume']
+    for c in cols:
+        if c not in df.columns: df[c] = 0
+    
+    # 處理除數為0的情況
+    df['Volume'] = df['Volume'].replace(0, 1)
     
     close = df['Close']
-    if 'VIX' not in df.columns: df['VIX'] = 20.0
-    vix = df['VIX'].ffill().fillna(20.0)
+    high = df['High']
+    low = df['Low']
+    vol = df['Volume']
     
-    if 'Volume' not in df.columns: df['Volume'] = 0
-    
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    df['MA20'] = ma20; df['MA60'] = ma60
-    
-    # 身份識別
-    avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
-    if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
-    is_titan = avg_dollar_vol > 5_000_000_000 
+    # ==========================================
+    # 1. 因子計算 (Feature Engineering)
+    # ==========================================
 
-    # ====================================================
-    # 2. 類比因子計算 (Analog Factors)
-    # ====================================================
+    # [F1] VWAP 定錨因子 (Volume Weighted Average Price)
+    # 邏輯：股價在月均成本(VWAP)之上，且乖離率擴大中，代表趨勢強勁
+    tp = (high + low + close) / 3
+    vwap = (tp * vol).rolling(20).sum() / vol.rolling(20).sum()
+    vwap_std = close.rolling(20).std().fillna(method='bfill')
+    # Z-Score 標準化：計算股價距離平均成本幾個標準差
+    f_vwap_z = ((close - vwap) / vwap_std).fillna(0)
     
-    # [A] 趨勢強度
-    bias = (close - ma60) / ma60
-    bias_z = (bias - bias.rolling(60).mean()) / bias.rolling(60).std().fillna(1)
-    
-    # [B] 動能變化
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
+    # [F2] CMF 資金流向因子 (Chaikin Money Flow)
+    # 邏輯：判斷資金是在吸籌還是出貨 (比單純法人買賣超更即時)
+    mf_multiplier = ((close - low) - (high - close)) / (high - low).replace(0, 0.01)
+    mf_volume = mf_multiplier * vol
+    f_cmf = mf_volume.rolling(20).sum() / vol.rolling(20).sum()
+    f_cmf = f_cmf.fillna(0) * 10  # 放大係數以便權重計算
+
+    # [F3] 動能加速因子 (MACD Acceleration)
+    # 邏輯：取 MACD Histogram 的變化率 (斜率)，作為領先指標
+    ema12 = close.ewm(span=12, adjust=False).mean()
+    ema26 = close.ewm(span=26, adjust=False).mean()
     macd = ema12 - ema26
-    signal = macd.ewm(span=9).mean()
+    signal = macd.ewm(span=9, adjust=False).mean()
     hist = macd - signal
-    mom_score = np.tanh(hist / close * 100) * 2 
-    
-    # [C] 籌碼流向
-    inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().fillna(1)
-    inst_z_smooth = inst_z.rolling(3).mean().fillna(0)
-    
-    # [D] 風險係數
-    risk_factor = np.maximum(0, vix - 15) / 10.0
-    
-    # ====================================================
-    # 3. 向量合成 (Vector Synthesis)
-    # ====================================================
-    
-    if is_titan:
-        w_trend = 15.0; w_mom = 10.0; w_chip = 10.0; w_risk = 20.0
+    # 計算 Histogram 的斜率 (今日 - 昨日)
+    f_mom_acc = hist.diff().fillna(0) 
+    # 正規化：除以股價以消除高價股數值過大的問題
+    f_mom_norm = (f_mom_acc / close) * 1000 
+
+    # [F4] 法人籌碼因子 (Institutional Impact)
+    # 邏輯：法人淨買超佔成交量的比重，並進行平滑處理
+    if 'Inst_Net_Buy' in df.columns:
+        inst_ratio = df['Inst_Net_Buy'] / vol
+        f_inst = inst_ratio.rolling(5).mean().fillna(0) * 20 # 係數調整
     else:
-        w_trend = 10.0; w_mom = 15.0; w_chip = 20.0; w_risk = 10.0
-        
-    # 核心公式
-    raw_score = 50 + (bias_z * w_trend) + (mom_score * w_mom * 10) + (inst_z_smooth * w_chip) - (risk_factor * w_risk)
+        f_inst = pd.Series(0, index=df.index)
+
+    # [F5] 波動率壓縮因子 (Volatility Squeeze)
+    # 邏輯：當布林通道寬度 (BandWidth) 處於低檔，暗示變盤在即
+    bb_std = close.rolling(20).std()
+    bb_mid = close.rolling(20).mean()
+    bb_width = (4 * bb_std) / bb_mid
+    # 用過去 60 天的寬度百分位數 (Percentile) 來判斷是否壓縮
+    # 如果 bb_width 是近 60 天最低，值會接近 0，我們希望這時候加權重(預備突破)
+    min_width = bb_width.rolling(60).min()
+    max_width = bb_width.rolling(60).max()
+    f_squeeze = 1 - ((bb_width - min_width) / (max_width - min_width)).fillna(0.5)
     
-    # 均值回歸力道 (Reversion Force)
-    reversion_force = np.maximum(0, -bias_z - 1.5) * 30
+    # ==========================================
+    # 2. 向量合成 (Vector Synthesis)
+    # ==========================================
     
-    final_score = raw_score + reversion_force
+    # 定義權重 (可根據回測結果微調)
+    w_vwap = 35.0   # 趨勢是王道
+    w_cmf = 25.0    # 資金流向確認真實性
+    w_mom = 20.0    # 動能加速提供切入點
+    w_inst = 20.0   # 籌碼提供續航力
     
-    # 平滑化輸出
-    df['Alpha_Score'] = final_score.rolling(2).mean().clip(0, 100)
+    # 原始分數合成
+    raw_score = (f_vwap_z * w_vwap) + \
+                (f_cmf * w_cmf) + \
+                (f_mom_norm * w_mom) + \
+                (f_inst * w_inst)
     
-    # ====================================================
-    # 4. 生成 Log (Fix: 使用 Numpy Array)
-    # ====================================================
+    # 加入 Squeeze 的乘數效應：
+    # 如果處於壓縮狀態 (f_squeeze 高) 且 動能向上 (raw_score > 0)，放大得分 (預期爆發)
+    # 如果處於壓縮狀態 且 動能向下，放大扣分 (預期崩跌)
+    squeeze_multiplier = 1 + (f_squeeze * 0.5) 
+    adjusted_score = raw_score * squeeze_multiplier
+
+    # ==========================================
+    # 3. 激活函數與標準化 (Activation & Normalization)
+    # ==========================================
+    
+    # 使用 Hyperbolic Tangent (tanh) 將分數非線性映射到 -100 ~ 100
+    # scale_factor 用於調整敏感度，數值越小，分數越容易接近極值
+    scale_factor = 60.0 
+    final_score = np.tanh(adjusted_score / scale_factor) * 100
+    
+    df['Alpha_Score'] = final_score.fillna(0)
+    
+    # ==========================================
+    # 4. 生成分析日誌 (Interpretation Log)
+    # ==========================================
     logs = []
     
-    # [關鍵修正] 轉為 .values (NumPy Array)
+    # 轉為 numpy array 加速迴圈
     score_val = df['Alpha_Score'].values
-    reversion_val = reversion_force.values # <--- 修正點
-    risk_val = risk_factor.values          # <--- 修正點
+    vwap_z_val = f_vwap_z.values
+    cmf_val = f_cmf.values
+    mom_val = f_mom_norm.values
+    inst_val = f_inst.values
+    squeeze_val = f_squeeze.values
     
     for i in range(len(df)):
         s = score_val[i]
+        reasons = []
         
-        # 基礎狀態
-        if s > 80: log = "🔥 強力看多"
-        elif s > 60: log = "📈 偏多操作"
-        elif s < 40: log = "📉 轉弱/偏空"
-        elif s < 20: log = "💀 極度弱勢"
-        else: log = "⚖️ 中性盤整"
+        # 狀態判斷
+        if s > 75: 
+            base_log = "🔥 極強多頭"
+            if squeeze_val[i] > 0.8: reasons.append("壓縮後爆發")
+        elif s > 40: 
+            base_log = "📈 趨勢偏多"
+        elif s < -75: 
+            base_log = "💀 崩盤/極空"
+        elif s < -40: 
+            base_log = "📉 趨勢偏空"
+        else: 
+            base_log = "⚖️ 盤整/觀望"
+            
+        # 細節歸因 (Attribution Analysis)
+        if vwap_z_val[i] > 2.0: reasons.append("成本乖離大")
+        if cmf_val[i] > 1.5: reasons.append("主力吸籌")
+        elif cmf_val[i] < -1.5: reasons.append("主力出貨")
         
-        # 特殊狀態覆蓋 (使用 numpy array 索引)
-        if reversion_val[i] > 0: 
-            log = "💎 乖離過大(醞釀反彈)"
+        if mom_val[i] > 1.0: reasons.append("動能加速")
+        elif mom_val[i] < -1.0: reasons.append("動能失速")
+            
+        if inst_val[i] > 2.0: reasons.append("法人重倉")
         
-        if risk_val[i] > 1.5 and s < 40: 
-            log = "🩸 市場恐慌(現金為王)"
-        
-        logs.append(log)
+        # 組合字串
+        detail = f" ({', '.join(reasons)})" if reasons else ""
+        logs.append(base_log + detail)
         
     df['Score_Log'] = logs
-    df['Recommended_Position'] = df['Alpha_Score']
     
-    # 輔助
-    df['Inst_Z'] = inst_z_smooth
+    # 輔助變數 (用於圖表顯示)
+    df['Score_VWAP_Z'] = f_vwap_z
+    df['Score_CMF'] = f_cmf
     
     return df
 
