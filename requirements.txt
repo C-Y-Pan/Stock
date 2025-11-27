@@ -4,5 +4,6 @@ numpy
 yfinance
 requests
 plotly
-matplotlib
+pytz
+statsmodels
 extra-streamlit-components
