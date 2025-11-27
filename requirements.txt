@@ -4,6 +4,7 @@ numpy
 yfinance
 requests
 plotly
-pytz
+finmind
 statsmodels
 extra-streamlit-components
+pytz
