@@ -632,13 +632,12 @@ def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.0014
 
 def analyze_alpha_performance(df):
     """
-    因子有效性檢驗工具：分析 Alpha Score/Slope 與未來股價漲跌的相關性
+    因子有效性檢驗工具 v2：分組勝率與報酬率分析
     """
     data = df.copy()
     
-    # 1. 建立未來回報欄位 (Label Generation)
-    # 分別計算未來 1日, 3日, 5日, 10日, 20日 的漲跌幅
-    periods = {1: '1D', 3: '3D', 5: '5D', 10: '10D', 20: '20D'}
+    # 1. 建立未來回報 (Label Generation)
+    periods = {1: '1D', 3: '3D', 5: '5D', 10: '10D'}
     for n, suffix in periods.items():
         data[f'Fwd_Ret_{suffix}'] = data['Close'].shift(-n) / data['Close'] - 1
 
@@ -646,40 +645,42 @@ def analyze_alpha_performance(df):
     if 'Alpha_Slope' not in data.columns:
         data['Alpha_Slope'] = data['Alpha_Score'].diff().fillna(0)
 
-    # 移除最後 N 天沒有未來數據的資料
+    # 移除無未來數據的資料
     valid_data = data.dropna(subset=[f'Fwd_Ret_{suffix}' for suffix in periods.values()])
     
     if valid_data.empty:
         return None, None, None
 
-    # 2. 計算 IC (Information Coefficient) - 皮爾森相關係數
-    # 衡量當下的分數與未來漲跌幅的線性相關度 (-1 ~ 1)
+    # 2. 計算 IC (維持不變)
     ic_metrics = []
     for factor in ['Alpha_Score', 'Alpha_Slope']:
         for n, suffix in periods.items():
             corr = valid_data[factor].corr(valid_data[f'Fwd_Ret_{suffix}'])
             ic_metrics.append({
-                "因子": "評分 (Score)" if factor == 'Alpha_Score' else "動能 (Slope)",
-                "預測週期": f"未來 {n} 日",
-                "IC (相關性)": corr
+                "因子": "評分" if factor == 'Alpha_Score' else "動能",
+                "週期": f"{n}日",
+                "IC": corr
             })
-    
     ic_df = pd.DataFrame(ic_metrics)
 
-    # 3. 分組績效測試 (Layered Backtest)
-    # 將 Alpha Score 分為 5 個區間 (Strong Sell 到 Strong Buy)，觀察各組的未來平均報酬
-    # 定義區間: < -60, -60~-20, -20~20, 20~60, > 60
-    bins = [-np.inf, -60, -20, 20, 60, np.inf]
-    labels = ['極弱勢 (<-60)', '弱勢 (-60~-20)', '中性震盪 (-20~20)', '強勢 (20~60)', '極強勢 (>60)']
+    # 3. [強化] 分組績效測試 (Bucketing Analysis)
+    # 我們將分數切得更細，觀察兩端極值
+    # 邏輯：<-40 (超賣), -40~0 (偏空), 0~40 (偏多), >40 (強勢)
+    bins = [-np.inf, -40, 0, 40, np.inf]
+    labels = ['空頭/超賣 (<-40)', '弱勢盤整 (-40~0)', '強勢盤整 (0~40)', '多頭/過熱 (>40)']
+    
     valid_data['Score_Bucket'] = pd.cut(valid_data['Alpha_Score'], bins=bins, labels=labels)
     
-    # 計算各組在未來 5 日的平均表現
-    bucket_perf = valid_data.groupby('Score_Bucket')[['Fwd_Ret_5D', 'Fwd_Ret_10D']].mean() * 100
-    bucket_counts = valid_data.groupby('Score_Bucket')['Close'].count()
-    
-    bucket_df = pd.concat([bucket_perf, bucket_counts.rename("樣本數")], axis=1)
+    # 計算每個分組的「平均報酬」與「勝率」
+    # 勝率定義：未來 5 日報酬 > 0 的機率
+    def win_rate_calc(x):
+        return (x > 0).mean() * 100
 
-    return ic_df, bucket_df, valid_data
+    bucket_stats = valid_data.groupby('Score_Bucket')['Fwd_Ret_5D'].agg(['mean', 'count', win_rate_calc])
+    bucket_stats.columns = ['Avg_Return', 'Samples', 'Win_Rate']
+    bucket_stats['Avg_Return'] = bucket_stats['Avg_Return'] * 100 # 轉百分比
+
+    return ic_df, bucket_stats, valid_data
 
 
 def calculate_target_hit_rate(df):
