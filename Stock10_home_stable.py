@@ -836,111 +836,159 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.1 (Hybrid Engine): 
-    結合「逆勢抄底」與「順勢趨勢」雙邏輯。
-    修正 v5.0 在強勢主升段因「過熱扣分」導致踏空的問題。
+    Alpha Score v6.0 (The Adaptive Quantum):
+    全自適應演算法。放棄固定閾值，改用滾動統計 (Rolling Statistics) 與 Z-Score 標準化。
+    能自動根據股性(波動率)、環境(VIX)、趨勢強度(ADX) 動態調整評分權重。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據
+    # 1. 基礎指標計算
     # ====================================================
+    # 確保基本數據
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
-    vix = df['VIX']
-
-    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
-    df['Vol_MA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
     
+    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
-    # 技術指標
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
+
+    # --- 自適應指標 A: ADX (趨勢強度) ---
+    # ADX 用於判斷現在是「趨勢盤」還是「盤整盤」，決定策略要順勢還是逆勢
+    # 簡單實作 DX
+    plus_dm = df['High'].diff()
+    minus_dm = df['Low'].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0) # minus_dm 取絕對值計算
     
-    # 布林通道
-    std20 = df['Close'].rolling(20).std()
-    bb_width = (4 * std20) / df['MA20'] 
+    tr = df['Close'].diff().abs() # 簡化版 TR
+    tr_sum = tr.rolling(14).sum().replace(0, 1)
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).sum() / tr_sum)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).sum() / tr_sum)
+    dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
+    df['ADX'] = dx.rolling(14).mean().fillna(20)
+
+    # --- 自適應指標 B: 相對波動率 (Z-Score) ---
+    # 計算乖離率的標準分數：(當前乖離 - 過去60天平均) / 過去60天標準差
+    # 這能讓「牛皮股」和「妖股」的乖離程度有一致的衡量標準
+    bias = (df['Close'] - df['MA20']) / df['MA20']
+    bias_mean = bias.rolling(60).mean()
+    bias_std = bias.rolling(60).std().replace(0, 0.01)
+    df['Bias_Z'] = (bias - bias_mean) / bias_std
+
+    # --- 自適應指標 C: 動態 RSI 閾值 ---
+    # 計算過去 60 天 RSI 的第 10% 和第 90% 位數
+    # 某些股票 RSI 跌到 40 就算低，某些要跌到 20，這能自動適應
+    rsi_low_dynamic = curr_rsi.rolling(60).quantile(0.10)
+    rsi_high_dynamic = curr_rsi.rolling(60).quantile(0.90)
 
     # ====================================================
-    # 2. 原始因子計算
-    # ====================================================
-    # A. 趨勢/乖離
-    score_trend = np.where(bias_60 > 0, 20, -10)
-    
-    # B. RSI 動能
-    score_rsi = np.where(curr_rsi > 75, -40, np.where(curr_rsi < 30, 40, 0))
-    
-    raw_score = score_trend + score_rsi 
-    raw_series = pd.Series(raw_score, index=df.index)
-
-    # ====================================================
-    # 3. 情境感知濾網 (Hybrid Logic)
+    # 2. 三大模組評分 (Sub-Scores)
     # ====================================================
     
-    is_downtrend = df['Close'] < df['MA60']
-    
-    # [定義] 恐慌殺盤 (逆勢買點)
-    cond_deep_value = bias_60 < -15
-    cond_panic_selling = (curr_rsi < 25) & (df['Volume'] > df['Vol_MA20'] * 1.5)
-    # 系統性恐慌 (VIX > 25) + 個股超賣
-    panic_buy_mask = (vix > 25) & (curr_rsi < 30)
-    
-    # [新增定義] 健康的多頭趨勢 (順勢買點)
-    # 1. 均線多頭排列 (Close > MA20 > MA60)
-    # 2. RSI 處於強勢區但未過熱 (50 < RSI < 75)
-    # 3. 股價沒有離季線太遠 (乖離 < 20%，避免末升段追高)
-    is_healthy_trend = (
-        (df['Close'] > df['MA20']) & 
-        (df['MA20'] > df['MA60']) & 
-        (curr_rsi > 50) & (curr_rsi < 78) & 
-        (bias_60 < 20)
-    )
+    # [模組 1] 順勢模組 (Trend Follower)
+    # 邏輯：均線多頭 + 位於布林通道中上軌 + ADX強
+    # 分數越高代表趨勢越強
+    trend_raw = 0
+    trend_raw += np.where(df['Close'] > df['MA20'], 30, -30)
+    trend_raw += np.where(df['MA20'] > df['MA60'], 20, -20)
+    trend_raw += np.where(df['ADX'] > 25, 20, 0) # 趨勢明確加分
+    trend_score = pd.Series(trend_raw, index=df.index).clip(-50, 80)
 
-    # --- 評分邏輯層級 ---
-    
-    final_score = raw_series.copy()
-    
-    # Level 1: 基礎均值回歸 (正常回檔)
-    cond_sweet_spot = (raw_series > -40) & (raw_series <= 10)
-    final_score = np.where(cond_sweet_spot & (~is_downtrend), raw_series + 60, final_score)
+    # [模組 2] 逆勢模組 (Mean Reversion)
+    # 邏輯：跌破動態 RSI 低點 + 負乖離過大 (Z-Score < -2)
+    reversion_raw = 0
+    # 使用動態閾值：比自己過去 90% 的時間都低
+    reversion_raw += np.where(curr_rsi < rsi_low_dynamic, 40, 0) 
+    # 乖離率達到 2 倍標準差以上 (統計學上的極端值)
+    reversion_raw += np.where(df['Bias_Z'] < -2.0, 40, 0)
+    # 恐慌爆量
+    vol_spike = df['Volume'] > df['Vol_MA20'] * 1.5
+    reversion_raw += np.where(vol_spike & (df['Bias_Z'] < -1.5), 20, 0)
+    reversion_score = pd.Series(reversion_raw, index=df.index).clip(0, 100)
 
-    # Level 2: [核心修正] 順勢動能加分
-    # 如果符合健康多頭趨勢，強制將分數拉升至「買進區 (70分)」
-    # 這會讓圖表左側的主升段出現連續的紅柱
-    final_score = np.where(is_healthy_trend, np.maximum(final_score, 70), final_score)
-
-    # Level 3: 過熱調節 (Overheat Correction)
-    # 只有當「不符合健康趨勢」且「原始分過高」時，才執行扣分
-    # 意即：RSI > 78 或 乖離過大時，才會被視為過熱
-    cond_real_overheat = (raw_series > 40) & (~is_healthy_trend)
-    final_score = np.where(cond_real_overheat, raw_series - 60, final_score)
-
-    # Level 4: 恐慌黃金坑 (最高優先級)
-    is_golden_pit = (cond_deep_value & cond_panic_selling) | panic_buy_mask
-    final_score = np.where(is_golden_pit, 95, final_score)
-    
-    # Level 5: 個股利空陷阱 (Idiosyncratic Risk)
-    bad_stock_mask = (vix < 20) & is_downtrend & (bias_60 < -10)
-    final_score = np.where(bad_stock_mask, -50, final_score)
+    # [模組 3] 過熱模組 (Overheat)
+    # 邏輯：RSI 突破動態高點 + 正乖離過大
+    overheat_raw = 0
+    overheat_raw += np.where(curr_rsi > rsi_high_dynamic, 50, 0)
+    overheat_raw += np.where(df['Bias_Z'] > 2.0, 50, 0)
+    overheat_score = pd.Series(overheat_raw, index=df.index)
 
     # ====================================================
-    # 4. 輸出
+    # 3. 動態權重分配 (The Adaptive Brain)
+    # ====================================================
+    # 這是這個策略最「活」的地方：根據環境決定聽誰的
+    
+    final_score = np.zeros(len(df))
+    score_logs = []
+
+    # 轉 numpy 加速迭代
+    adx_arr = df['ADX'].values
+    vix_arr = df['VIX'].values
+    trend_s = trend_score.values
+    rev_s = reversion_score.values
+    over_s = overheat_score.values
+    
+    for i in range(len(df)):
+        current_adx = adx_arr[i]
+        current_vix = vix_arr[i]
+        
+        # --- 情境 A: 系統性恐慌 (Panic Regime) ---
+        if current_vix > 25:
+            # 此时「順勢」失效，完全依賴「逆勢抄底」
+            # 權重：100% 逆勢
+            base = rev_s[i] * 1.2 # 恐慌時逆勢訊號加權
+            log = "💎 恐慌模組"
+            
+        # --- 情境 B: 強力趨勢盤 (Trend Regime) ---
+        elif current_adx > 25:
+            # 趨勢明確，順勢為主，逆勢為輔（只抓深回檔）
+            # 權重：70% 順勢 + 30% 逆勢
+            base = (trend_s[i] * 0.7) + (rev_s[i] * 0.3)
+            
+            # 在強趨勢中，對於過熱要比較寬容 (不要太早賣)
+            if over_s[i] > 0: 
+                base -= (over_s[i] * 0.5) # 扣分打折
+            
+            log = "🚀 順勢模組"
+
+        # --- 情境 C: 盤整/無趨勢 (Choppy Regime) ---
+        else: # ADX < 25
+            # 沒趨勢，只能做區間震盪 (高出低進)
+            # 權重：20% 順勢 + 80% 逆勢
+            base = (trend_s[i] * 0.2) + (rev_s[i] * 0.8)
+            
+            # 盤整盤對過熱要非常敏感 (一熱就賣)
+            base -= over_s[i]
+            
+            log = "🌊 擺盪模組"
+            
+        final_score[i] = base
+        score_logs.append(log)
+
+    # ====================================================
+    # 4. 輸出與平滑
     # ====================================================
     final_series = pd.Series(final_score, index=df.index)
     
-    # 平滑化
+    # 最終微調：確保分數分佈合理
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
     
-    # 狀態標籤
-    df['Score_Log'] = np.where(is_golden_pit, "💎 恐慌抄底",
-                      np.where(is_healthy_trend, "🚀 順勢動能",
-                      np.where(df['Alpha_Score'] > 60, "回檔佈局", 
-                      np.where(bad_stock_mask, "⚠️ 避開", "盤整"))))
-    
+    # 根據分數修正 Log
+    df['Score_Log'] = score_logs
+    # 若分數極高，強制標記為強力訊號
+    df['Score_Log'] = np.where(df['Alpha_Score'] > 80, df['Score_Log'] + "(極強)", 
+                      np.where(df['Alpha_Score'] < -50, "避開/弱勢", df['Score_Log']))
+
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
+    
+    # 輔助欄位 (給圖表用)
+    df['Dynamic_RSI_Low'] = rsi_low_dynamic
+    df['Dynamic_RSI_High'] = rsi_high_dynamic
+    df['Bias_Z'] = df['Bias_Z']
 
     return df
 
