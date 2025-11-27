@@ -437,9 +437,12 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v10.1 (Bug Fix):
-    補回遺漏的 'Cum_Market' 計算，修復繪圖時的 KeyError。
-    邏輯核心維持 v10.0 (破底即走 + 黃金坑戰術)。
+    策略引擎 v10.2 (The Diamond Hands):
+    針對「洗盤賣飛」進行最終修復。
+    
+    [核心進化] 波動率寬容與時間保護
+    1. 防守線加寬：從最低價的 99% 放寬到 96% (給予 4% 洗盤空間)。
+    2. 三天豁免期：進場前 3 天，無視技術面破底訊號 (給予築底時間)，只看硬停損。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -451,11 +454,12 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     entry_price = 0.0
     highest_price = 0.0 
     
-    # 防守價位 (進場當日最低點)
+    # 防守價位
     signal_low_price = 0.0
     
     cooldown_counter = 0 
     is_golden_pit_trade = False
+    days_in_trade = 0 # 持倉天數計數器
     
     # 轉 numpy 加速
     close = df['Close'].values
@@ -488,14 +492,15 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
                 signal = 1
                 entry_price = curr_price
                 highest_price = curr_price
+                days_in_trade = 0 # 重置天數
                 action_code = "Buy"
                 reason_str = score_logs[i]
                 this_confidence = int(curr_score)
                 
-                # 設定戰術與防守點
                 if curr_score >= 80:
                     is_golden_pit_trade = True
-                    signal_low_price = curr_low * 0.99 
+                    # [修正 1] 加寬防守緩衝：給予 4% 的假跌破空間
+                    signal_low_price = curr_low * 0.96 
                 else:
                     is_golden_pit_trade = False
                     signal_low_price = 0.0 
@@ -504,6 +509,7 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
 
         # --- 出場邏輯 ---
         elif position == 1:
+            days_in_trade += 1
             if curr_price > highest_price: highest_price = curr_price
             
             dd_from_peak = (curr_price - highest_price) / highest_price
@@ -513,18 +519,27 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
             
             # --- 戰術 A: 黃金坑抄底 ---
             if is_golden_pit_trade:
-                # 階段 1: 還在季線下
+                # 階段 1: 還在季線下 (逆勢階段)
                 if curr_price < curr_ma60:
-                    # [核心修正] 破底即走
-                    if curr_price < signal_low_price:
-                        is_sell = True
-                        reason_str = "破底翻失敗(快逃)"
-                    elif pnl_pct < -0.15:
+                    
+                    # [修正 2] 雙重防護網
+                    # A. 災難停損 (絕對底線)：-15% (不管幾天，跌爛了就跑)
+                    if pnl_pct < -0.15:
                         is_sell = True
                         reason_str = "災難停損"
+                    
+                    # B. 破底停損 (有條件)：
+                    # 只有在「持有超過 3 天」後，才開始檢查是否破底
+                    # 前 3 天視為「洗盤豁免期」，給它震盪
+                    elif days_in_trade > 3 and curr_price < signal_low_price:
+                        is_sell = True
+                        reason_str = "破底確認(遲到)"
+                    
                     else:
+                        # 沒破底，或者還在豁免期內 -> 死抱
                         is_sell = False
-                        reason_str = "築底防守中"
+                        reason_str = f"築底防守 ({days_in_trade}d)"
+                
                 # 階段 2: 站上季線 -> 轉為波段
                 else:
                     is_golden_pit_trade = False 
@@ -553,11 +568,10 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
                 action_code = "Sell"
                 sign = "+" if pnl_pct > 0 else ""
                 ret_label = f"{sign}{pnl_pct*100:.1f}%"
-                cooldown_counter = 3 
+                cooldown_counter = 3
             
             this_confidence = 0
 
-        # 更新列表
         position = signal
         positions.append(signal)
         reasons.append(reason_str)
@@ -580,10 +594,7 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
     
     df['Strategy_Return'] = (df['Real_Position'] * df['Market_Return']) - cost_series
-    
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
-    
-    # [Fix] 補回這行，修復 KeyError
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
