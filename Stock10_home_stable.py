@@ -863,10 +863,14 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v9.2 (Adaptive Panic Ladder):
-    針對「高 VIX 卻沒買」的問題進行修復。
-    引入「動態恐慌階梯」：
-    VIX 越高，對個股 RSI 的超賣標準越寬鬆，避免因為差 1-2 分的 RSI 而錯過世紀大底。
+    Alpha Score v11.0 (The Coil Breakout):
+    針對「錯過起漲點」進行最終修復。
+    
+    [核心進化] 壓縮突破機制
+    修正了「均線糾結濾網」過於嚴格的問題。
+    現在，當均線糾結 (Gap < 2.5%) 時，系統會檢查動能：
+    若股價強勢站上季線且 RSI 轉強 (>55)，視為「壓縮突破 (Coil Breakout)」，立即給予買入評分，
+    不再等到均線發散才追價。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -899,49 +903,53 @@ def calculate_alpha_score(df, margin_df, short_df):
     curr_rsi = df['RSI'].fillna(50)
     
     ma60_slope = df['MA60'].diff(5).fillna(0)
+    # 均線距離 (壓縮度)
     ma_gap = (abs(df['MA20'] - df['MA60']) / df['MA60']) * 100
 
     # ====================================================
-    # 2. 狀態定義 (動態階梯)
+    # 2. 狀態定義
     # ====================================================
     
-    # A. 空頭趨勢
-    is_hard_downtrend = (df['Close'] < df['MA60']) & (ma60_slope < 0)
-
-    # B. [核心修正] 動態恐慌階梯 (Panic Ladder)
+    # A. 狀態變數
     vix = df['VIX']
     
-    # Level 1: 末日級恐慌 (VIX > 40) -> 閉眼買 (RSI < 45 即可)
+    # B. 恐慌黃金坑 (動態階梯)
     panic_lvl_1 = (vix > 40) & (curr_rsi < 45)
-    
-    # Level 2: 嚴重恐慌 (VIX > 30) -> 寬鬆買 (RSI < 35)
     panic_lvl_2 = (vix > 30) & (curr_rsi < 35)
-    
-    # Level 3: 一般恐慌 (VIX > 25) -> 標準買 (RSI < 25)
     panic_lvl_3 = (vix > 25) & (curr_rsi < 25)
-    
-    # 只要符合任一階梯，視為系統性買點
     systemic_panic = panic_lvl_1 | panic_lvl_2 | panic_lvl_3
-
-    # 個股恐慌 (爆量趕底) - 這裡維持原樣
+    
+    is_hard_downtrend = (df['Close'] < df['MA60']) & (ma60_slope < 0)
     vol_spike = df['Volume'] > df['Vol_MA20'] * 1.8 
     capitulation = is_hard_downtrend & vol_spike & (curr_rsi < 25)
     
     is_golden_pit = systemic_panic | capitulation
     
-    # C. 死魚盤
-    is_choppy = (ma_gap < 2.0) & (df['ADX'] < 25)
+    # C. [核心修正] 壓縮與突破 (Squeeze & Breakout)
+    # 定義壓縮：月線與季線距離 < 2.5% (黏在一起)
+    is_squeeze = ma_gap < 2.5
     
-    # D. 強力噴出
-    is_super_trend = (
-        (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.0) & (df['ADX'] > 25) & (ma60_slope > 0)
+    # 定義壓縮突破：雖然壓縮，但股價強勢站上兩條均線，且動能轉強
+    is_coil_breakout = (
+        is_squeeze & 
+        (df['Close'] > df['MA60']) & 
+        (df['Close'] > df['MA20']) & 
+        (curr_rsi > 55) # 動能確認
     )
     
-    # E. 初升段
+    # 定義死魚盤：壓縮且無動能
+    is_dead_fish = is_squeeze & (~is_coil_breakout)
+    
+    # D. 強力噴出 (趨勢拉開)
+    is_super_trend = (
+        (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & 
+        (ma_gap >= 2.5) & (df['ADX'] > 25) & (ma60_slope > 0)
+    )
+    
+    # E. 初升段 (趨勢拉開)
     is_early_trend = (
         (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.0) & (ma60_slope > 0)
+        (ma_gap >= 2.5) & (ma60_slope > 0)
     )
 
     # ====================================================
@@ -954,7 +962,8 @@ def calculate_alpha_score(df, margin_df, short_df):
     rsi_arr = curr_rsi.values
     downtrend_arr = is_hard_downtrend.values
     golden_arr = is_golden_pit.values
-    choppy_arr = is_choppy.values
+    breakout_arr = is_coil_breakout.values
+    dead_arr = is_dead_fish.values
     super_arr = is_super_trend.values
     early_arr = is_early_trend.values
     
@@ -971,30 +980,33 @@ def calculate_alpha_score(df, margin_df, short_df):
         elif downtrend_arr[i]:
             score = -50 
             log = "📉 空頭速跌"
-            # 空頭中的反彈，如果 VIX 很高但還沒到恐慌買點，可以給一點分數但不追高
-            if rsi_arr[i] < 15: 
-                score = 50
-                log = "搶極短反彈"
+            if rsi_arr[i] < 15: score = 50; log = "搶極短反彈"
                 
-        # 3. 死魚盤 (0分)
-        elif choppy_arr[i]:
+        # 3. [關鍵] 壓縮突破 (75分)
+        # 在均線發散之前，搶先買進
+        elif breakout_arr[i]:
+            score = 75
+            log = "🔥 壓縮突破"
+            
+        # 4. 死魚盤 (0分)
+        # 只有沒突破的壓縮，才視為死魚
+        elif dead_arr[i]:
             score = 0
             log = "💤 均線糾結"
             
-        # 4. 強力噴出 (85分)
+        # 5. 強力噴出 (85分)
         elif super_arr[i]:
             score = 85
             log = "🚀 強勢噴出"
-            if rsi_arr[i] > 85: 
-                score = 70; log = "⚠️ 過熱警戒"
+            if rsi_arr[i] > 85: score = 70; log = "⚠️ 過熱警戒"
                 
-        # 5. 初升段 (65~75分)
+        # 6. 初升段 (65~75分)
         elif early_arr[i]:
             score = 65
             log = "📈 趨勢發散"
             if rsi_arr[i] < 70: score += 10
         
-        # 6. 盤整
+        # 7. 盤整
         else:
             if rsi_arr[i] < 40: score = 50; log = "弱勢盤整"
             else: score = 0; log = "觀望"
@@ -1002,9 +1014,7 @@ def calculate_alpha_score(df, margin_df, short_df):
         final_score[i] = score
         logs.append(log)
 
-    # ====================================================
-    # 4. 輸出優化 (峰值保留)
-    # ====================================================
+    # 輸出 (峰值保留)
     raw_series = pd.Series(final_score, index=df.index)
     smooth_series = raw_series.rolling(3, min_periods=1).mean()
     df['Alpha_Score'] = np.maximum(raw_series, smooth_series).clip(-100, 100)
@@ -1012,7 +1022,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
     return df
-
 # ==========================================
 # 6. 主儀表板繪製 (Updated)
 # ==========================================
