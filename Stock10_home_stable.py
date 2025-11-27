@@ -437,31 +437,26 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v6.0 (Alpha-Driven):
-    完全由 Alpha Score 驅動交易決策。
-    特色：針對高分進場(>80)實施「鎖倉保護」，解決「抄底後被小震盪洗出場」的問題。
+    策略引擎 v7.0 (Trailing Stop Edition):
+    解決「賣飛」問題。
+    1. 買進：依據 Alpha Score (>60)。
+    2. 賣出：不再單純依賴 Score 下降，而是使用「移動停損 (Trailing Stop)」。
+       只要價格沒有跌破「最高價回檔 X%」，就死抱不放。
     """
     df = data.copy()
-    
-    # 確保有 Alpha_Score (防呆)
-    if 'Alpha_Score' not in df.columns:
-        # 如果沒有，回傳空值或報錯，但在這個架構下應確保傳入前已計算
-        return df
+    if 'Alpha_Score' not in df.columns: return df
         
     positions = []; reasons = []; actions = []; return_labels = []
     confidences = [] 
     
     position = 0
-    days_held = 0
     entry_price = 0.0
-    entry_score = 0.0  # 記錄進場當下的分數
+    highest_price = 0.0 # 紀錄持倉期間最高價
     
-    # 轉 numpy 加速
+    # 轉 numpy
     close = df['Close'].values
-    high = df['High'].values
-    low = df['Low'].values
     scores = df['Alpha_Score'].values
-    trends = df['Trend'].values if 'Trend' in df.columns else np.zeros(len(df))
+    ma60 = df['MA60'].values
     
     for i in range(len(df)):
         signal = position
@@ -469,76 +464,61 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
         action_code = "Hold" if position == 1 else "Wait"
         ret_label = ""
         curr_score = scores[i]
+        curr_price = close[i]
         
         # --- 進場邏輯 ---
         if position == 0:
-            # 條件：分數大於門檻
+            # 門檻設為 60 (包含 強勢噴出80 和 區間低檔60)
             if curr_score >= buy_threshold:
                 signal = 1
-                entry_price = close[i]
-                entry_score = curr_score
+                entry_price = curr_price
+                highest_price = curr_price # 初始化最高價
                 action_code = "Buy"
-                
-                if entry_score >= 80:
-                    reason_str = "黃金坑/強力抄底"
-                else:
-                    reason_str = "趨勢轉強/回檔"
-                
-                confidences.append(int(curr_score)) # 記錄信心
+                reason_str = df['Score_Log'].iloc[i]
+                confidences.append(int(curr_score))
             else:
                 confidences.append(0)
 
         # --- 出場邏輯 ---
         elif position == 1:
-            days_held += 1
-            curr_price = close[i]
-            drawdown = (curr_price - entry_price) / entry_price
+            # 更新最高價
+            if curr_price > highest_price:
+                highest_price = curr_price
+            
+            # 計算回檔幅度 (Drawdown from Peak)
+            dd_from_peak = (curr_price - highest_price) / highest_price
+            pnl_pct = (curr_price - entry_price) / entry_price
             
             is_sell = False
             
-            # [關鍵機制] 黃金坑保護令 (Golden Pit Protection)
-            # 如果進場時分數很高(>80)，代表是逆勢接刀，通常需要時間築底。
-            # 給予 8 天的寬限期 (Lock-up)，期間忽略趨勢轉弱訊號，只看硬停損。
-            is_protected = (entry_score >= 80) and (days_held <= 8)
+            # [核心修正] 移動停損機制 (Dynamic Trailing Stop)
             
-            # 1. 硬性停損 (Hard Stop) - 永遠生效
-            # 逆勢單停損放寬到 12%，順勢單 8%
-            stop_limit = -0.12 if entry_score >= 80 else -0.08
-            
-            if drawdown < stop_limit:
+            # 1. 停利保護：如果已經大賺 (>20%)，回檔 10% 就走 (保住獲利)
+            if pnl_pct > 0.20 and dd_from_peak < -0.10:
                 is_sell = True
-                reason_str = "觸發硬停損"
+                reason_str = "移動停利 (高檔回落)"
+                
+            # 2. 趨勢破壞：跌破季線 (MA60) 且分數轉弱
+            elif curr_price < ma60[i] and curr_score < 40:
+                is_sell = True
+                reason_str = "跌破季線"
+                
+            # 3. 硬性停損：虧損超過 10%
+            elif pnl_pct < -0.10:
+                is_sell = True
+                reason_str = "停損 (-10%)"
             
-            # 2. 條件出場 (Condition Exit)
-            elif not is_protected:
-                # 狀況 A: 評分轉弱 (變成負分)
-                if curr_score < -20:
-                    is_sell = True
-                    reason_str = "評分轉空"
-                
-                # 狀況 B: 趨勢破線 (且分數也不夠高了)
-                elif trends[i] == -1 and curr_score < 50:
-                    is_sell = True
-                    reason_str = "趨勢轉弱"
-                
-                # 狀況 C: 獲利回吐保護 (Trailing Stop)
-                # 如果曾經獲利 > 10%，回檔 5% 就走
-                elif (high[i] - entry_price)/entry_price > 0.10 and drawdown < 0.05:
-                     is_sell = True
-                     reason_str = "獲利回吐調節"
+            # 4. 評分極度轉空：分數 < -20 (這代表型態真的爛掉了)
+            # 注意：我們不再因為分數 < 50 就賣，必須爛到 -20 才賣
+            elif curr_score < -20:
+                is_sell = True
+                reason_str = "評分轉空"
 
-            else:
-                # 在保護期內
-                action_code = "Hold"
-                reason_str = f"鎖倉築底 ({days_held}/8)"
-            
             if is_sell:
                 signal = 0
                 action_code = "Sell"
-                pnl = (curr_price - entry_price) / entry_price * 100
-                sign = "+" if pnl > 0 else ""
-                ret_label = f"{sign}{pnl:.1f}%"
-                days_held = 0 # 重置
+                sign = "+" if pnl_pct > 0 else ""
+                ret_label = f"{sign}{pnl_pct*100:.1f}%"
             
             confidences.append(0)
 
@@ -554,14 +534,11 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
 
-    # === 計算績效 ===
+    # 計算績效
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
-    
-    # 策略毛利
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     
-    # 扣除成本
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
@@ -836,160 +813,137 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.0 (The Adaptive Quantum):
-    全自適應演算法。放棄固定閾值，改用滾動統計 (Rolling Statistics) 與 Z-Score 標準化。
-    能自動根據股性(波動率)、環境(VIX)、趨勢強度(ADX) 動態調整評分權重。
+    Alpha Score v7.0 (Trend Unchained):
+    趨勢解鎖版。
+    引入 ADX 指標：當趨勢形成時 (ADX>25)，解除所有「過熱扣分」，允許分數飆高以捕捉主升段。
+    只在盤整時才使用均值回歸邏輯。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎指標計算
+    # 1. 基礎數據
     # ====================================================
-    # 確保基本數據
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
     
     if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
+    df['Vol_MA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
+    
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
-    curr_rsi = df['RSI'].fillna(50)
-
-    # --- 自適應指標 A: ADX (趨勢強度) ---
-    # ADX 用於判斷現在是「趨勢盤」還是「盤整盤」，決定策略要順勢還是逆勢
-    # 簡單實作 DX
-    plus_dm = df['High'].diff()
-    minus_dm = df['Low'].diff()
+    # 計算 ADX (趨勢強度關鍵)
+    # ------------------------------------------------
+    high = df['High']; low = df['Low']; close = df['Close']
+    plus_dm = high.diff()
+    minus_dm = low.diff()
     plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0) # minus_dm 取絕對值計算
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
     
-    tr = df['Close'].diff().abs() # 簡化版 TR
-    tr_sum = tr.rolling(14).sum().replace(0, 1)
-    plus_di = 100 * (pd.Series(plus_dm).rolling(14).sum() / tr_sum)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(14).sum() / tr_sum)
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
     dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
-    df['ADX'] = dx.rolling(14).mean().fillna(20)
+    # ADX: 數值越大，代表趨勢越強 (不分多空)
+    df['ADX'] = dx.rolling(14).mean().fillna(0)
+    # ------------------------------------------------
 
-    # --- 自適應指標 B: 相對波動率 (Z-Score) ---
-    # 計算乖離率的標準分數：(當前乖離 - 過去60天平均) / 過去60天標準差
-    # 這能讓「牛皮股」和「妖股」的乖離程度有一致的衡量標準
-    bias = (df['Close'] - df['MA20']) / df['MA20']
-    bias_mean = bias.rolling(60).mean()
-    bias_std = bias.rolling(60).std().replace(0, 0.01)
-    df['Bias_Z'] = (bias - bias_mean) / bias_std
-
-    # --- 自適應指標 C: 動態 RSI 閾值 ---
-    # 計算過去 60 天 RSI 的第 10% 和第 90% 位數
-    # 某些股票 RSI 跌到 40 就算低，某些要跌到 20，這能自動適應
-    rsi_low_dynamic = curr_rsi.rolling(60).quantile(0.10)
-    rsi_high_dynamic = curr_rsi.rolling(60).quantile(0.90)
-
+    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
+    curr_rsi = df['RSI'].fillna(50)
+    
     # ====================================================
-    # 2. 三大模組評分 (Sub-Scores)
+    # 2. 狀態定義 (Regime Definition)
     # ====================================================
     
-    # [模組 1] 順勢模組 (Trend Follower)
-    # 邏輯：均線多頭 + 位於布林通道中上軌 + ADX強
-    # 分數越高代表趨勢越強
-    trend_raw = 0
-    trend_raw += np.where(df['Close'] > df['MA20'], 30, -30)
-    trend_raw += np.where(df['MA20'] > df['MA60'], 20, -20)
-    trend_raw += np.where(df['ADX'] > 25, 20, 0) # 趨勢明確加分
-    trend_score = pd.Series(trend_raw, index=df.index).clip(-50, 80)
-
-    # [模組 2] 逆勢模組 (Mean Reversion)
-    # 邏輯：跌破動態 RSI 低點 + 負乖離過大 (Z-Score < -2)
-    reversion_raw = 0
-    # 使用動態閾值：比自己過去 90% 的時間都低
-    reversion_raw += np.where(curr_rsi < rsi_low_dynamic, 40, 0) 
-    # 乖離率達到 2 倍標準差以上 (統計學上的極端值)
-    reversion_raw += np.where(df['Bias_Z'] < -2.0, 40, 0)
-    # 恐慌爆量
-    vol_spike = df['Volume'] > df['Vol_MA20'] * 1.5
-    reversion_raw += np.where(vol_spike & (df['Bias_Z'] < -1.5), 20, 0)
-    reversion_score = pd.Series(reversion_raw, index=df.index).clip(0, 100)
-
-    # [模組 3] 過熱模組 (Overheat)
-    # 邏輯：RSI 突破動態高點 + 正乖離過大
-    overheat_raw = 0
-    overheat_raw += np.where(curr_rsi > rsi_high_dynamic, 50, 0)
-    overheat_raw += np.where(df['Bias_Z'] > 2.0, 50, 0)
-    overheat_score = pd.Series(overheat_raw, index=df.index)
-
-    # ====================================================
-    # 3. 動態權重分配 (The Adaptive Brain)
-    # ====================================================
-    # 這是這個策略最「活」的地方：根據環境決定聽誰的
+    # A. 強力多頭 (Super Trend)
+    # 條件：均線多頭排列 + ADX > 25 (趨勢噴出中)
+    # 在這種狀態下，任何回檔都是買點，且絕不猜頭
+    is_super_trend = (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & (df['ADX'] > 25)
     
+    # B. 恐慌殺盤 (Panic)
+    # 條件：VIX高 + RSI低 (維持原本邏輯，抓黃金坑)
+    is_panic = (df['VIX'] > 25) & (curr_rsi < 30)
+    
+    # C. 空頭/弱勢
+    is_downtrend = (df['Close'] < df['MA60']) & (~is_panic)
+
+    # ====================================================
+    # 3. 評分邏輯 (Logic Hierarchy)
+    # ====================================================
     final_score = np.zeros(len(df))
-    score_logs = []
-
-    # 轉 numpy 加速迭代
-    adx_arr = df['ADX'].values
-    vix_arr = df['VIX'].values
-    trend_s = trend_score.values
-    rev_s = reversion_score.values
-    over_s = overheat_score.values
+    logs = []
+    
+    # 轉 Numpy 加速
+    rsi_arr = curr_rsi.values
+    bias_arr = bias_60.values
+    super_trend_arr = is_super_trend.values
+    panic_arr = is_panic.values
+    down_arr = is_downtrend.values
+    vol_arr = df['Volume'].values
+    vol_ma_arr = df['Vol_MA20'].values
     
     for i in range(len(df)):
-        current_adx = adx_arr[i]
-        current_vix = vix_arr[i]
+        score = 0
+        log = "盤整"
         
-        # --- 情境 A: 系統性恐慌 (Panic Regime) ---
-        if current_vix > 25:
-            # 此时「順勢」失效，完全依賴「逆勢抄底」
-            # 權重：100% 逆勢
-            base = rev_s[i] * 1.2 # 恐慌時逆勢訊號加權
-            log = "💎 恐慌模組"
+        # --- 情境 1: 黃金坑 (最高優先) ---
+        if panic_arr[i] or (bias_arr[i] < -15 and rsi_arr[i] < 25):
+            score = 95
+            log = "💎 恐慌黃金坑"
             
-        # --- 情境 B: 強力趨勢盤 (Trend Regime) ---
-        elif current_adx > 25:
-            # 趨勢明確，順勢為主，逆勢為輔（只抓深回檔）
-            # 權重：70% 順勢 + 30% 逆勢
-            base = (trend_s[i] * 0.7) + (rev_s[i] * 0.3)
+        # --- 情境 2: 強力多頭 (主升段) ---
+        elif super_trend_arr[i]:
+            # 只要是強勢趨勢，基礎分就是 80
+            score = 80
+            log = "🚀 強勢噴出"
             
-            # 在強趨勢中，對於過熱要比較寬容 (不要太早賣)
-            if over_s[i] > 0: 
-                base -= (over_s[i] * 0.5) # 扣分打折
+            # 順勢加分：量增價漲
+            if vol_arr[i] > vol_ma_arr[i]:
+                score += 10
             
-            log = "🚀 順勢模組"
-
-        # --- 情境 C: 盤整/無趨勢 (Choppy Regime) ---
-        else: # ADX < 25
-            # 沒趨勢，只能做區間震盪 (高出低進)
-            # 權重：20% 順勢 + 80% 逆勢
-            base = (trend_s[i] * 0.2) + (rev_s[i] * 0.8)
-            
-            # 盤整盤對過熱要非常敏感 (一熱就賣)
-            base -= over_s[i]
-            
-            log = "🌊 擺盪模組"
-            
-        final_score[i] = base
-        score_logs.append(log)
+            # [關鍵] 在此模式下，完全忽略 RSI 過熱和乖離過大
+            # 只有當 RSI 真的極度誇張 (>85) 才微幅警告，但不扣成負分
+            if rsi_arr[i] > 85:
+                score = 60 # 降至持有，但不賣出
+                log = "⚠️ 過熱警戒"
+                
+        # --- 情境 3: 空頭/弱勢 ---
+        elif down_arr[i]:
+            score = -40
+            log = "空頭抵抗"
+            # 只有極短線反彈才給分
+            if rsi_arr[i] < 20:
+                score = 50
+                log = "搶反彈"
+                
+        # --- 情境 4: 盤整 (無趨勢) ---
+        else:
+            # 使用原本的均值回歸邏輯
+            # 低買
+            if rsi_arr[i] < 40 or bias_arr[i] < -5:
+                score = 60
+                log = "區間低檔"
+            # 高賣
+            elif rsi_arr[i] > 70 or bias_arr[i] > 10:
+                score = -20
+                log = "區間高檔"
+            else:
+                score = 0
+                log = "觀望"
+        
+        final_score[i] = score
+        logs.append(log)
 
     # ====================================================
-    # 4. 輸出與平滑
+    # 4. 輸出
     # ====================================================
     final_series = pd.Series(final_score, index=df.index)
-    
-    # 最終微調：確保分數分佈合理
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
-    
-    # 根據分數修正 Log
-    df['Score_Log'] = score_logs
-    # 若分數極高，強制標記為強力訊號
-    df['Score_Log'] = np.where(df['Alpha_Score'] > 80, df['Score_Log'] + "(極強)", 
-                      np.where(df['Alpha_Score'] < -50, "避開/弱勢", df['Score_Log']))
-
+    df['Score_Log'] = logs
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
-    # 輔助欄位 (給圖表用)
-    df['Dynamic_RSI_Low'] = rsi_low_dynamic
-    df['Dynamic_RSI_High'] = rsi_high_dynamic
-    df['Bias_Z'] = df['Bias_Z']
-
     return df
 
 # ==========================================
