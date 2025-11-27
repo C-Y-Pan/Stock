@@ -497,18 +497,25 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v10.2 (The Diamond Hands):
-    針對「洗盤賣飛」進行最終修復。
+    策略引擎 v11.0 (Chandelier Exit):
+    解決「抱過一座山」的問題。
     
-    [核心進化] 波動率寬容與時間保護
-    1. 防守線加寬：從最低價的 99% 放寬到 96% (給予 4% 洗盤空間)。
-    2. 三天豁免期：進場前 3 天，無視技術面破底訊號 (給予築底時間)，只看硬停損。
+    [核心進化] ATR 吊燈停利
+    不再使用固定的 10% 或 20% 回檔。
+    出場線 = 持倉期間最高價 - (3 * ATR)。
+    這能動態適應股價波動，在頭部形成時更早離場。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
         
+    # 計算 ATR (用於出場)
+    high = df['High']; low = df['Low']; close = df['Close']
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().fillna(0)
+    atr_val = atr.values
+
     positions = []; reasons = []; actions = []; return_labels = []
     confidences = [] 
     
@@ -516,18 +523,17 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     entry_price = 0.0
     highest_price = 0.0 
     
-    # 防守價位
-    signal_low_price = 0.0
+    # 吊燈停利線
+    chandelier_stop = 0.0
     
+    signal_low_price = 0.0
     cooldown_counter = 0 
     is_golden_pit_trade = False
-    days_in_trade = 0 # 持倉天數計數器
     
-    # 轉 numpy 加速
-    close = df['Close'].values
-    low = df['Low'].values 
+    close_val = df['Close'].values
+    low_val = df['Low'].values
     scores = df['Alpha_Score'].values
-    ma60 = df['MA60'].values if 'MA60' in df.columns else close 
+    ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
     score_logs = df['Score_Log'].values if 'Score_Log' in df.columns else [""] * len(df)
 
     for i in range(len(df)):
@@ -536,94 +542,82 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
         action_code = "Hold" if position == 1 else "Wait"
         ret_label = ""
         curr_score = scores[i]
-        curr_price = close[i]
-        curr_low = low[i]
+        curr_price = close_val[i]
+        curr_low = low_val[i]
         curr_ma60 = ma60[i]
+        curr_atr = atr_val[i]
         
         this_confidence = 0
         
         # --- 冷卻期 ---
         if cooldown_counter > 0:
             cooldown_counter -= 1
-            action_code = "Wait" 
+            action_code = "Wait"
             reason_str = f"冷卻中 ({cooldown_counter})"
         
-        # --- 進場邏輯 ---
+        # --- 進場 ---
         elif position == 0:
             if curr_score >= buy_threshold:
                 signal = 1
                 entry_price = curr_price
                 highest_price = curr_price
-                days_in_trade = 0 # 重置天數
+                # 初始化吊燈停損點
+                chandelier_stop = curr_price - (3 * curr_atr)
+                
                 action_code = "Buy"
                 reason_str = score_logs[i]
                 this_confidence = int(curr_score)
                 
-                if curr_score >= 80:
+                if curr_score >= 80: # 黃金坑定義
                     is_golden_pit_trade = True
-                    # [修正 1] 加寬防守緩衝：給予 4% 的假跌破空間
-                    signal_low_price = curr_low * 0.96 
+                    signal_low_price = curr_low * 0.96
                 else:
                     is_golden_pit_trade = False
-                    signal_low_price = 0.0 
             else:
                 this_confidence = 0
 
-        # --- 出場邏輯 ---
+        # --- 出場 ---
         elif position == 1:
-            days_in_trade += 1
-            if curr_price > highest_price: highest_price = curr_price
+            # 更新最高價
+            if curr_price > highest_price:
+                highest_price = curr_price
             
-            dd_from_peak = (curr_price - highest_price) / highest_price
+            # [核心] 更新吊燈停損點 (只能上移，不能下移)
+            new_stop = highest_price - (3 * curr_atr)
+            if new_stop > chandelier_stop:
+                chandelier_stop = new_stop
+            
             pnl_pct = (curr_price - entry_price) / entry_price
-            
             is_sell = False
             
-            # --- 戰術 A: 黃金坑抄底 ---
+            # --- 戰術 A: 黃金坑特殊處理 (未過季線前) ---
             if is_golden_pit_trade:
-                # 階段 1: 還在季線下 (逆勢階段)
                 if curr_price < curr_ma60:
-                    
-                    # [修正 2] 雙重防護網
-                    # A. 災難停損 (絕對底線)：-15% (不管幾天，跌爛了就跑)
-                    if pnl_pct < -0.15:
-                        is_sell = True
-                        reason_str = "災難停損"
-                    
-                    # B. 破底停損 (有條件)：
-                    # 只有在「持有超過 3 天」後，才開始檢查是否破底
-                    # 前 3 天視為「洗盤豁免期」，給它震盪
-                    elif days_in_trade > 3 and curr_price < signal_low_price:
-                        is_sell = True
-                        reason_str = "破底確認(遲到)"
-                    
-                    else:
-                        # 沒破底，或者還在豁免期內 -> 死抱
-                        is_sell = False
-                        reason_str = f"築底防守 ({days_in_trade}d)"
-                
-                # 階段 2: 站上季線 -> 轉為波段
+                    # 破底即走
+                    if curr_price < signal_low_price:
+                        is_sell = True; reason_str = "破底失敗"
+                    elif pnl_pct < -0.15:
+                        is_sell = True; reason_str = "災難停損"
                 else:
-                    is_golden_pit_trade = False 
-                    
-            # --- 戰術 B: 一般順勢 ---
+                    is_golden_pit_trade = False # 站上季線，解除保護
+            
+            # --- 戰術 B: 一般順勢 / 已轉正波段 ---
             if not is_golden_pit_trade and not is_sell:
-                # 1. 移動停利
-                if pnl_pct > 0.20 and dd_from_peak < -0.10:
+                
+                # 1. [核心修正] 觸發吊燈停利
+                if curr_price < chandelier_stop:
                     is_sell = True
-                    reason_str = "移動停利"
-                # 2. 趨勢破壞
-                elif curr_price < curr_ma60 and curr_score < 40:
-                    is_sell = True
-                    reason_str = "跌破季線"
-                # 3. 一般停損
-                elif pnl_pct < -0.08:
-                    is_sell = True
-                    reason_str = "停損"
-                # 4. 評分轉空
+                    reason_str = "吊燈停利(趨勢結束)"
+                
+                # 2. 評分顯著轉空 (v16.3 分數會變負，這裡更靈敏)
                 elif curr_score < -20:
                     is_sell = True
                     reason_str = "評分轉空"
+                    
+                # 3. 破季線且分數弱
+                elif curr_price < curr_ma60 and curr_score < 0:
+                    is_sell = True
+                    reason_str = "跌破季線"
 
             if is_sell:
                 signal = 0
@@ -646,20 +640,19 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     df['Action'] = actions
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
-
-    # 績效計算
+    
+    # 補回績效與大盤計算
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
-    
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
-    
     df['Strategy_Return'] = (df['Real_Position'] * df['Market_Return']) - cost_series
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
+
 
 # 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
@@ -925,19 +918,22 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v16.2 (Bug Fix Edition):
-    修復 KeyError。
-    將 final_score 轉為 numpy array 後再進入迴圈，解決日期索引與整數迴圈不兼容的問題。
+    Alpha Score v16.3 (Zero-Gravity):
+    修正「分數虛高、無法及時轉空」的問題。
+    
+    [核心進化] 零重力計分
+    1. 移除 Base-50 偏誤：平盤/無趨勢時，分數應回歸 0 分，而非 50 分。
+    2. 負分釋放：當 Z-Score 轉負（法人賣、斜率下彎），分數會直接殺入負值區 (-20 ~ -100)。
+    3. 效果：在做頭下跌初期，分數會迅速由紅翻綠，觸發停利/停損。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 數據防呆與準備
+    # 1. 數據防呆
     # ====================================================
     has_chip_data = 'Inst_Net_Buy' in df.columns
-    if not has_chip_data:
-        df['Inst_Net_Buy'] = 0 
+    if not has_chip_data: df['Inst_Net_Buy'] = 0 
     
     close = df['Close']
     if 'VIX' not in df.columns: df['VIX'] = 20.0
@@ -947,103 +943,101 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
     
-    # 判斷股本/市值屬性
+    # 判斷股本 (權重分配)
     avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
-    
-    # 防呆：如果成交額是空值 (例如剛上市)，預設為中型股
     if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
 
     is_large_cap = avg_dollar_vol > 5_000_000_000 
     is_small_cap = avg_dollar_vol < 500_000_000   
     
     if is_small_cap:
-        w_tech = 0.3; w_chip = 0.7
-        z_threshold = 2.5 
+        w_tech = 0.3; w_chip = 0.7; z_threshold = 2.5 
         mode_log = "小型股(籌碼戰)"
     elif is_large_cap:
-        w_tech = 0.6; w_chip = 0.4
-        z_threshold = 2.0 
+        w_tech = 0.6; w_chip = 0.4; z_threshold = 2.0 
         mode_log = "權值股(趨勢戰)"
     else:
-        w_tech = 0.5; w_chip = 0.5
-        z_threshold = 2.2
+        w_tech = 0.5; w_chip = 0.5; z_threshold = 2.2
         mode_log = "中型股(均衡)"
 
     if not has_chip_data:
-        w_tech = 1.0; w_chip = 0.0
-        mode_log = "純技術模式"
+        w_tech = 1.0; w_chip = 0.0; mode_log = "純技術模式"
 
     # ====================================================
-    # 2. 技術面因子 (Z-Score)
+    # 2. 技術面因子 (Raw Z-Scores)
     # ====================================================
+    # 斜率 Z (Slope)
     ma60_diff = df['MA60'].diff()
     slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std()
     slope_z = slope_z.fillna(0)
     
+    # 效率 (ER) - 這次我們將 Rank 轉換為 -0.5 ~ 0.5 的區間
     net_change = close.diff(10).abs()
     total_path = close.diff().abs().rolling(10).sum()
     er = net_change / total_path.replace(0, 1)
     er_rank = er.rolling(60).rank(pct=True).fillna(0.5)
+    # ER Rank > 0.5 加分， < 0.5 扣分
+    er_score = (er_rank - 0.5) * 2 # 範圍 -1 ~ 1
     
-    tech_score_raw = (slope_z.clip(-2, 2) * 25) + (er_rank * 50)
-    tech_score_norm = np.where(tech_score_raw > 0, 50 + tech_score_raw, 50 + tech_score_raw).clip(0, 100)
+    # 技術總分 (-100 ~ 100)
+    # 斜率權重高，效率為輔
+    tech_score = (slope_z.clip(-3, 3) * 20) + (er_score * 30)
 
     # ====================================================
-    # 3. 籌碼面因子 (Z-Score)
+    # 3. 籌碼面因子 (Raw Z-Scores)
     # ====================================================
+    # 法人 Z (Inst)
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
     inst_mean = inst_rate.rolling(60).mean()
     inst_std = inst_rate.rolling(60).std().replace(0, 0.01)
     inst_z = (inst_rate - inst_mean) / inst_std
     inst_z = inst_z.fillna(0)
     
+    # 主力線 Rank (-0.5 ~ 0.5)
     inst_obv = df['Inst_Net_Buy'].cumsum()
     inst_obv_bias = (inst_obv - inst_obv.rolling(20).mean())
     chip_rank = inst_obv_bias.rolling(60).rank(pct=True).fillna(0.5)
+    chip_rank_score = (chip_rank - 0.5) * 2 # 範圍 -1 ~ 1
     
-    chip_score_raw = (inst_z.clip(-3, 3) * 15) + (chip_rank * 55)
-    chip_score_norm = chip_score_raw.clip(0, 100)
+    # 籌碼總分 (-100 ~ 100)
+    chip_score = (inst_z.clip(-3, 3) * 20) + (chip_rank_score * 40)
 
     # ====================================================
     # 4. 合成決策
     # ====================================================
-    final_score_series = (tech_score_norm * w_tech) + (chip_score_norm * w_chip)
+    # 直接加權，不再墊高 50 分
+    final_score_series = (tech_score * w_tech) + (chip_score * w_chip)
     
-    # [Fix] 寫入 DataFrame
-    df['Alpha_Score'] = final_score_series.fillna(0)
+    # 放大係數 (Gain) - 讓分數更容易觸及 +/- 100
+    final_score_series = final_score_series * 1.5
     
-    # [Fix] 轉為 Numpy Array 以供迴圈使用 (解決 KeyError)
+    # 寫入
+    df['Alpha_Score'] = final_score_series.fillna(0).clip(-100, 100)
+    
+    # 轉 numpy 供迴圈用
     final_score_val = df['Alpha_Score'].values
     inst_z_val = inst_z.values
     slope_z_val = slope_z.values
     
     logs = []
-    
     for i in range(len(df)):
         log = mode_log
-        
-        # 使用 numpy array 進行索引，這是安全的
-        if inst_z_val[i] < -z_threshold:
-            log = "💀 法人極端倒貨"
-        elif inst_z_val[i] > z_threshold:
-            log = "🔥 法人極端掃貨"
-        elif slope_z_val[i] < -1.0 and inst_z_val[i] > 1.0:
-            log = "💎 底部主力低接"
-        elif slope_z_val[i] > 1.0 and inst_z_val[i] < -1.0:
-            log = "⚠️ 拉高出貨警報"
-        elif final_score_val[i] > 80:
-            log = "🚀 強力多頭"
-        elif final_score_val[i] < 20:
-            log = "💤 弱勢觀望"
-            
+        if inst_z_val[i] < -z_threshold: log = "💀 法人極端倒貨"
+        elif inst_z_val[i] > z_threshold: log = "🔥 法人極端掃貨"
+        elif slope_z_val[i] < -1.0 and inst_z_val[i] > 1.0: log = "💎 底部主力低接"
+        elif slope_z_val[i] > 1.0 and inst_z_val[i] < -1.0: log = "⚠️ 拉高出貨警報"
+        elif final_score_val[i] > 60: log = "🚀 強力多頭"
+        elif final_score_val[i] < -60: log = "📉 空頭修正"
         logs.append(log)
         
     df['Score_Log'] = logs
-    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
+    # 建議持倉 (負分就建議 0 持倉)
+    df['Recommended_Position'] = np.where(df['Alpha_Score'] > 0, df['Alpha_Score'], 0)
     df['Inst_Z'] = inst_z
     
     return df
+
 
 # ==========================================
 # 6. 主儀表板繪製 (Updated)
