@@ -2045,7 +2045,6 @@ elif page == "📋 全台股清單":
         st.dataframe(df_show, use_container_width=True, hide_index=True)
 
 # --- 頁面 3.5 (局部無感刷新版): 持股健診 ---
-# --- 頁面 3.5 (局部無感刷新版): 持股健診 ---
 elif page == "💼 持股健診與建議":
     st.markdown("### 💼 智能持股健診 (Portfolio Doctor)")
     
@@ -2166,8 +2165,8 @@ elif page == "💼 持股健診與建議":
 
     with col_ctrl:
         st.markdown("#### 2. 監控設定")
-        st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 60 秒僅更新圖表數據，不會重載整頁。")
-        enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 60 秒更新)", value=False)
+        st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 300 秒僅更新圖表數據，不會重載整頁。")
+        enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 300 秒更新)", value=False)
 
     # ==========================================
     # 3. 定義局部刷新片段 (The Fragment)
@@ -2182,7 +2181,7 @@ elif page == "💼 持股健診與建議":
     if 'last_email_time' not in st.session_state:
         st.session_state['last_email_time'] = datetime.min
 
-    @st.fragment(run_every=60 if enable_monitor else None)  
+    @st.fragment(run_every=300 if enable_monitor else None)  
     def render_live_dashboard(target_df):
         if target_df.empty:
             st.warning("⚠️ 請先輸入持股資料。")
@@ -2303,7 +2302,7 @@ elif page == "💼 持股健診與建議":
             
             status.update(label="AI 分析完成！", state="complete", expanded=False)
 
-# ==========================================
+        # ==========================================
         # 自動寄信邏輯：評分變動觸發 (優化版：計算具體變化)
         # ==========================================
         if enable_monitor and portfolio_results:
