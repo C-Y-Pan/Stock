@@ -881,15 +881,10 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v22.0 (The Awakening):
-    緊急修復「權值股零交易」的數學錯誤。
-    
-    [核心修正]
-    1. 基準回歸：將分數模型校正回 50 分為中軸。
-       - (Z-Score * 權重) 加回 50，確保正常趨勢能達到 60~80 分的買進區。
-    2. 泰坦溢價 (Titan Premium):
-       - 針對權值股，只要確認在季線之上且趨勢向上，額外給予 +15 分的「趨勢紅利」。
-       - 這確保了台積電這種緩漲股，分數能穩定維持在 65+ (持有/買進)，不會因為指標鈍化而掉下來。
+    Alpha Score v22.1 (Bug Fix Edition):
+    修復 KeyError。
+    將 vix_panic 轉為 numpy array (vix_panic_val) 後再進入迴圈，
+    解決日期索引與整數迴圈不兼容的問題。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -940,24 +935,18 @@ def calculate_alpha_score(df, margin_df, short_df):
     else:
         w_trend = 0.3; w_chip = 0.7; mode_log = "🐆 游擊"
     
-    # [修正 1] 基礎分計算 (以 50 為中心)
-    # Z-Score 通常在 -2 ~ +2 之間
-    # 乘以 20 代表波動範圍約在 -40 ~ +40
-    # 加上 50 -> 分數範圍 10 ~ 90
+    # 基礎分計算 (以 50 為中心)
     weighted_z = (slope_z * w_trend + inst_z * w_chip)
     base_score = 50 + (weighted_z * 20)
     
-    # [修正 2] 泰坦趨勢溢價 (Trend Premium)
-    # 如果是權值股，且站在季線上，且季線向上 -> 直接加分
-    # 這是為了防止緩漲時 Z-Score 不夠高
+    # 泰坦趨勢溢價 (Trend Premium)
     is_bull_trend = (close > df['MA60']) & (ma60_diff > 0)
     titan_bonus = np.where(is_titan & is_bull_trend, 15, 0)
     
-    # [修正 3] 恐慌加權 (Panic Bonus)
-    # VIX > 25 且 乖離 Z < -1.5 (負乖離大)
-    vix_panic = (df['VIX'] > 25) & (bias_z < -1.5)
-    # 恐慌時，直接給予極大加分 (讓分數衝破 90)
-    panic_bonus = np.where(vix_panic, 50, 0)
+    # 恐慌加權 (Panic Bonus)
+    # VIX > 25 且 乖離 Z < -1.5
+    vix_panic_series = (df['VIX'] > 25) & (bias_z < -1.5)
+    panic_bonus = np.where(vix_panic_series, 50, 0)
     
     # 總分合成
     final_score_series = base_score + titan_bonus + panic_bonus
@@ -965,9 +954,12 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 寫入 (平滑化)
     df['Alpha_Score'] = final_score_series.rolling(3, min_periods=1).mean().clip(0, 100)
     
+    # [核心修正] 將 Series 轉為 Numpy Array，供迴圈使用
+    score_val = df['Alpha_Score'].values
+    vix_panic_val = vix_panic_series.values  # <--- 這裡修正了
+    
     # 生成 Log
     logs = []
-    score_val = df['Alpha_Score'].values
     
     for i in range(len(df)):
         if score_val[i] > 80: log = f"{mode_log} 極強"
@@ -975,7 +967,8 @@ def calculate_alpha_score(df, margin_df, short_df):
         elif score_val[i] < 40: log = f"{mode_log} 偏空"
         else: log = "盤整"
         
-        if vix_panic[i]: log = "💎 恐慌機會"
+        # 使用 numpy array 進行索引，這是安全的
+        if vix_panic_val[i]: log = "💎 恐慌機會"
         
         logs.append(log)
         
