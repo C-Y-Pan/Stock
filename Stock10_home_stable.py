@@ -863,22 +863,19 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v12.0 (Volume-Price Confirmation):
-    針對「無量假突破」導致的盤整盤雙巴進行修復。
+    Alpha Score v12.1 (Smart Money Filter):
+    針對「箱型假突破」與「主力騙線」進行修復。
     
-    [核心進化] 真·壓縮突破
-    在 v11.0 的基礎上，嚴格加上「量價濾網」：
-    1. 必須帶量：Volume > Vol_MA20 (拒絕無量過高)。
-    2. 必須脫離：Close > MA60 * 1.015 (必須拉開 1.5% 差距，拒絕黏著磨蹭)。
-    3. 必須紅K：Close > Open (拒絕避雷針/上影線)。
-    
-    只有同時滿足上述條件，才承認是「壓縮突破」，否則視為盤整雜訊。
+    [核心進化] 引入籌碼與波動率雙濾網
+    1. OBV 濾網：突破時，OBV 必須站上月均線 (確認聰明錢進場)。
+    2. ATR 濾網：收盤價必須突破「季線 + 0.8 ATR」 (動態過濾雜訊)。
+    3. 斜率門檻：季線必須「顯著」向上，走平時禁止追突破。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據
+    # 1. 基礎數據計算
     # ====================================================
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
@@ -886,25 +883,40 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
     df['Vol_MA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
     
-    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    close = df['Close']
+    if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
+    if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
+    
+    # 計算 ATR (波動率)
+    high = df['High']; low = df['Low']
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().fillna(0)
     
     # 計算 ADX
-    high = df['High']; low = df['Low']; close = df['Close']
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
     plus_dm = high.diff(); minus_dm = low.diff()
     plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
     minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
-    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr.replace(0,1))
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr.replace(0,1))
     dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
     df['ADX'] = dx.rolling(14).mean().fillna(0)
 
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
+    # [關鍵新增] 計算 OBV (能量潮)
+    # OBV = 累積成交量 (漲+ 跌-)
+    # 用來判斷資金流向
+    price_change = close.diff().fillna(0)
+    vol_direction = np.sign(price_change)
+    df['OBV'] = (vol_direction * df['Volume']).cumsum()
+    df['OBV_MA20'] = df['OBV'].rolling(20).mean()
+
+    bias_60 = ((close - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
     
-    ma60_slope = df['MA60'].diff(5).fillna(0)
+    # 計算斜率百分比 ( Normalized Slope)
+    # 避免高價股斜率數值過大，統一用百分比衡量
+    ma60_slope_pct = (df['MA60'].diff(3) / df['MA60']) * 100
+    ma60_slope_pct = ma60_slope_pct.fillna(0)
+    
     ma_gap = (abs(df['MA20'] - df['MA60']) / df['MA60']) * 100
 
     # ====================================================
@@ -918,45 +930,51 @@ def calculate_alpha_score(df, margin_df, short_df):
     panic_lvl_3 = (vix > 25) & (curr_rsi < 25)
     systemic_panic = panic_lvl_1 | panic_lvl_2 | panic_lvl_3
     
-    is_hard_downtrend = (df['Close'] < df['MA60']) & (ma60_slope < 0)
+    is_hard_downtrend = (close < df['MA60']) & (ma60_slope_pct < -0.05)
     vol_spike = df['Volume'] > df['Vol_MA20'] * 1.8 
     capitulation = is_hard_downtrend & vol_spike & (curr_rsi < 25)
     
     is_golden_pit = systemic_panic | capitulation
     
-    # B. [核心修正] 壓縮與真突破
+    # B. [核心修正] 真·壓縮突破 (The Smart Breakout)
     is_squeeze = ma_gap < 2.5
     
-    # 真突破濾網 (True Breakout Filter)
-    # 1. 量能確認：量 > 均量
+    # 條件 1: 帶量 (基本)
     has_volume = df['Volume'] > df['Vol_MA20']
-    # 2. 價格脫離：收盤價必須拉開季線 1.5% 距離 (避免黏著)
-    has_clearance = df['Close'] > df['MA60'] * 1.015
-    # 3. K線型態：必須是紅K (收 > 開)
-    is_solid_candle = df['Close'] > df['Open']
     
-    # 只有全部滿足，才算突破
+    # 條件 2: [ATR濾網] 價格必須明確脫離雜訊區
+    # 不再是固定 1.5%，而是 0.8 倍 ATR。波動越大，要求突破越遠。
+    has_clearance = close > (df['MA60'] + 0.8 * atr)
+    
+    # 條件 3: [OBV濾網] 聰明錢確認
+    # OBV 必須在月線上，代表資金是進場的
+    has_smart_money = df['OBV'] > df['OBV_MA20']
+    
+    # 條件 4: [斜率濾網] 季線不能走平
+    # 斜率必須 > 0.05% (微幅向上也不行，要有感向上)
+    is_trending_up = ma60_slope_pct > 0.05
+    
     is_coil_breakout = (
         is_squeeze & 
         has_volume & 
         has_clearance & 
-        is_solid_candle &
+        has_smart_money & 
+        is_trending_up & # 關鍵：箱型走平時禁止突破
         (curr_rsi > 55)
     )
     
-    # 死魚盤：壓縮 但 沒突破
     is_dead_fish = is_squeeze & (~is_coil_breakout)
     
     # C. 強力噴出
     is_super_trend = (
-        (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.5) & (df['ADX'] > 25) & (ma60_slope > 0)
+        (close > df['MA20']) & (df['MA20'] > df['MA60']) & 
+        (ma_gap >= 2.5) & (df['ADX'] > 25) & (ma60_slope_pct > 0)
     )
     
     # D. 初升段
     is_early_trend = (
-        (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.5) & (ma60_slope > 0)
+        (close > df['MA20']) & (df['MA20'] > df['MA60']) & 
+        (ma_gap >= 2.5) & (ma60_slope_pct > 0)
     )
 
     # ====================================================
@@ -989,15 +1007,16 @@ def calculate_alpha_score(df, margin_df, short_df):
             log = "📉 空頭速跌"
             if rsi_arr[i] < 15: score = 50; log = "搶極短反彈"
                 
-        # 3. [關鍵] 壓縮突破 (75分)
+        # 3. 壓縮突破 (75分)
         elif breakout_arr[i]:
             score = 75
-            log = "🔥 壓縮帶量突破"
+            log = "🔥 籌碼帶量突破"
             
-        # 4. 死魚盤 (0分) -> 這會過濾掉所有無量假突破
+        # 4. 死魚盤/箱型整理 (0分)
+        # [圖中案例會落入這裡]
         elif dead_arr[i]:
             score = 0
-            log = "💤 均線糾結"
+            log = "💤 均線糾結(無趨勢)"
             
         # 5. 強力噴出 (85分)
         elif super_arr[i]:
