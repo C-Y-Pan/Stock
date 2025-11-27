@@ -497,7 +497,7 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=60, sell_threshold=30, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
     """
     策略引擎 v21.0 (The Hysteresis Guard):
     解決頻繁進出場問題。
@@ -591,14 +591,17 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=30, fee_rate=0.00
                     
             else:
                 # --- 游擊模式 (靈活) ---
+                # 1. 吊燈停利
                 chandelier_stop = highest_price - (3 * atr[i])
                 if curr_price < chandelier_stop:
                     is_sell = True; reason_str = "吊燈停利"
                 
-                # [修改這行] 使用傳入的 sell_threshold
-                elif valid_score < sell_threshold:
+                # 2. 遲滯賣點 (Hysteresis Exit)
+                # 買點是 60，但賣點是 30。中間的 30~60 是「持有區」。
+                elif valid_score < 30:
                     is_sell = True; reason_str = "評分轉空"
                     
+                # 3. 破季線
                 elif curr_price < curr_ma60:
                     is_sell = True; reason_str = "破季線"
 
@@ -897,7 +900,7 @@ def analyze_signal(final_df):
 # ==========================================
 # 5. [核心演算法] 買賣評等 (Alpha Score) - 實務嚴謹版
 # ==========================================
-def calculate_alpha_score(df, margin_df, short_df, window=5):
+def calculate_alpha_score(df, margin_df, short_df):
     """
     Alpha Score v26.3 (The Smooth Operator):
     針對「訊號過於敏感導致頻繁交易」進行修復。
@@ -989,7 +992,7 @@ def calculate_alpha_score(df, margin_df, short_df, window=5):
     # 4. [關鍵修正] 5日平滑化 (Stability)
     raw_series = pd.Series(final_score).fillna(50)
     # rolling(5) 讓分數更穩定，不容易忽上忽下
-    df['Alpha_Score'] = raw_series.rolling(window, min_periods=1).mean().clip(0, 100)
+    df['Alpha_Score'] = raw_series.rolling(5, min_periods=1).mean().clip(0, 100)
     
     df['Score_Log'] = logs
     df['Recommended_Position'] = df['Alpha_Score']
@@ -1430,27 +1433,13 @@ with st.sidebar:
     today = datetime.now(tw_tz).date() # 強制使用台北時間的今天
     st.markdown("---")
     with st.expander("⚙️ 參數與日期設定", expanded=False):
-        today = datetime.now(tw_tz).date()
-        start_date = st.date_input("開始", value=today - timedelta(days=365*2+1))
-        end_date = st.date_input("結束", value=today)
-        
-        st.markdown("---")
-        st.caption("🔧 策略參數微調 (Strategy Tuning)")
-        
-        col_p1, col_p2, col_p3 = st.columns(3)
-        # 1. 平滑天數：控制分數的靈敏度 (越小越靈敏，越大越穩重)
-        smooth_window = col_p1.number_input("平滑天數", min_value=1, max_value=20, value=5, help="控制 Alpha Score 的反應速度。")
-        
-        # 2. 買進門檻：控制出手的謹慎程度
-        buy_threshold = col_p2.number_input("買進門檻", min_value=40, max_value=90, value=60, help="分數高於此值才進場。")
-        
-        # 3. 賣出門檻：控制停利的寬容度 (遲滯區間)
-        sell_threshold = col_p3.number_input("賣出門檻", min_value=10, max_value=60, value=30, help="分數低於此值才視為轉空賣出。")
-        
-        st.caption("交易成本設定")
-        fee_input = st.number_input("手續費(%)", value=0.1425, step=0.01) / 100
-        tax_input = st.number_input("交易稅(%)", value=0.3000, step=0.01) / 100
-
+            today = datetime.now(tw_tz).date()
+            start_date = st.date_input("開始", value=today - timedelta(days=365*2+1))
+            end_date = st.date_input("結束", value=today)
+            
+            st.caption("交易成本設定")
+            fee_input = st.number_input("手續費(%)", value=0.1425, step=0.01) / 100
+            tax_input = st.number_input("交易稅(%)", value=0.3000, step=0.01) / 100
 
 market_df = get_market_data(start_date, end_date)
 
