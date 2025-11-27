@@ -630,6 +630,58 @@ def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.0014
         "split_date": test_data_raw['Date'].min()
     }
 
+def analyze_alpha_performance(df):
+    """
+    因子有效性檢驗工具：分析 Alpha Score/Slope 與未來股價漲跌的相關性
+    """
+    data = df.copy()
+    
+    # 1. 建立未來回報欄位 (Label Generation)
+    # 分別計算未來 1日, 3日, 5日, 10日, 20日 的漲跌幅
+    periods = {1: '1D', 3: '3D', 5: '5D', 10: '10D', 20: '20D'}
+    for n, suffix in periods.items():
+        data[f'Fwd_Ret_{suffix}'] = data['Close'].shift(-n) / data['Close'] - 1
+
+    # 確保 Alpha_Slope 存在
+    if 'Alpha_Slope' not in data.columns:
+        data['Alpha_Slope'] = data['Alpha_Score'].diff().fillna(0)
+
+    # 移除最後 N 天沒有未來數據的資料
+    valid_data = data.dropna(subset=[f'Fwd_Ret_{suffix}' for suffix in periods.values()])
+    
+    if valid_data.empty:
+        return None, None, None
+
+    # 2. 計算 IC (Information Coefficient) - 皮爾森相關係數
+    # 衡量當下的分數與未來漲跌幅的線性相關度 (-1 ~ 1)
+    ic_metrics = []
+    for factor in ['Alpha_Score', 'Alpha_Slope']:
+        for n, suffix in periods.items():
+            corr = valid_data[factor].corr(valid_data[f'Fwd_Ret_{suffix}'])
+            ic_metrics.append({
+                "因子": "評分 (Score)" if factor == 'Alpha_Score' else "動能 (Slope)",
+                "預測週期": f"未來 {n} 日",
+                "IC (相關性)": corr
+            })
+    
+    ic_df = pd.DataFrame(ic_metrics)
+
+    # 3. 分組績效測試 (Layered Backtest)
+    # 將 Alpha Score 分為 5 個區間 (Strong Sell 到 Strong Buy)，觀察各組的未來平均報酬
+    # 定義區間: < -60, -60~-20, -20~20, 20~60, > 60
+    bins = [-np.inf, -60, -20, 20, 60, np.inf]
+    labels = ['極弱勢 (<-60)', '弱勢 (-60~-20)', '中性震盪 (-20~20)', '強勢 (20~60)', '極強勢 (>60)']
+    valid_data['Score_Bucket'] = pd.cut(valid_data['Alpha_Score'], bins=bins, labels=labels)
+    
+    # 計算各組在未來 5 日的平均表現
+    bucket_perf = valid_data.groupby('Score_Bucket')[['Fwd_Ret_5D', 'Fwd_Ret_10D']].mean() * 100
+    bucket_counts = valid_data.groupby('Score_Bucket')['Close'].count()
+    
+    bucket_df = pd.concat([bucket_perf, bucket_counts.rename("樣本數")], axis=1)
+
+    return ic_df, bucket_df, valid_data
+
+
 def calculate_target_hit_rate(df):
     if df is None or df.empty: return "0.0%", 0, 0
     
@@ -1513,10 +1565,15 @@ elif page == "📊 單股深度分析":
                 m3.metric("目標達成率 (Target)", hit_rate, f"{hits}次達標 (+15%)")
                 m4.metric("盈虧因子 (PF)", f"{risk_metrics.get('Profit_Factor', 0):.2f}", f"夏普: {risk_metrics.get('Sharpe', 0):.2f}")
                 
-                # ... (請保留原本的 Tabs 繪圖代碼) ...
-                tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
+                stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
+                final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
+                # 計算 Alpha Score 斜率
+                final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
+
+                # 原有的 tab 定義
+                tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])                
                 
-# [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
+                # [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
                 with tab1:
                     # 1. 準備數據
                     # 將 Alpha Score 寫入 final_df
@@ -1692,26 +1749,105 @@ elif page == "📊 單股深度分析":
                         st.metric("潛在獲利 (95%)", f"+{(opt_p-last_p)/last_p*100:.1f}%")
                         st.metric("潛在風險 (5%)", f"-{(last_p-pes_p)/last_p*100:.1f}%")
 
-                # [Tab 4: 有效性驗證]
+                # [Tab 4: 有效性驗證 (Updated)]
                 with tab4:
-                    if validation_result:
-                        st.markdown(f"### 🧪 樣本外測試 (Walk-Forward Analysis)")
-                        tr_cagr = validation_result['train']['cagr'] * 100
-                        te_cagr = validation_result['test']['cagr'] * 100
+                    st.markdown("### 🧪 策略與因子有效性驗證")
+                    
+                    # 1. 既有的策略回測驗證 (WFA)
+                    with st.expander("策略樣本外測試 (Walk-Forward)", expanded=False):
+                        if validation_result:
+                            tr_cagr = validation_result['train']['cagr'] * 100
+                            te_cagr = validation_result['test']['cagr'] * 100
+                            
+                            vt1, vt2 = st.columns(2)
+                            vt1.metric("訓練集年化報酬", f"{tr_cagr:.1f}%")
+                            vt2.metric("測試集年化報酬", f"{te_cagr:.1f}%", f"差異: {(te_cagr-tr_cagr):.1f}%")
+                            
+                            fig_val = go.Figure()
+                            fig_val.add_trace(go.Scatter(x=validation_result['train']['df']['Date'], y=validation_result['train']['df']['Cum_Strategy'], name='訓練', line=dict(color='gray', dash='dot')))
+                            scale_factor = validation_result['train']['df']['Cum_Strategy'].iloc[-1]
+                            fig_val.add_trace(go.Scatter(x=validation_result['test']['df']['Date'], y=validation_result['test']['df']['Cum_Strategy']*scale_factor, name='測試', line=dict(color='#00e676')))
+                            fig_val.add_vline(x=validation_result['split_date'].timestamp()*1000, line_dash="dash", line_color="white")
+                            fig_val.update_layout(template="plotly_dark", height=300, margin=dict(l=10, r=10, t=30, b=10))
+                            st.plotly_chart(fig_val, use_container_width=True)
+                        else:
+                            st.warning("數據不足，無法執行樣本外驗證。")
+
+                    st.markdown("---")
+                    st.markdown("### 🧬 Alpha 因子預測力檢驗 (IC Analysis)")
+                    st.caption("驗證 Alpha Score 與 Alpha Slope 對於未來股價的預測能力 (相關係數越高代表預測力越強)。")
+
+                    # 執行因子分析
+                    ic_df, bucket_df, valid_data_for_plot = analyze_alpha_performance(final_df)
+
+                    if ic_df is not None:
+                        # A. IC 相關性顯示
+                        ic_col1, ic_col2 = st.columns([1, 1])
+                        with ic_col1:
+                            # 樞紐分析表呈現 IC
+                            ic_pivot = ic_df.pivot(index="預測週期", columns="因子", values="IC (相關性)")
+                            st.dataframe(
+                                ic_pivot.style.background_gradient(cmap='RdYlGn', vmin=-0.1, vmax=0.1).format("{:.3f}"),
+                                use_container_width=True
+                            )
+                            st.caption("* IC > 0.05 通常視為顯著有效因子")
+
+                        with ic_col2:
+                            # B. 分組績效長條圖 (Bar Chart)
+                            # 視覺化不同分數區間的未來表現
+                            fig_bucket = go.Figure()
+                            fig_bucket.add_trace(go.Bar(
+                                x=bucket_df.index, 
+                                y=bucket_df['Fwd_Ret_5D'],
+                                name='未來 5 日漲幅',
+                                marker_color=['#ef5350' if x > 0 else '#26a69a' for x in bucket_df['Fwd_Ret_5D']]
+                            ))
+                            fig_bucket.update_layout(
+                                title="不同評分區間的未來 5 日平均漲跌幅",
+                                yaxis_title="平均漲跌幅 (%)",
+                                template="plotly_dark",
+                                height=300,
+                                margin=dict(l=10, r=10, t=40, b=10)
+                            )
+                            st.plotly_chart(fig_bucket, use_container_width=True)
+
+                        # C. 散佈圖與回歸線 (Scatter Plot with Regression)
+                        st.markdown("#### 🔎 評分與 5 日後報酬之分佈 (Regression)")
                         
-                        vt1, vt2 = st.columns(2)
-                        vt1.metric("訓練集年化報酬", f"{tr_cagr:.1f}%")
-                        vt2.metric("測試集年化報酬", f"{te_cagr:.1f}%", f"差異: {(te_cagr-tr_cagr):.1f}%")
+                        # 計算簡單回歸線
+                        import statsmodels.api as sm
+                        X = valid_data_for_plot['Alpha_Score']
+                        Y = valid_data_for_plot['Fwd_Ret_5D'] * 100 # 轉百分比
+                        X_const = sm.add_constant(X)
+                        model = sm.OLS(Y, X_const).fit()
+                        pred_y = model.predict(X_const)
+
+                        fig_reg = go.Figure()
+                        # 散佈點
+                        fig_reg.add_trace(go.Scatter(
+                            x=X, y=Y, 
+                            mode='markers', 
+                            marker=dict(color='rgba(255, 255, 255, 0.3)', size=4),
+                            name='樣本點'
+                        ))
+                        # 回歸線
+                        fig_reg.add_trace(go.Scatter(
+                            x=X, y=pred_y,
+                            mode='lines',
+                            line=dict(color='#ffeb3b', width=2),
+                            name=f'趨勢線 (R²={model.rsquared:.3f})'
+                        ))
                         
-                        fig_val = go.Figure()
-                        fig_val.add_trace(go.Scatter(x=validation_result['train']['df']['Date'], y=validation_result['train']['df']['Cum_Strategy'], name='訓練', line=dict(color='gray', dash='dot')))
-                        scale_factor = validation_result['train']['df']['Cum_Strategy'].iloc[-1]
-                        fig_val.add_trace(go.Scatter(x=validation_result['test']['df']['Date'], y=validation_result['test']['df']['Cum_Strategy']*scale_factor, name='測試', line=dict(color='#00e676')))
-                        fig_val.add_vline(x=validation_result['split_date'].timestamp()*1000, line_dash="dash", line_color="white")
-                        fig_val.update_layout(template="plotly_dark", height=400, margin=dict(l=10, r=10, t=30, b=10))
-                        st.plotly_chart(fig_val, use_container_width=True)
+                        fig_reg.update_layout(
+                            xaxis_title="Alpha Score",
+                            yaxis_title="未來 5 日漲跌幅 (%)",
+                            template="plotly_dark",
+                            height=400
+                        )
+                        st.plotly_chart(fig_reg, use_container_width=True)
+
                     else:
-                        st.warning("數據不足，無法執行樣本外驗證。")
+                        st.warning("數據量不足，無法進行因子相關性分析。")
 
 # --- 頁面 3 (修正版): 科技股/熱門股掃描 ---
 elif page == "🚀 科技股掃描":
