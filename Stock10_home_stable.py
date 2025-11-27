@@ -863,19 +863,20 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v12.1 (Smart Money Filter):
-    針對「箱型假突破」與「主力騙線」進行修復。
+    Alpha Score v12.2 (The Climax Killer):
+    最終完成版。
+    針對「爆量假突破 (Volume Climax)」進行修復。
     
-    [核心進化] 引入籌碼與波動率雙濾網
-    1. OBV 濾網：突破時，OBV 必須站上月均線 (確認聰明錢進場)。
-    2. ATR 濾網：收盤價必須突破「季線 + 0.8 ATR」 (動態過濾雜訊)。
-    3. 斜率門檻：季線必須「顯著」向上，走平時禁止追突破。
+    [核心進化] 竭盡與影線濾網
+    1. 拒絕天量：在無趨勢(ADX低)時，若量能 > 3.5倍均量，視為主力倒貨，禁止追價。
+    2. 拒絕長上影：若上影線過長 (賣壓重)，禁止視為突破。
+    這能有效避開「一日行情」的最高點陷阱。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據計算
+    # 1. 基礎數據
     # ====================================================
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
@@ -883,16 +884,15 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
     df['Vol_MA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
     
-    close = df['Close']
-    if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
+    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
+    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
-    # 計算 ATR (波動率)
-    high = df['High']; low = df['Low']
+    high = df['High']; low = df['Low']; close = df['Close']; open_p = df['Open']
+    
+    # 計算 ATR & ADX
     tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().fillna(0)
     
-    # 計算 ADX
     plus_dm = high.diff(); minus_dm = low.diff()
     plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
     minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
@@ -901,9 +901,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
     df['ADX'] = dx.rolling(14).mean().fillna(0)
 
-    # [關鍵新增] 計算 OBV (能量潮)
-    # OBV = 累積成交量 (漲+ 跌-)
-    # 用來判斷資金流向
+    # 計算 OBV
     price_change = close.diff().fillna(0)
     vol_direction = np.sign(price_change)
     df['OBV'] = (vol_direction * df['Volume']).cumsum()
@@ -912,18 +910,15 @@ def calculate_alpha_score(df, margin_df, short_df):
     bias_60 = ((close - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
     
-    # 計算斜率百分比 ( Normalized Slope)
-    # 避免高價股斜率數值過大，統一用百分比衡量
     ma60_slope_pct = (df['MA60'].diff(3) / df['MA60']) * 100
     ma60_slope_pct = ma60_slope_pct.fillna(0)
-    
     ma_gap = (abs(df['MA20'] - df['MA60']) / df['MA60']) * 100
 
     # ====================================================
     # 2. 狀態定義
     # ====================================================
     
-    # A. 恐慌黃金坑 (動態階梯)
+    # A. 恐慌黃金坑
     vix = df['VIX']
     panic_lvl_1 = (vix > 40) & (curr_rsi < 45)
     panic_lvl_2 = (vix > 30) & (curr_rsi < 35)
@@ -933,33 +928,41 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_hard_downtrend = (close < df['MA60']) & (ma60_slope_pct < -0.05)
     vol_spike = df['Volume'] > df['Vol_MA20'] * 1.8 
     capitulation = is_hard_downtrend & vol_spike & (curr_rsi < 25)
-    
     is_golden_pit = systemic_panic | capitulation
     
-    # B. [核心修正] 真·壓縮突破 (The Smart Breakout)
+    # B. [核心修正] 壓縮與真突破
     is_squeeze = ma_gap < 2.5
     
-    # 條件 1: 帶量 (基本)
-    has_volume = df['Volume'] > df['Vol_MA20']
+    # 條件 1: 量能適中 (有量但不能失控)
+    # [新] 爆天量過濾：如果在盤整區(ADX<25)，量 > 3.5倍均量 -> 視為竭盡/倒貨
+    is_volume_climax = (df['Volume'] > df['Vol_MA20'] * 3.5) & (df['ADX'] < 25)
+    has_good_volume = (df['Volume'] > df['Vol_MA20']) & (~is_volume_climax)
     
-    # 條件 2: [ATR濾網] 價格必須明確脫離雜訊區
-    # 不再是固定 1.5%，而是 0.8 倍 ATR。波動越大，要求突破越遠。
+    # 條件 2: 價格脫離
     has_clearance = close > (df['MA60'] + 0.8 * atr)
     
-    # 條件 3: [OBV濾網] 聰明錢確認
-    # OBV 必須在月線上，代表資金是進場的
+    # 條件 3: 聰明錢 OBV
     has_smart_money = df['OBV'] > df['OBV_MA20']
     
-    # 條件 4: [斜率濾網] 季線不能走平
-    # 斜率必須 > 0.05% (微幅向上也不行，要有感向上)
+    # 條件 4: 斜率
     is_trending_up = ma60_slope_pct > 0.05
     
+    # 條件 5: [新] K線型態濾網
+    # 計算上影線長度
+    upper_shadow = high - np.maximum(close, open_p)
+    body_len = np.abs(close - open_p)
+    # 如果上影線 > 實體的 0.6 倍，視為避雷針 (賣壓重)
+    is_shooting_star = upper_shadow > (body_len * 0.6)
+    is_solid_candle = (close > open_p) & (~is_shooting_star)
+    
+    # 綜合判斷
     is_coil_breakout = (
         is_squeeze & 
-        has_volume & 
+        has_good_volume &  # 修正：排除爆天量
         has_clearance & 
         has_smart_money & 
-        is_trending_up & # 關鍵：箱型走平時禁止突破
+        is_trending_up & 
+        is_solid_candle &  # 修正：排除長上影
         (curr_rsi > 55)
     )
     
@@ -991,46 +994,51 @@ def calculate_alpha_score(df, margin_df, short_df):
     dead_arr = is_dead_fish.values
     super_arr = is_super_trend.values
     early_arr = is_early_trend.values
+    climax_arr = is_volume_climax.values # 竭盡陣列
     
     for i in range(len(df)):
         score = 0
         log = "盤整"
         
-        # 1. 黃金坑 (95分)
+        # 1. 黃金坑
         if golden_arr[i]:
             score = 95
             log = "💎 恐慌黃金坑"
             
-        # 2. 空頭防禦 (負分)
+        # 2. 空頭防禦
         elif downtrend_arr[i]:
             score = -50 
             log = "📉 空頭速跌"
             if rsi_arr[i] < 15: score = 50; log = "搶極短反彈"
                 
-        # 3. 壓縮突破 (75分)
+        # 3. 壓縮突破
         elif breakout_arr[i]:
             score = 75
             log = "🔥 籌碼帶量突破"
             
-        # 4. 死魚盤/箱型整理 (0分)
-        # [圖中案例會落入這裡]
+        # 4. [新] 竭盡倒貨 (給予警告)
+        elif climax_arr[i]:
+            score = -20
+            log = "⚠️ 爆量竭盡/假突破"
+            
+        # 5. 死魚盤
         elif dead_arr[i]:
             score = 0
-            log = "💤 均線糾結(無趨勢)"
+            log = "💤 均線糾結"
             
-        # 5. 強力噴出 (85分)
+        # 6. 強力噴出
         elif super_arr[i]:
             score = 85
             log = "🚀 強勢噴出"
             if rsi_arr[i] > 85: score = 70; log = "⚠️ 過熱警戒"
                 
-        # 6. 初升段 (65~75分)
+        # 7. 初升段
         elif early_arr[i]:
             score = 65
             log = "📈 趨勢發散"
             if rsi_arr[i] < 70: score += 10
         
-        # 7. 盤整
+        # 8. 盤整
         else:
             if rsi_arr[i] < 40: score = 50; log = "弱勢盤整"
             else: score = 0; log = "觀望"
