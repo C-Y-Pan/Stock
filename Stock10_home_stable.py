@@ -2044,34 +2044,45 @@ elif page == "💼 持股健診與建議":
     else:
         st.caption("⚠️ 訪客模式")
 
-    # ==========================================
-    # 1. [修正] 準備輸入資料 (使用 Callback 鎖定狀態)
+# ==========================================
+    # 1. [修正-防呆版] 準備輸入資料 (使用 Callback 鎖定狀態)
     # ==========================================
     
-# 定義 Callback：當表格被編輯時，立刻執行此函式存檔
+    # 定義 Callback：當表格被編輯時，立刻執行此函式存檔
     def on_portfolio_change():
-        # 1. 取出編輯後的資料
-        edited_data = st.session_state["portfolio_editor"]
+        # 從 editor 取出資料
+        edited_val = st.session_state.get("portfolio_editor")
         
-        # 2. [關鍵修正] 強制轉為 DataFrame
-        # 避免 Streamlit 回傳 List 或 Dict 導致 iterrows() 失敗
-        if not isinstance(edited_data, pd.DataFrame):
-            new_df = pd.DataFrame(edited_data)
-        else:
-            new_df = edited_data
-            
-        # 3. 更新 Session State
+        # [防呆機制] 確保轉換為 DataFrame
+        new_df = pd.DataFrame() # 預設空表
+        
+        if isinstance(edited_val, pd.DataFrame):
+            new_df = edited_val.copy() # 複製一份，切斷參照
+        elif isinstance(edited_val, list):
+            new_df = pd.DataFrame(edited_val)
+        elif isinstance(edited_val, dict):
+            # 極少數情況會變成 dict，嘗試救援，若失敗則忽略
+            try: new_df = pd.DataFrame(edited_val)
+            except: return 
+
+        # 確保欄位型態正確 (防止空值導致計算錯誤)
+        if not new_df.empty:
+            # 嘗試將持有股數轉為數字，非數字補 0
+            if '持有股數' in new_df.columns:
+                new_df['持有股數'] = pd.to_numeric(new_df['持有股數'], errors='coerce').fillna(0).astype(int)
+            # 確保代號是字串
+            if '代號' in new_df.columns:
+                new_df['代號'] = new_df['代號'].astype(str)
+
+        # 更新 Session State (確保它是乾淨的 DataFrame)
         st.session_state['portfolio_data'] = new_df
         
-        # 4. 如果已登入，同步寫入資料庫
+        # 如果已登入，同步寫入資料庫
         if st.session_state.get('logged_in'):
-            # 確保欄位名稱正確，防止空資料導致錯誤
-            if not new_df.empty and '代號' in new_df.columns and '持有股數' in new_df.columns:
-                save_portfolio_to_db(st.session_state['username'], new_df)
+            save_portfolio_to_db(st.session_state['username'], new_df)
 
-                
-    # 初始化資料 (只在第一次執行)
-    if 'portfolio_data' not in st.session_state:
+    # 初始化資料 (只在第一次執行或資料被意外清空時執行)
+    if 'portfolio_data' not in st.session_state or not isinstance(st.session_state['portfolio_data'], pd.DataFrame):
         if st.session_state.get('logged_in'):
             db_df = load_portfolio_from_db(st.session_state['username'])
             st.session_state['portfolio_data'] = db_df if not db_df.empty else pd.DataFrame([{"代號": "2330", "持有股數": 1000}])
@@ -2085,20 +2096,19 @@ elif page == "💼 持股健診與建議":
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
         
-        # [關鍵修正]：移除原本的返回值賦值，改用 key + on_change
-        # 這樣做可以確保資料在編輯當下就被鎖定，不會因為頁面刷新而重置
+        # 這裡的 key 必須對應 callback 中的名稱
         st.data_editor(
             st.session_state['portfolio_data'], 
             num_rows="dynamic", 
             use_container_width=True, 
-            key="portfolio_editor",  # 綁定 Session Key
-            on_change=on_portfolio_change, # 綁定觸發函式
+            key="portfolio_editor",
+            on_change=on_portfolio_change,
             column_config={
                 "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號"),
                 "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
-
+        
     with col_ctrl:
         st.markdown("#### 2. 監控設定")
         st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 60 秒僅更新圖表數據，不會重載整頁。")
