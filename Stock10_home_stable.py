@@ -2334,9 +2334,9 @@ elif page == "💼 持股健診與建議":
                     elif new_score != old_score:
                         # 有變動
                         if new_score > old_score:
-                            change_str = f"{old_score} <b style='color:red'>➜ {new_score} (⬆️)</b>"
+                            change_str = f"{old_score} <b style='color:red'>➜ {new_score}</b>"
                         else:
-                            change_str = f"{old_score} <b style='color:green'>➜ {new_score} (⬇️)</b>"
+                            change_str = f"{old_score} <b style='color:green'>➜ {new_score}</b>"
                     else:
                         # 沒變動
                         change_str = f"{new_score}"
