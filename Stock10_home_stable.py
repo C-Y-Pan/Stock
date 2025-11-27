@@ -497,25 +497,21 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v11.0 (Chandelier Exit):
-    解決「抱過一座山」的問題。
+    策略引擎 v13.0 (The Titan Grip):
+    針對「台積電恐慌被洗出場」進行邏輯分流。
     
-    [核心進化] ATR 吊燈停利
-    不再使用固定的 10% 或 20% 回檔。
-    出場線 = 持倉期間最高價 - (3 * ATR)。
-    這能動態適應股價波動，在頭部形成時更早離場。
+    [核心進化] 泰坦之握 (Titan Grip)
+    1. 身份識別：在策略端重新計算成交金額，區分 泰坦股 vs 游擊股。
+    2. 差異化防守：
+       - 對游擊股(小型)：維持「破底即走」，防止接到墜落飛刀。
+       - 對泰坦股(權值)：**廢除破底即走**。在恐慌買入後，給予 -20% 的超寬停損與 20天的築底期。
+         認定權值股的恐慌破底通常是假跌破 (Spring)，必須死抱。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
         
-    # 計算 ATR (用於出場)
-    high = df['High']; low = df['Low']; close = df['Close']
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().fillna(0)
-    atr_val = atr.values
-
     positions = []; reasons = []; actions = []; return_labels = []
     confidences = [] 
     
@@ -523,18 +519,32 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     entry_price = 0.0
     highest_price = 0.0 
     
-    # 吊燈停利線
-    chandelier_stop = 0.0
-    
     signal_low_price = 0.0
     cooldown_counter = 0 
     is_golden_pit_trade = False
+    days_in_trade = 0
     
+    # 1. 再次確認身份 (Titan vs Guerrilla)
+    # 使用平均成交金額判斷
     close_val = df['Close'].values
+    vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
+    # 簡單計算全域平均 (或是用滾動平均的最後值)
+    avg_dollar_vol = np.mean(close_val * vol_val)
+    if np.isnan(avg_dollar_vol): avg_dollar_vol = 0
+    
+    is_titan = avg_dollar_vol > 5_000_000_000 # 50億門檻
+    
+    # 轉 numpy
     low_val = df['Low'].values
     scores = df['Alpha_Score'].values
     ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
     score_logs = df['Score_Log'].values if 'Score_Log' in df.columns else [""] * len(df)
+    
+    # 計算 ATR 用於吊燈停利
+    high = df['High']; low = df['Low']; close = df['Close']
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().fillna(0).values
+    chandelier_stop = 0.0
 
     for i in range(len(df)):
         signal = position
@@ -545,7 +555,7 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
         curr_price = close_val[i]
         curr_low = low_val[i]
         curr_ma60 = ma60[i]
-        curr_atr = atr_val[i]
+        curr_atr = atr[i]
         
         this_confidence = 0
         
@@ -555,76 +565,112 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
             action_code = "Wait"
             reason_str = f"冷卻中 ({cooldown_counter})"
         
-        # --- 進場 ---
+        # --- 進場邏輯 ---
         elif position == 0:
             if curr_score >= buy_threshold:
                 signal = 1
                 entry_price = curr_price
                 highest_price = curr_price
-                # 初始化吊燈停損點
-                chandelier_stop = curr_price - (3 * curr_atr)
+                days_in_trade = 0
+                chandelier_stop = curr_price - (3 * curr_atr) # 初始化吊燈
                 
                 action_code = "Buy"
                 reason_str = score_logs[i]
                 this_confidence = int(curr_score)
                 
-                if curr_score >= 80: # 黃金坑定義
+                # 標記戰術
+                if curr_score >= 80:
                     is_golden_pit_trade = True
-                    signal_low_price = curr_low * 0.96
+                    signal_low_price = curr_low # 記錄進場低點
                 else:
                     is_golden_pit_trade = False
             else:
                 this_confidence = 0
 
-        # --- 出場 ---
+        # --- 出場邏輯 ---
         elif position == 1:
-            # 更新最高價
-            if curr_price > highest_price:
-                highest_price = curr_price
+            days_in_trade += 1
+            if curr_price > highest_price: highest_price = curr_price
             
-            # [核心] 更新吊燈停損點 (只能上移，不能下移)
+            # 更新吊燈 (只能上移)
             new_stop = highest_price - (3 * curr_atr)
-            if new_stop > chandelier_stop:
-                chandelier_stop = new_stop
+            if new_stop > chandelier_stop: chandelier_stop = new_stop
             
             pnl_pct = (curr_price - entry_price) / entry_price
             is_sell = False
             
-            # --- 戰術 A: 黃金坑特殊處理 (未過季線前) ---
+            # ============================================
+            # 戰術 A: 黃金坑/恐慌單 (Golden Pit)
+            # ============================================
             if is_golden_pit_trade:
+                # 若還在季線下 (逆勢階段)
                 if curr_price < curr_ma60:
-                    # 破底即走
-                    if curr_price < signal_low_price:
-                        is_sell = True; reason_str = "破底失敗"
-                    elif pnl_pct < -0.15:
-                        is_sell = True; reason_str = "災難停損"
+                    
+                    # [核心分流] 泰坦股 vs 游擊股
+                    if is_titan:
+                        # --- 泰坦模式 (Titan Grip) ---
+                        # 權值股在恐慌時，我們假設它不會倒，破底通常是洗盤
+                        # 規則：不設破底停損，只設災難停損 (-20%)
+                        if pnl_pct < -0.20:
+                            is_sell = True
+                            reason_str = "災難停損(泰坦)"
+                        elif days_in_trade > 40 and pnl_pct < -0.10:
+                            # 如果抱了兩個月還在賠錢，才承認看錯
+                            is_sell = True
+                            reason_str = "時間停損"
+                        else:
+                            # 死抱！無視破底！
+                            is_sell = False
+                            reason_str = "泰坦護盤中"
+                            
+                    else:
+                        # --- 游擊模式 (Guerrilla) ---
+                        # 小型股破底可能就是下市，必須跑
+                        # 給予 3 天觀察期，3天後若破底則停損
+                        if days_in_trade > 3 and curr_price < signal_low_price * 0.96:
+                            is_sell = True
+                            reason_str = "破底停損"
+                        elif pnl_pct < -0.15:
+                            is_sell = True
+                            reason_str = "災難停損"
+                        else:
+                            is_sell = False
+                            reason_str = "築底觀察"
                 else:
-                    is_golden_pit_trade = False # 站上季線，解除保護
-            
-            # --- 戰術 B: 一般順勢 / 已轉正波段 ---
+                    # 站上季線 -> 成功轉正，解除特殊保護
+                    is_golden_pit_trade = False 
+
+            # ============================================
+            # 戰術 B: 順勢單 / 已轉正單
+            # ============================================
             if not is_golden_pit_trade and not is_sell:
                 
-                # 1. [核心修正] 觸發吊燈停利
+                # 1. 吊燈停利 (主要出場)
                 if curr_price < chandelier_stop:
                     is_sell = True
-                    reason_str = "吊燈停利(趨勢結束)"
+                    reason_str = "吊燈停利"
                 
-                # 2. 評分顯著轉空 (v16.3 分數會變負，這裡更靈敏)
+                # 2. 評分轉空
                 elif curr_score < -20:
                     is_sell = True
                     reason_str = "評分轉空"
                     
-                # 3. 破季線且分數弱
-                elif curr_price < curr_ma60 and curr_score < 0:
-                    is_sell = True
-                    reason_str = "跌破季線"
+                # 3. 破季線保護 (泰坦股給寬容一點，游擊股嚴格一點)
+                elif curr_price < curr_ma60:
+                    if is_titan:
+                        # 泰坦股破季線，再觀察一下，除非分數也很爛
+                        if curr_score < -10: 
+                            is_sell = True; reason_str = "破季線轉弱"
+                    else:
+                        is_sell = True; reason_str = "跌破季線"
 
+            # 執行賣出
             if is_sell:
                 signal = 0
                 action_code = "Sell"
                 sign = "+" if pnl_pct > 0 else ""
                 ret_label = f"{sign}{pnl_pct*100:.1f}%"
-                cooldown_counter = 3
+                cooldown_counter = 5
             
             this_confidence = 0
 
@@ -641,7 +687,7 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 補回績效與大盤計算
+    # 績效
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     cost_series = pd.Series(0.0, index=df.index)
@@ -652,6 +698,7 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
+
 
 
 # 修改後：傳遞成本參數
