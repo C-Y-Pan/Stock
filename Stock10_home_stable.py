@@ -497,17 +497,16 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, buy_threshold=50, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v13.0 (The Titan Grip):
-    針對「台積電恐慌被洗出場」進行邏輯分流。
+    策略引擎 v14.0 (Zen Mode):
+    解決「過度交易磨損利潤」的問題。
     
-    [核心進化] 泰坦之握 (Titan Grip)
-    1. 身份識別：在策略端重新計算成交金額，區分 泰坦股 vs 游擊股。
-    2. 差異化防守：
-       - 對游擊股(小型)：維持「破底即走」，防止接到墜落飛刀。
-       - 對泰坦股(權值)：**廢除破底即走**。在恐慌買入後，給予 -20% 的超寬停損與 20天的築底期。
-         認定權值股的恐慌破底通常是假跌破 (Spring)，必須死抱。
+    [核心進化] 泰坦禪意 (Titan Zen)
+    對於權值股 (Titan)：
+    1. 買進：只要分數轉正 (>50) 且趨勢向上，就買。
+    2. 賣出：**廢除所有震盪停利**。唯一的賣點是「收盤價跌破季線」。
+    3. 這將確保吃到 90% 的主升段，中間無論怎麼洗都不下車。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -517,169 +516,99 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     
     position = 0
     entry_price = 0.0
-    highest_price = 0.0 
     
-    signal_low_price = 0.0
-    cooldown_counter = 0 
-    is_golden_pit_trade = False
-    days_in_trade = 0
-    
-    # 1. 再次確認身份 (Titan vs Guerrilla)
-    # 使用平均成交金額判斷
+    # 身份識別
     close_val = df['Close'].values
     vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
-    # 簡單計算全域平均 (或是用滾動平均的最後值)
     avg_dollar_vol = np.mean(close_val * vol_val)
     if np.isnan(avg_dollar_vol): avg_dollar_vol = 0
+    is_titan = avg_dollar_vol > 5_000_000_000 
     
-    is_titan = avg_dollar_vol > 5_000_000_000 # 50億門檻
-    
-    # 轉 numpy
-    low_val = df['Low'].values
-    scores = df['Alpha_Score'].values
     ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
-    score_logs = df['Score_Log'].values if 'Score_Log' in df.columns else [""] * len(df)
+    scores = df['Alpha_Score'].values
     
-    # 計算 ATR 用於吊燈停利
-    high = df['High']; low = df['Low']; close = df['Close']
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    # 計算 ATR (僅供小型股使用)
+    high = df['High']; low = df['Low']
+    tr = pd.concat([high - low, (high - close_val).abs(), (low - close_val).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean().fillna(0).values
-    chandelier_stop = 0.0
+    highest_price = 0.0
 
     for i in range(len(df)):
         signal = position
         reason_str = ""
         action_code = "Hold" if position == 1 else "Wait"
         ret_label = ""
-        curr_score = scores[i]
+        
         curr_price = close_val[i]
-        curr_low = low_val[i]
+        curr_score = scores[i]
         curr_ma60 = ma60[i]
-        curr_atr = atr[i]
-        
-        this_confidence = 0
-        
-        # --- 冷卻期 ---
-        if cooldown_counter > 0:
-            cooldown_counter -= 1
-            action_code = "Wait"
-            reason_str = f"冷卻中 ({cooldown_counter})"
         
         # --- 進場邏輯 ---
-        elif position == 0:
+        if position == 0:
+            # 門檻稍微放寬到 50，因為我們用 Z-Score 計算，50 已經是很強的標準差了
             if curr_score >= buy_threshold:
-                signal = 1
-                entry_price = curr_price
-                highest_price = curr_price
-                days_in_trade = 0
-                chandelier_stop = curr_price - (3 * curr_atr) # 初始化吊燈
-                
-                action_code = "Buy"
-                reason_str = score_logs[i]
-                this_confidence = int(curr_score)
-                
-                # 標記戰術
-                if curr_score >= 80:
-                    is_golden_pit_trade = True
-                    signal_low_price = curr_low # 記錄進場低點
+                # 額外濾網：如果是權值股，必須在季線上才買 (順勢)
+                # 除非是恐慌抄底 (>80分)
+                if is_titan and curr_price < curr_ma60 and curr_score < 80:
+                    pass # 權值股空頭不接刀
                 else:
-                    is_golden_pit_trade = False
-            else:
-                this_confidence = 0
-
+                    signal = 1
+                    entry_price = curr_price
+                    highest_price = curr_price
+                    action_code = "Buy"
+                    reason_str = "趨勢啟動" if curr_score < 80 else "恐慌抄底"
+        
         # --- 出場邏輯 ---
         elif position == 1:
-            days_in_trade += 1
             if curr_price > highest_price: highest_price = curr_price
-            
-            # 更新吊燈 (只能上移)
-            new_stop = highest_price - (3 * curr_atr)
-            if new_stop > chandelier_stop: chandelier_stop = new_stop
-            
-            pnl_pct = (curr_price - entry_price) / entry_price
             is_sell = False
             
             # ============================================
-            # 戰術 A: 黃金坑/恐慌單 (Golden Pit)
+            # [核心差異] 泰坦股 vs 游擊股
             # ============================================
-            if is_golden_pit_trade:
-                # 若還在季線下 (逆勢階段)
+            
+            if is_titan:
+                # --- 泰坦禪意模式 (Titan Zen) ---
+                # 只有一條規則：破季線就跑。
+                # 只要季線有撐，就算回檔 20%、法人大賣、分數歸零，都視為雜訊。
+                # (除非是恐慌抄底單，那邊有另外的深停損保護，這裡簡化為統一邏輯)
+                
                 if curr_price < curr_ma60:
-                    
-                    # [核心分流] 泰坦股 vs 游擊股
-                    if is_titan:
-                        # --- 泰坦模式 (Titan Grip) ---
-                        # 權值股在恐慌時，我們假設它不會倒，破底通常是洗盤
-                        # 規則：不設破底停損，只設災難停損 (-20%)
-                        if pnl_pct < -0.20:
-                            is_sell = True
-                            reason_str = "災難停損(泰坦)"
-                        elif days_in_trade > 40 and pnl_pct < -0.10:
-                            # 如果抱了兩個月還在賠錢，才承認看錯
-                            is_sell = True
-                            reason_str = "時間停損"
-                        else:
-                            # 死抱！無視破底！
-                            is_sell = False
-                            reason_str = "泰坦護盤中"
-                            
-                    else:
-                        # --- 游擊模式 (Guerrilla) ---
-                        # 小型股破底可能就是下市，必須跑
-                        # 給予 3 天觀察期，3天後若破底則停損
-                        if days_in_trade > 3 and curr_price < signal_low_price * 0.96:
-                            is_sell = True
-                            reason_str = "破底停損"
-                        elif pnl_pct < -0.15:
-                            is_sell = True
-                            reason_str = "災難停損"
-                        else:
-                            is_sell = False
-                            reason_str = "築底觀察"
-                else:
-                    # 站上季線 -> 成功轉正，解除特殊保護
-                    is_golden_pit_trade = False 
-
-            # ============================================
-            # 戰術 B: 順勢單 / 已轉正單
-            # ============================================
-            if not is_golden_pit_trade and not is_sell:
+                    # 給予 1% 的緩衝，避免假跌破
+                    if curr_price < curr_ma60 * 0.99:
+                        is_sell = True
+                        reason_str = "跌破季線(趨勢結束)"
                 
-                # 1. 吊燈停利 (主要出場)
+                # 唯一的例外：災難停損 (防黑天鵝)
+                elif (curr_price - entry_price) / entry_price < -0.15:
+                    is_sell = True
+                    reason_str = "災難停損"
+                    
+            else:
+                # --- 游擊靈活模式 (Guerrilla) ---
+                # 維持原本的敏捷邏輯：吊燈停利 + 評分轉弱
+                chandelier_stop = highest_price - (3 * atr[i])
+                
                 if curr_price < chandelier_stop:
-                    is_sell = True
-                    reason_str = "吊燈停利"
-                
-                # 2. 評分轉空
+                    is_sell = True; reason_str = "吊燈停利"
                 elif curr_score < -20:
-                    is_sell = True
-                    reason_str = "評分轉空"
-                    
-                # 3. 破季線保護 (泰坦股給寬容一點，游擊股嚴格一點)
+                    is_sell = True; reason_str = "評分轉空"
                 elif curr_price < curr_ma60:
-                    if is_titan:
-                        # 泰坦股破季線，再觀察一下，除非分數也很爛
-                        if curr_score < -10: 
-                            is_sell = True; reason_str = "破季線轉弱"
-                    else:
-                        is_sell = True; reason_str = "跌破季線"
+                    is_sell = True; reason_str = "破季線"
 
-            # 執行賣出
             if is_sell:
                 signal = 0
                 action_code = "Sell"
-                sign = "+" if pnl_pct > 0 else ""
-                ret_label = f"{sign}{pnl_pct*100:.1f}%"
-                cooldown_counter = 5
-            
-            this_confidence = 0
+                pnl = (curr_price - entry_price) / entry_price * 100
+                sign = "+" if pnl > 0 else ""
+                ret_label = f"{sign}{pnl:.1f}%"
 
         position = signal
         positions.append(signal)
         reasons.append(reason_str)
         actions.append(action_code)
         return_labels.append(ret_label)
-        confidences.append(this_confidence)
+        confidences.append(int(curr_score))
 
     df['Position'] = positions
     df['Reason'] = reasons
@@ -687,7 +616,7 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 績效
+    # 績效...
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     cost_series = pd.Series(0.0, index=df.index)
@@ -965,19 +894,13 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v20.0 (The Smart Aggressor):
-    針對「飆股爆量被誤判」與「盤整均線被雙巴」的最終修正。
+    Alpha Score v21.0 (The Analog Signal):
+    解決「分數死板均一」的問題。
     
-    [核心進化]
-    1. 攻擊量識別 (Ignition Volume):
-       - 在小型股飆升段，爆量往往是攻擊訊號。
-       - 修正：若 Vol_Z > 3.0 但 K線強勢 (實體紅K)，判定為「主力點火」，給予極高分。
-       - 只有出現「避雷針/長上影」配合爆量，才視為竭盡。
-       
-    2. 唐奇安突破 (Donchian Breakout):
-       - 解決盤整區均線糾纏的問題。
-       - 修正：不再單看站上季線。必須「創20日新高 (Break 20-Day High)」才准買進。
-       - 這能過濾掉 90% 的盤整雜訊。
+    [核心進化] 純數學推導
+    1. 移除所有 `score = 85` 這種人工賦值。
+    2. 改用 Z-Score 加權總和，讓分數呈現連續的類比變化。
+    3. 這樣您就能看到趨勢是「逐漸轉強」還是「瞬間爆發」。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -988,8 +911,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     has_chip_data = 'Inst_Net_Buy' in df.columns
     if not has_chip_data: df['Inst_Net_Buy'] = 0 
     
-    close = df['Close']; high = df['High']; low = df['Low']; open_p = df['Open']
-    
+    close = df['Close']
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
     if 'Volume' not in df.columns: df['Volume'] = 0
@@ -997,147 +919,85 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
     
-    # 身份識別
+    # 判斷股本 (用於權重分配，但不影響分數連續性)
     avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
     if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
-    is_titan_mode = avg_dollar_vol > 5_000_000_000 
-    
-    # [新增] 唐奇安通道 (過去 20 天最高價，不含今日)
-    donchian_high = high.shift(1).rolling(20).max()
+    is_titan = avg_dollar_vol > 5_000_000_000 
 
-    # Z-Score 計算
-    vol_mean = df['Volume'].rolling(60).mean()
-    vol_std = df['Volume'].rolling(60).std().replace(0, 1)
-    vol_z = (df['Volume'] - vol_mean) / vol_std
+    # ====================================================
+    # 2. 計算連續性因子 (Continuous Factors)
+    # ====================================================
     
-    inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().fillna(1)
-    
+    # A. 趨勢強度 (Slope Z-Score)
     ma60_diff = df['MA60'].diff()
-    slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std().fillna(1)
-
-    # 恐慌條件
-    bias_60 = ((close - df['MA60']) / df['MA60']) * 100
-    curr_rsi = df['RSI'].fillna(50)
-    vix = df['VIX']
+    slope_mean = ma60_diff.rolling(60).mean()
+    slope_std = ma60_diff.rolling(60).std().replace(0, 0.001)
+    slope_z = (ma60_diff - slope_mean) / slope_std
+    slope_z = slope_z.fillna(0)
     
-    # K線型態分析
-    body_len = (close - open_p).abs()
-    upper_shadow = high - np.maximum(close, open_p)
-    # 實體紅K：收盤 > 開盤 且 實體長度夠大
-    is_strong_candle = (close > open_p) & (body_len > (high - low) * 0.5)
-    # 避雷針：上影線很長
-    is_shooting_star = upper_shadow > body_len
+    # B. 籌碼動能 (Inst Z-Score)
+    inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
+    inst_mean = inst_rate.rolling(60).mean()
+    inst_std = inst_rate.rolling(60).std().replace(0, 0.01)
+    inst_z = (inst_rate - inst_mean) / inst_std
+    inst_z = inst_z.fillna(0)
+    
+    # C. 乖離率倒數 (Mean Reversion Potential)
+    # 用於恐慌抄底：乖離越負，分數越高
+    bias_60 = (close - df['MA60']) / df['MA60']
+    bias_z = (bias_60 - bias_60.rolling(60).mean()) / bias_60.rolling(60).std().fillna(1)
+    # 逆勢分數：當乖離率極低(負)時，給予正向分數
+    reversion_score = -bias_z 
 
     # ====================================================
-    # 2. 決策邏輯 (分流)
+    # 3. 合成總分 (Weighted Sum)
     # ====================================================
-    final_score = np.zeros(len(df))
+    # 根據股性調整權重
+    if is_titan:
+        # 權值股：重趨勢 (60%) + 重籌碼 (40%)
+        w_trend = 0.6
+        w_chip = 0.4
+        mode_log = "🐘 泰坦"
+    else:
+        # 小型股：籌碼決定一切 (70%)
+        w_trend = 0.3
+        w_chip = 0.7
+        mode_log = "🐆 游擊"
+    
+    # 基礎分 (趨勢 + 籌碼)
+    base_score = (slope_z * w_trend + inst_z * w_chip) * 30 
+    
+    # 恐慌加分 (僅在極端恐慌時生效)
+    # 當 VIX 高且乖離大時，疊加逆勢分數
+    vix_panic = np.where(df['VIX'] > 25, 1, 0)
+    panic_bonus = reversion_score * 40 * vix_panic
+    
+    # 最終分數 = 基礎分 + 恐慌加分
+    final_score_series = base_score + panic_bonus
+    
+    # 寫入 (平滑化處理)
+    # 使用 3日 EMA 讓曲線更滑順，不再是鋸齒狀
+    df['Alpha_Score'] = final_score_series.ewm(span=3).mean().clip(-100, 100)
+    
+    # 生成 Log
     logs = []
-    
-    # 轉 Numpy
-    close_val = close.values
-    donchian_val = donchian_high.values
-    ma60_val = df['MA60'].values
-    slope_val = slope_z.values
-    inst_z_val = inst_z.values
-    vol_z_val = vol_z.fillna(0).values
-    
-    strong_candle_val = is_strong_candle.values
-    shooting_star_val = is_shooting_star.values
-    
-    # 恐慌階梯
-    panic_val = (((vix > 30) & (curr_rsi < 35)) | ((bias_60 < -15) & (curr_rsi < 25))).values
-    
-    ma60_slope_raw = df['MA60'].diff(5).fillna(0).values 
+    score_val = df['Alpha_Score'].values
     
     for i in range(len(df)):
-        score = 0
-        log = "盤整"
-        
-        # --- 1. 恐慌黃金坑 (最高優先) ---
-        if panic_val[i]:
-            score = 95
-            log = "💎 恐慌黃金坑"
-            
-        # =================================================
-        # 分流 A: 泰坦模式 (權值股) - 邏輯維持 v19.0 (因權值股表現良好)
-        # =================================================
-        elif is_titan_mode:
-            if close_val[i] > ma60_val[i] and ma60_slope_raw[i] > 0:
-                score = 75
-                log = "🐘 權值順勢"
-                if inst_z_val[i] > 0.5 or slope_val[i] > 1.0:
-                    score = 85
-                    log = "🚀 權值強勢"
-            elif close_val[i] < ma60_val[i]:
-                score = -40
-                log = "📉 權值轉弱"
-                
-        # =================================================
-        # 分流 B: 游擊模式 (中小型股) - [大改版]
-        # =================================================
-        else:
-            # --- 量能判斷 (The Volume Judge) ---
-            is_climax_volume = vol_z_val[i] > 3.0
-            
-            # 狀況 1: 爆天量 + 爛K線 (避雷針/收黑) -> 這是真的竭盡
-            if is_climax_volume and (shooting_star_val[i] or close_val[i] < open_p.values[i]):
-                score = -50
-                log = "⚠️ 爆量出貨(避雷針)"
-                
-            # 狀況 2: 爆天量 + 強紅K -> 這是攻擊訊號 (Ignition)
-            elif is_climax_volume and strong_candle_val[i]:
-                # 這裡不再扣分，反而加分，但要求已經突破
-                if close_val[i] > donchian_val[i]:
-                    score = 90
-                    log = "🔥 主力點火攻擊"
-                else:
-                    score = 60 # 還沒突破，先觀察
-                    log = "👀 底部吸籌"
-            
-            # --- 趨勢判斷 (Donchian Breakout) ---
-            # 狀況 3: 創 20日新高 (突破盤整區)
-            elif close_val[i] > donchian_val[i]:
-                # 必須有季線支撐 (季線不能下彎太嚴重)
-                if slope_val[i] > -0.5:
-                    score = 75
-                    log = "🚀 創20日高(突破)"
-                    
-                    # 如果有法人買超，加分
-                    if inst_z_val[i] > 0.5:
-                        score = 85
-                        log = "🚀 籌碼突破"
-                else:
-                    score = 0
-                    log = "💤 逆勢突破(觀望)"
-                    
-            # 狀況 4: 盤整區 (沒創新高，也沒爆量)
-            # 在這裡，就算站上季線也不給分 (解決左側雙巴)
-            else:
-                if close_val[i] < ma60_val[i]:
-                    score = -20
-                    log = "弱勢整理"
-                else:
-                    score = 0
-                    log = "區間震盪(等待突破)"
-
-        final_score[i] = score
+        if score_val[i] > 80: log = f"{mode_log} 極強"
+        elif score_val[i] > 50: log = f"{mode_log} 偏多"
+        elif score_val[i] < -50: log = f"{mode_log} 偏空"
+        else: log = "盤整"
         logs.append(log)
-
-    # 輸出 (峰值保留)
-    raw_series = pd.Series(final_score, index=df.index)
-    smooth_series = raw_series.rolling(3, min_periods=1).mean()
-    df['Alpha_Score'] = np.maximum(raw_series, smooth_series).clip(-100, 100)
+        
     df['Score_Log'] = logs
-    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
     # 輔助
     df['Slope_Z'] = slope_z
-    df['Vol_Z'] = vol_z
     df['Inst_Z'] = inst_z
     
     return df
+
 
 
 # ==========================================
