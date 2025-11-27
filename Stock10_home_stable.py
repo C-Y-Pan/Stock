@@ -192,107 +192,88 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_master_stock_data():
     """
-    從證交所與櫃買中心獲取全市場股票、ETF (含上市、上櫃、主動式、債券型)
+    [終極版] 從證交所與櫃買中心獲取「每日收盤行情」(STOCK_DAY_ALL)
+    策略：不分股票/ETF/ETN，只要市場上有報價的商品全數抓取，確保無遺漏。
     """
-    stock_list = []
+    stock_map = {} # 使用字典去重 (代號為 Key)
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Accept': 'application/json'
     }
     
     # ==========================================
-    # 1. 上市股票 (TWSE Equities)
+    # 1. 上市全市場行情 (TWSE All Daily Quotes)
     # ==========================================
+    # 這個 API 包含上市的所有：股票、ETF、ETN、特別股、權證...
     try:
-        url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=5, verify=False) 
+        url_twse_all = "https://openapi.twse.com.tw/v1/exchangeReport/STOCK_DAY_ALL"
+        res = requests.get(url_twse_all, headers=headers, timeout=8, verify=False) 
         if res.status_code == 200:
             data = res.json()
             for row in data:
-                if row.get('Code') and row.get('Name'):
-                    stock_list.append({
-                        "代號": row.get('Code'), "名稱": row.get('Name'), "市場": "上市",
-                        "本益比": row.get('PEratio', '-'), "殖利率(%)": row.get('DividendYield', '-'), "股價淨值比": row.get('PBratio', '-')
-                    })
-    except Exception as e:
-        print(f"TWSE Equities Error: {e}")
-
-    # ==========================================
-    # 2. 上櫃股票 (TPEx Equities)
-    # ==========================================
-    try:
-        url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
-        res = requests.get(url_tpex, headers=headers, timeout=5, verify=False)
-        if res.status_code == 200:
-            data = res.json()
-            for row in data:
-                if row.get('SecuritiesCompanyCode') and row.get('CompanyName'):
-                    stock_list.append({
-                        "代號": row.get('SecuritiesCompanyCode'), "名稱": row.get('CompanyName'), "市場": "上櫃",
-                        "本益比": row.get('PriceEarningRatio', '-'), "殖利率(%)": row.get('YieldRatio', '-'), "股價淨值比": row.get('PriceBookRatio', '-')
-                    })
-    except Exception as e:
-        print(f"TPEx Equities Error: {e}")
-
-    # ==========================================
-    # 3. 上市 ETF (TWSE ETFs)
-    # ==========================================
-    try:
-        url_etf_twse = "https://openapi.twse.com.tw/v1/securities/ETF"
-        res = requests.get(url_etf_twse, headers=headers, timeout=5, verify=False)
-        if res.status_code == 200:
-            data = res.json()
-            for row in data:
-                if row.get('Code') and row.get('Name'):
-                    stock_list.append({
-                        "代號": row.get('Code'), "名稱": row.get('Name'), "市場": "上市ETF",
-                        "本益比": "-", "殖利率(%)": "-", "股價淨值比": "-"
-                    })
-    except Exception as e:
-        print(f"TWSE ETF Error: {e}")
-
-    # ==========================================
-    # 4. [關鍵新增] 上櫃 ETF (TPEx ETFs - 含債券/主動式)
-    # ==========================================
-    try:
-        # 櫃買中心 ETF 基本資料 API
-        url_etf_tpex = "https://www.tpex.org.tw/openapi/v1/etf_security_info"
-        res = requests.get(url_etf_tpex, headers=headers, timeout=5, verify=False)
-        if res.status_code == 200:
-            data = res.json()
-            for row in data:
-                # 櫃買 API 的欄位名稱通常是 SecuritiesCode / SecuritiesName
-                code = row.get('SecuritiesCode')
-                name = row.get('SecuritiesName')
+                code = row.get('Code')
+                name = row.get('Name')
                 if code and name:
-                    stock_list.append({
-                        "代號": code, "名稱": name, "市場": "上櫃ETF",
+                    stock_map[code] = {
+                        "代號": code, 
+                        "名稱": name, 
+                        "市場": "上市",
+                        # 行情表不含基本面數據，預設給 "-"，確保搜尋功能正常
                         "本益比": "-", "殖利率(%)": "-", "股價淨值比": "-"
-                    })
+                    }
     except Exception as e:
-        print(f"TPEx ETF Error: {e}")
-        
-    # ==========================================
-    # 5. Fallback 防呆清單 (手動補強熱門標的)
-    # ==========================================
-    current_codes = {x['代號'] for x in stock_list}
-    # 這裡可以手動加入特定的主動式 ETF 代號，以防 API 資料更新不及
-    fallback_etfs = [
-        ("0050", "元大台灣50"), ("0056", "元大高股息"), ("00878", "國泰永續高股息"),
-        ("00679B", "元大美債20年"), ("00687B", "國泰20年美債"), ("00937B", "群益ESG投等債20+"),
-        ("00933B", "國泰10Y+金融債") 
-    ]
-    for code, name in fallback_etfs:
-        if code not in current_codes:
-            stock_list.append({
-                "代號": code, "名稱": name, "市場": "ETF(Manual)",
-                "本益比": "-", "殖利率(%)": "-", "股價淨值比": "-"
-            })
+        print(f"TWSE All Quote Error: {e}")
 
-    if not stock_list:
+    # ==========================================
+    # 2. 上櫃全市場行情 (TPEx All Daily Quotes)
+    # ==========================================
+    # 這個 API 包含上櫃的所有商品
+    try:
+        url_tpex_all = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_quotes"
+        res = requests.get(url_tpex_all, headers=headers, timeout=8, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            for row in data:
+                code = row.get('SecuritiesCompanyCode')
+                name = row.get('CompanyName')
+                if code and name:
+                    stock_map[code] = {
+                        "代號": code, 
+                        "名稱": name, 
+                        "市場": "上櫃",
+                        "本益比": "-", "殖利率(%)": "-", "股價淨值比": "-"
+                    }
+    except Exception as e:
+        print(f"TPEx All Quote Error: {e}")
+
+    # ==========================================
+    # 3. [選擇性] 補充個股基本面數據 (Optional)
+    # ==========================================
+    # 為了讓一般股票仍能顯示本益比，我們嘗試抓取 PE 表來更新 stock_map
+    # 如果這裡失敗也沒關係，至少 stock_map 裡已經有代號和名稱了 (這最重要)
+    try:
+        url_pe = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
+        res = requests.get(url_pe, headers=headers, timeout=3, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            for row in data:
+                c = row.get('Code')
+                if c in stock_map:
+                    stock_map[c]['本益比'] = row.get('PEratio', '-')
+                    stock_map[c]['殖利率(%)'] = row.get('DividendYield', '-')
+                    stock_map[c]['股價淨值比'] = row.get('PBratio', '-')
+    except: pass
+
+    # ==========================================
+    # 4. 轉為 DataFrame 並回傳
+    # ==========================================
+    if not stock_map:
+        # 萬一連線全掛，回傳空表
         return pd.DataFrame(columns=["代號", "名稱", "市場", "本益比", "殖利率(%)", "股價淨值比"])
-        
-    return pd.DataFrame(stock_list)
+    
+    # 將字典轉回 List 再轉 DataFrame
+    final_list = list(stock_map.values())
+    return pd.DataFrame(final_list)
 
 
 
