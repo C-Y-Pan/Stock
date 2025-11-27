@@ -813,10 +813,10 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v7.0 (Trend Unchained):
-    趨勢解鎖版。
-    引入 ADX 指標：當趨勢形成時 (ADX>25)，解除所有「過熱扣分」，允許分數飆高以捕捉主升段。
-    只在盤整時才使用均值回歸邏輯。
+    Alpha Score v7.1 (The Trend Bridge):
+    修復「主升段踏空」問題。
+    新增「初升段 (Early Trend)」識別：只要均線多頭排列，即便 ADX 不強，也給予 65+ 分數，
+    防止在起漲點因 RSI 過熱而被系統誤判為賣出。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -833,8 +833,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
-    # 計算 ADX (趨勢強度關鍵)
-    # ------------------------------------------------
+    # 計算 ADX
     high = df['High']; low = df['Low']; close = df['Close']
     plus_dm = high.diff()
     minus_dm = low.diff()
@@ -842,92 +841,97 @@ def calculate_alpha_score(df, margin_df, short_df):
     minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
     tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
     atr = tr.rolling(14).mean()
-    
     plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
     minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
     dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
-    # ADX: 數值越大，代表趨勢越強 (不分多空)
     df['ADX'] = dx.rolling(14).mean().fillna(0)
-    # ------------------------------------------------
 
     bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
     
     # ====================================================
-    # 2. 狀態定義 (Regime Definition)
+    # 2. 狀態定義 (Regime)
     # ====================================================
     
-    # A. 強力多頭 (Super Trend)
-    # 條件：均線多頭排列 + ADX > 25 (趨勢噴出中)
-    # 在這種狀態下，任何回檔都是買點，且絕不猜頭
+    # A. 恐慌黃金坑 (最優先)
+    # VIX高 + RSI低 + 乖離大
+    is_panic = (df['VIX'] > 25) & (curr_rsi < 30)
+    is_deep_value = (bias_60 < -15) & (curr_rsi < 30)
+    
+    # B. 強力噴出 (Super Trend)
+    # 均線多頭 + ADX 強
     is_super_trend = (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & (df['ADX'] > 25)
     
-    # B. 恐慌殺盤 (Panic)
-    # 條件：VIX高 + RSI低 (維持原本邏輯，抓黃金坑)
-    is_panic = (df['VIX'] > 25) & (curr_rsi < 30)
+    # C. [新增] 初升段 / 溫和多頭 (Early Trend)
+    # 關鍵：只要站穩季線且均線多頭，就算 ADX 不強，也是多頭！
+    # 這就是填補真空帶的關鍵
+    is_early_trend = (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60'])
     
-    # C. 空頭/弱勢
-    is_downtrend = (df['Close'] < df['MA60']) & (~is_panic)
+    # D. 空頭
+    is_downtrend = (df['Close'] < df['MA60']) & (~is_panic) & (~is_deep_value)
 
     # ====================================================
-    # 3. 評分邏輯 (Logic Hierarchy)
+    # 3. 評分邏輯
     # ====================================================
     final_score = np.zeros(len(df))
     logs = []
     
-    # 轉 Numpy 加速
+    # 轉 Numpy
     rsi_arr = curr_rsi.values
     bias_arr = bias_60.values
-    super_trend_arr = is_super_trend.values
     panic_arr = is_panic.values
+    deep_val_arr = is_deep_value.values
+    super_arr = is_super_trend.values
+    early_arr = is_early_trend.values
     down_arr = is_downtrend.values
-    vol_arr = df['Volume'].values
-    vol_ma_arr = df['Vol_MA20'].values
     
     for i in range(len(df)):
         score = 0
         log = "盤整"
         
-        # --- 情境 1: 黃金坑 (最高優先) ---
-        if panic_arr[i] or (bias_arr[i] < -15 and rsi_arr[i] < 25):
+        # --- 1. 黃金坑 (95分) ---
+        if panic_arr[i] or deep_val_arr[i]:
             score = 95
             log = "💎 恐慌黃金坑"
             
-        # --- 情境 2: 強力多頭 (主升段) ---
-        elif super_trend_arr[i]:
-            # 只要是強勢趨勢，基礎分就是 80
-            score = 80
+        # --- 2. 強力噴出 (85分) ---
+        elif super_arr[i]:
+            score = 85
             log = "🚀 強勢噴出"
-            
-            # 順勢加分：量增價漲
-            if vol_arr[i] > vol_ma_arr[i]:
-                score += 10
-            
-            # [關鍵] 在此模式下，完全忽略 RSI 過熱和乖離過大
-            # 只有當 RSI 真的極度誇張 (>85) 才微幅警告，但不扣成負分
-            if rsi_arr[i] > 85:
-                score = 60 # 降至持有，但不賣出
+            # 只有極度過熱才微調，絕不賣出
+            if rsi_arr[i] > 85: 
+                score = 70 
                 log = "⚠️ 過熱警戒"
                 
-        # --- 情境 3: 空頭/弱勢 ---
+        # --- 3. [關鍵修正] 初升段 (65~75分) ---
+        # 只要均線多頭，基礎分就是 65 (確保會買進/持有)
+        elif early_arr[i]:
+            score = 65
+            log = "📈 趨勢成形"
+            
+            # 如果還沒過熱，加分
+            if rsi_arr[i] < 70:
+                score += 10 # 變 75
+            
+            # 在這裡，我們 *完全移除* 負乖離扣分
+            # 哪怕 RSI 75，只要在多頭排列中，最低也是 65 分 (持有)
+            
+        # --- 4. 空頭 (負分) ---
         elif down_arr[i]:
             score = -40
             log = "空頭抵抗"
-            # 只有極短線反彈才給分
-            if rsi_arr[i] < 20:
+            if rsi_arr[i] < 20: # 搶極短反彈
                 score = 50
                 log = "搶反彈"
                 
-        # --- 情境 4: 盤整 (無趨勢) ---
+        # --- 5. 盤整 (均值回歸) ---
+        # 只有不符合上述任何多頭條件時，才執行高出低進
         else:
-            # 使用原本的均值回歸邏輯
-            # 低買
-            if rsi_arr[i] < 40 or bias_arr[i] < -5:
+            if rsi_arr[i] < 40:
                 score = 60
                 log = "區間低檔"
-            # 高賣
-            elif rsi_arr[i] > 70 or bias_arr[i] > 10:
-                score = -20
+            elif rsi_arr[i] > 70:
+                score = -20 # 只有在盤整時，RSI高才賣
                 log = "區間高檔"
             else:
                 score = 0
@@ -936,9 +940,6 @@ def calculate_alpha_score(df, margin_df, short_df):
         final_score[i] = score
         logs.append(log)
 
-    # ====================================================
-    # 4. 輸出
-    # ====================================================
     final_series = pd.Series(final_score, index=df.index)
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
     df['Score_Log'] = logs
