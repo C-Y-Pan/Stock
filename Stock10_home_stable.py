@@ -881,10 +881,17 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v22.1 (Bug Fix Edition):
-    修復 KeyError。
-    將 vix_panic 轉為 numpy array (vix_panic_val) 後再進入迴圈，
-    解決日期索引與整數迴圈不兼容的問題。
+    Alpha Score v23.0 (The Panic Injector):
+    解決「恐慌時分數反應遲鈍」的問題。
+    
+    [核心進化] 直通式加分 (Direct Injection)
+    不再依賴僵化的 Z-Score 閾值來觸發恐慌訊號。
+    改用「線性增壓」邏輯：
+    1. VIX 增壓：VIX 只要超過 20 (警戒線)，每高 1 點，分數直接 +2。
+    2. 乖離增壓：股價只要在季線下，每低 1%，分數直接 +3。
+    
+    這確保了在「VIX 30 + 負乖離 10%」這種送分題出現時，
+    分數會由數學公式強制推升至 100 分，絕不錯過。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -909,7 +916,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_titan = avg_dollar_vol > 5_000_000_000 
 
     # ====================================================
-    # 2. 統計因子 (Z-Scores)
+    # 2. 統計因子 (Z-Scores) - 用於判斷趨勢強弱
     # ====================================================
     
     # A. 斜率 Z
@@ -922,12 +929,8 @@ def calculate_alpha_score(df, margin_df, short_df):
     inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().replace(0, 0.01)
     inst_z = inst_z.fillna(0)
     
-    # C. 乖離率 Z (用於恐慌判斷)
-    bias_60 = (close - df['MA60']) / df['MA60']
-    bias_z = (bias_60 - bias_60.rolling(60).mean()) / bias_60.rolling(60).std().fillna(1)
-
     # ====================================================
-    # 3. 合成總分 (Weighted Sum)
+    # 3. 合成總分 (The Calculation)
     # ====================================================
     
     if is_titan:
@@ -935,40 +938,59 @@ def calculate_alpha_score(df, margin_df, short_df):
     else:
         w_trend = 0.3; w_chip = 0.7; mode_log = "🐆 游擊"
     
-    # 基礎分計算 (以 50 為中心)
+    # [A] 基礎分 (50分中心)
+    # 反映正常的趨勢與籌碼狀態
     weighted_z = (slope_z * w_trend + inst_z * w_chip)
-    base_score = 50 + (weighted_z * 20)
+    base_score = 50 + (weighted_z * 15)
     
-    # 泰坦趨勢溢價 (Trend Premium)
-    is_bull_trend = (close > df['MA60']) & (ma60_diff > 0)
-    titan_bonus = np.where(is_titan & is_bull_trend, 15, 0)
+    # [B] 泰坦趨勢溢價
+    # 只要權值股在季線上，就給予 10 分的基本盤 (確保不輕易賣出)
+    titan_bonus = np.where((is_titan) & (close > df['MA60']), 10, 0)
     
-    # 恐慌加權 (Panic Bonus)
-    # VIX > 25 且 乖離 Z < -1.5
-    vix_panic_series = (df['VIX'] > 25) & (bias_z < -1.5)
-    panic_bonus = np.where(vix_panic_series, 50, 0)
+    # [C] 恐慌注油器 (Panic Injector) - 這是解決您問題的關鍵
+    # 1. VIX 溢價：VIX 每超過 20 一點，加 2 分
+    vix_excess = np.maximum(0, df['VIX'] - 20)
+    vix_score = vix_excess * 2.0  # VIX 30 -> +20分, VIX 40 -> +40分
     
-    # 總分合成
-    final_score_series = base_score + titan_bonus + panic_bonus
+    # 2. 乖離溢價：股價在季線下，每低 1%，加 3 分
+    # 負乖離越大 (bias_pct 越負)，加分越多
+    bias_pct = ((close - df['MA60']) / df['MA60']) * 100
+    bias_excess = np.maximum(0, -bias_pct) # 只取負乖離部分，轉為正數
+    
+    # 只有在 VIX 偏高 (>22) 時，負乖離才視為「黃金坑」，否則可能是「基本面轉差」
+    # 使用 sigmoid 函數或簡單的門檻來啟動
+    panic_activation = np.where(df['VIX'] > 22, 1.0, 0.0)
+    
+    # 乖離加分：跌 10% -> 30分
+    reversion_score = (bias_excess * 3.0) * panic_activation
+    
+    # [D] 最終總分
+    # 基礎分 + 趨勢溢價 + 恐慌溢價
+    final_score_series = base_score + titan_bonus + vix_score + reversion_score
     
     # 寫入 (平滑化)
-    df['Alpha_Score'] = final_score_series.rolling(3, min_periods=1).mean().clip(0, 100)
-    
-    # [核心修正] 將 Series 轉為 Numpy Array，供迴圈使用
-    score_val = df['Alpha_Score'].values
-    vix_panic_val = vix_panic_series.values  # <--- 這裡修正了
+    # 這裡平滑化不能太強，否則會把 V 型反轉的尖點磨掉
+    df['Alpha_Score'] = final_score_series.rolling(2, min_periods=1).mean().clip(0, 100)
     
     # 生成 Log
     logs = []
+    score_val = df['Alpha_Score'].values
+    vix_val = df['VIX'].values
     
     for i in range(len(df)):
-        if score_val[i] > 80: log = f"{mode_log} 極強"
-        elif score_val[i] > 60: log = f"{mode_log} 偏多"
-        elif score_val[i] < 40: log = f"{mode_log} 偏空"
-        else: log = "盤整"
+        log = mode_log # 預設
         
-        # 使用 numpy array 進行索引，這是安全的
-        if vix_panic_val[i]: log = "💎 恐慌機會"
+        # 優先顯示恐慌訊號
+        if vix_val[i] > 25 and score_val[i] > 80:
+            log = "💎 恐慌黃金坑"
+        elif score_val[i] > 80: 
+            log = f"{mode_log} 極強"
+        elif score_val[i] > 60: 
+            log = f"{mode_log} 偏多"
+        elif score_val[i] < 40: 
+            log = f"{mode_log} 偏空"
+        else: 
+            log = "盤整"
         
         logs.append(log)
         
