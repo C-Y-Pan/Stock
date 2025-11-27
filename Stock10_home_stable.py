@@ -437,13 +437,9 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v10.0 (The Flexible Trader):
-    真正的頂尖交易員邏輯：敢於逆勢抄底，但承認錯誤的速度極快。
-    
-    [核心進化] 破底即走 (Breakdown Exit)
-    1. 買進時，記錄當日最低價 (Signal Low) 作為防守線。
-    2. 黃金坑戰術中，如果收盤價跌破防守線，代表「抄底失敗」，立即停損 (通常 < 5%)。
-    3. 不再傻傻等到 -15% 才賣，大幅保留資本捕捉下一次機會。
+    策略引擎 v10.1 (Bug Fix):
+    補回遺漏的 'Cum_Market' 計算，修復繪圖時的 KeyError。
+    邏輯核心維持 v10.0 (破底即走 + 黃金坑戰術)。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -455,7 +451,7 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     entry_price = 0.0
     highest_price = 0.0 
     
-    # [新增] 防守價位 (進場當日最低點)
+    # 防守價位 (進場當日最低點)
     signal_low_price = 0.0
     
     cooldown_counter = 0 
@@ -463,7 +459,7 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     
     # 轉 numpy 加速
     close = df['Close'].values
-    low = df['Low'].values # 讀取最低價
+    low = df['Low'].values 
     scores = df['Alpha_Score'].values
     ma60 = df['MA60'].values if 'MA60' in df.columns else close 
     score_logs = df['Score_Log'].values if 'Score_Log' in df.columns else [""] * len(df)
@@ -496,14 +492,13 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
                 reason_str = score_logs[i]
                 this_confidence = int(curr_score)
                 
-                # [關鍵] 設定戰術與防守點
+                # 設定戰術與防守點
                 if curr_score >= 80:
                     is_golden_pit_trade = True
-                    # 抄底單的防守點：進場當日的最低價 (給予 1% 緩衝)
                     signal_low_price = curr_low * 0.99 
                 else:
                     is_golden_pit_trade = False
-                    signal_low_price = 0.0 # 順勢單不看這個
+                    signal_low_price = 0.0 
             else:
                 this_confidence = 0
 
@@ -516,43 +511,35 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
             
             is_sell = False
             
-            # --- 戰術 A: 黃金坑抄底 (Golden Pit) ---
+            # --- 戰術 A: 黃金坑抄底 ---
             if is_golden_pit_trade:
-                # 階段 1: 還在季線下 (逆勢階段)
+                # 階段 1: 還在季線下
                 if curr_price < curr_ma60:
-                    
-                    # [核心修正] 破底即走 (Fail Fast)
-                    # 如果收盤價跌破了「進場日的最低點」，承認看錯，馬上跑
+                    # [核心修正] 破底即走
                     if curr_price < signal_low_price:
                         is_sell = True
                         reason_str = "破底翻失敗(快逃)"
-                    
-                    # 雙重保險：萬一跳空大跌，還是要有硬停損
                     elif pnl_pct < -0.15:
                         is_sell = True
                         reason_str = "災難停損"
-                    
-                    # 只要沒破底，就給它時間震盪築底
                     else:
                         is_sell = False
                         reason_str = "築底防守中"
-                
-                # 階段 2: 站上季線 -> 成功轉為波段單
+                # 階段 2: 站上季線 -> 轉為波段
                 else:
-                    is_golden_pit_trade = False # 解除特殊狀態，回歸一般邏輯
+                    is_golden_pit_trade = False 
                     
-            # --- 戰術 B: 一般順勢 / 已轉正的波段單 ---
+            # --- 戰術 B: 一般順勢 ---
             if not is_golden_pit_trade and not is_sell:
-                
-                # 1. 移動停利 (獲利回吐保護)
+                # 1. 移動停利
                 if pnl_pct > 0.20 and dd_from_peak < -0.10:
                     is_sell = True
                     reason_str = "移動停利"
-                # 2. 趨勢破壞 (跌破季線 + 分數轉弱)
+                # 2. 趨勢破壞
                 elif curr_price < curr_ma60 and curr_score < 40:
                     is_sell = True
                     reason_str = "跌破季線"
-                # 3. 一般停損 (順勢單停損嚴格一點 -8%)
+                # 3. 一般停損
                 elif pnl_pct < -0.08:
                     is_sell = True
                     reason_str = "停損"
@@ -561,14 +548,11 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
                     is_sell = True
                     reason_str = "評分轉空"
 
-            # 執行賣出
             if is_sell:
                 signal = 0
                 action_code = "Sell"
                 sign = "+" if pnl_pct > 0 else ""
                 ret_label = f"{sign}{pnl_pct*100:.1f}%"
-                
-                # 賣出後冷卻，避免立刻又接回來
                 cooldown_counter = 3 
             
             this_confidence = 0
@@ -590,13 +574,20 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     # 績效計算
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
+    
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
+    
     df['Strategy_Return'] = (df['Real_Position'] * df['Market_Return']) - cost_series
+    
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
     
+    # [Fix] 補回這行，修復 KeyError
+    df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
+    
     return df
+
 # 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
     """
