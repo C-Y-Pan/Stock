@@ -192,7 +192,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 @st.cache_data(ttl=3600, show_spinner=False)
 def get_master_stock_data():
     """
-    從證交所與櫃買中心獲取全市場股票與 ETF 清單 (修復 ETF 搜尋不到的問題)
+    從證交所與櫃買中心獲取全市場股票、ETF (含上市、上櫃、主動式、債券型)
     """
     stock_list = []
     headers = {
@@ -200,12 +200,12 @@ def get_master_stock_data():
         'Accept': 'application/json'
     }
     
-    # ---------------------------------------
-    # 1. 上市個股 (TWSE Equities)
-    # ---------------------------------------
+    # ==========================================
+    # 1. 上市股票 (TWSE Equities)
+    # ==========================================
     try:
         url_twse = "https://openapi.twse.com.tw/v1/exchangeReport/BWIBBU_ALL"
-        res = requests.get(url_twse, headers=headers, timeout=10, verify=False) 
+        res = requests.get(url_twse, headers=headers, timeout=5, verify=False) 
         if res.status_code == 200:
             data = res.json()
             for row in data:
@@ -217,12 +217,12 @@ def get_master_stock_data():
     except Exception as e:
         print(f"TWSE Equities Error: {e}")
 
-    # ---------------------------------------
-    # 2. 上櫃個股 (TPEx Equities)
-    # ---------------------------------------
+    # ==========================================
+    # 2. 上櫃股票 (TPEx Equities)
+    # ==========================================
     try:
         url_tpex = "https://www.tpex.org.tw/openapi/v1/tpex_mainboard_peratio_analysis"
-        res = requests.get(url_tpex, headers=headers, timeout=10, verify=False)
+        res = requests.get(url_tpex, headers=headers, timeout=5, verify=False)
         if res.status_code == 200:
             data = res.json()
             for row in data:
@@ -234,13 +234,12 @@ def get_master_stock_data():
     except Exception as e:
         print(f"TPEx Equities Error: {e}")
 
-    # ---------------------------------------
-    # 3. [新增] 上市 ETF (TWSE ETFs)
-    # ---------------------------------------
+    # ==========================================
+    # 3. 上市 ETF (TWSE ETFs)
+    # ==========================================
     try:
-        # 使用證交所證券編碼 API 獲取 ETF
-        url_etf = "https://openapi.twse.com.tw/v1/securities/ETF"
-        res = requests.get(url_etf, headers=headers, timeout=10, verify=False)
+        url_etf_twse = "https://openapi.twse.com.tw/v1/securities/ETF"
+        res = requests.get(url_etf_twse, headers=headers, timeout=5, verify=False)
         if res.status_code == 200:
             data = res.json()
             for row in data:
@@ -251,17 +250,37 @@ def get_master_stock_data():
                     })
     except Exception as e:
         print(f"TWSE ETF Error: {e}")
+
+    # ==========================================
+    # 4. [關鍵新增] 上櫃 ETF (TPEx ETFs - 含債券/主動式)
+    # ==========================================
+    try:
+        # 櫃買中心 ETF 基本資料 API
+        url_etf_tpex = "https://www.tpex.org.tw/openapi/v1/etf_security_info"
+        res = requests.get(url_etf_tpex, headers=headers, timeout=5, verify=False)
+        if res.status_code == 200:
+            data = res.json()
+            for row in data:
+                # 櫃買 API 的欄位名稱通常是 SecuritiesCode / SecuritiesName
+                code = row.get('SecuritiesCode')
+                name = row.get('SecuritiesName')
+                if code and name:
+                    stock_list.append({
+                        "代號": code, "名稱": name, "市場": "上櫃ETF",
+                        "本益比": "-", "殖利率(%)": "-", "股價淨值比": "-"
+                    })
+    except Exception as e:
+        print(f"TPEx ETF Error: {e}")
         
-    # ---------------------------------------
-    # 4. [防呆] 如果 API 失敗，補入熱門 ETF
-    # ---------------------------------------
-    # 檢查是否已包含 0050，若無則手動加入常用清單，確保斷線時至少能用熱門股
+    # ==========================================
+    # 5. Fallback 防呆清單 (手動補強熱門標的)
+    # ==========================================
     current_codes = {x['代號'] for x in stock_list}
+    # 這裡可以手動加入特定的主動式 ETF 代號，以防 API 資料更新不及
     fallback_etfs = [
-        ("0050", "元大台灣50"), ("0056", "元大高股息"), ("00878", "國泰永續高股息"), 
-        ("00929", "復華台灣科技優息"), ("00919", "群益台灣精選高息"), ("006208", "富邦台50"),
-        ("00713", "元大台灣高息低波"), ("00679B", "元大美債20年"), ("00687B", "國泰20年美債"),
-        ("00940", "元大台灣價值高息"), ("00881", "國泰台灣5G+")
+        ("0050", "元大台灣50"), ("0056", "元大高股息"), ("00878", "國泰永續高股息"),
+        ("00679B", "元大美債20年"), ("00687B", "國泰20年美債"), ("00937B", "群益ESG投等債20+"),
+        ("00933B", "國泰10Y+金融債") 
     ]
     for code, name in fallback_etfs:
         if code not in current_codes:
@@ -274,6 +293,7 @@ def get_master_stock_data():
         return pd.DataFrame(columns=["代號", "名稱", "市場", "本益比", "殖利率(%)", "股價淨值比"])
         
     return pd.DataFrame(stock_list)
+
 
 
 def get_stock_name(ticker):
