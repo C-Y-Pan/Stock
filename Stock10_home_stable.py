@@ -918,19 +918,24 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v16.3 (Zero-Gravity):
-    修正「分數虛高、無法及時轉空」的問題。
+    Alpha Score v17.0 (The Structural Guard):
+    針對「寬幅震盪盤頻繁雙巴」與「天量假突破」進行修復。
     
-    [核心進化] 零重力計分
-    1. 移除 Base-50 偏誤：平盤/無趨勢時，分數應回歸 0 分，而非 50 分。
-    2. 負分釋放：當 Z-Score 轉負（法人賣、斜率下彎），分數會直接殺入負值區 (-20 ~ -100)。
-    3. 效果：在做頭下跌初期，分數會迅速由紅翻綠，觸發停利/停損。
+    [核心進化]
+    1. 結構否決權 (Structural Veto):
+       - 當斜率不夠陡 (Slope_Z < 0.8) 且 走勢雜亂 (ER < 0.5) 時，判定為「結構弱勢」。
+       - 結構弱勢時，Alpha Score 上限被鎖死在 50 分 (強制觀望)，無論籌碼多好都不准買。
+       
+    2. 竭盡反轉 (Climax Inversion):
+       - 針對圖中那根「94分」的最高點。
+       - 當出現極端天量 (Vol_Z > 3.5) 但趨勢尚未確立 (Slope_Z < 1.5) 時，視為「竭盡/倒貨」。
+       - 此時不加分反而重扣分，避開最高點追價。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 數據防呆
+    # 1. 基礎數據與防呆
     # ====================================================
     has_chip_data = 'Inst_Net_Buy' in df.columns
     if not has_chip_data: df['Inst_Net_Buy'] = 0 
@@ -943,7 +948,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
     
-    # 判斷股本 (權重分配)
+    # 股本判斷 (權重)
     avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
     if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
 
@@ -952,92 +957,112 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     if is_small_cap:
         w_tech = 0.3; w_chip = 0.7; z_threshold = 2.5 
-        mode_log = "小型股(籌碼戰)"
     elif is_large_cap:
         w_tech = 0.6; w_chip = 0.4; z_threshold = 2.0 
-        mode_log = "權值股(趨勢戰)"
     else:
         w_tech = 0.5; w_chip = 0.5; z_threshold = 2.2
-        mode_log = "中型股(均衡)"
-
-    if not has_chip_data:
-        w_tech = 1.0; w_chip = 0.0; mode_log = "純技術模式"
 
     # ====================================================
-    # 2. 技術面因子 (Raw Z-Scores)
+    # 2. 統計特徵 (Z-Scores & Ranks)
     # ====================================================
-    # 斜率 Z (Slope)
+    
+    # A. 斜率 Z (趨勢強度)
     ma60_diff = df['MA60'].diff()
     slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std()
     slope_z = slope_z.fillna(0)
     
-    # 效率 (ER) - 這次我們將 Rank 轉換為 -0.5 ~ 0.5 的區間
+    # B. 效率 ER Rank (走勢純度)
     net_change = close.diff(10).abs()
     total_path = close.diff().abs().rolling(10).sum()
     er = net_change / total_path.replace(0, 1)
     er_rank = er.rolling(60).rank(pct=True).fillna(0.5)
-    # ER Rank > 0.5 加分， < 0.5 扣分
-    er_score = (er_rank - 0.5) * 2 # 範圍 -1 ~ 1
     
-    # 技術總分 (-100 ~ 100)
-    # 斜率權重高，效率為輔
-    tech_score = (slope_z.clip(-3, 3) * 20) + (er_score * 30)
-
-    # ====================================================
-    # 3. 籌碼面因子 (Raw Z-Scores)
-    # ====================================================
-    # 法人 Z (Inst)
+    # C. 成交量 Z (能量異常度)
+    vol_mean = df['Volume'].rolling(60).mean()
+    vol_std = df['Volume'].rolling(60).std().replace(0, 1)
+    vol_z = (df['Volume'] - vol_mean) / vol_std
+    vol_z = vol_z.fillna(0)
+    
+    # D. 籌碼 Z (法人動向)
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_mean = inst_rate.rolling(60).mean()
-    inst_std = inst_rate.rolling(60).std().replace(0, 0.01)
-    inst_z = (inst_rate - inst_mean) / inst_std
+    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std()
     inst_z = inst_z.fillna(0)
     
-    # 主力線 Rank (-0.5 ~ 0.5)
+    # E. 籌碼主力線 Rank
     inst_obv = df['Inst_Net_Buy'].cumsum()
-    inst_obv_bias = (inst_obv - inst_obv.rolling(20).mean())
-    chip_rank = inst_obv_bias.rolling(60).rank(pct=True).fillna(0.5)
-    chip_rank_score = (chip_rank - 0.5) * 2 # 範圍 -1 ~ 1
-    
-    # 籌碼總分 (-100 ~ 100)
-    chip_score = (inst_z.clip(-3, 3) * 20) + (chip_rank_score * 40)
+    chip_rank = (inst_obv - inst_obv.rolling(20).mean()).rolling(60).rank(pct=True).fillna(0.5)
 
     # ====================================================
-    # 4. 合成決策
+    # 3. 原始評分計算
     # ====================================================
-    # 直接加權，不再墊高 50 分
-    final_score_series = (tech_score * w_tech) + (chip_score * w_chip)
     
-    # 放大係數 (Gain) - 讓分數更容易觸及 +/- 100
-    final_score_series = final_score_series * 1.5
+    # 技術分
+    er_score = (er_rank - 0.5) * 2
+    tech_score = (slope_z.clip(-3, 3) * 20) + (er_score * 30)
     
-    # 寫入
-    df['Alpha_Score'] = final_score_series.fillna(0).clip(-100, 100)
+    # 籌碼分
+    chip_rank_score = (chip_rank - 0.5) * 2
+    chip_score = (inst_z.clip(-3, 3) * 20) + (chip_rank_score * 40)
     
-    # 轉 numpy 供迴圈用
-    final_score_val = df['Alpha_Score'].values
-    inst_z_val = inst_z.values
-    slope_z_val = slope_z.values
+    # 初步合成
+    raw_final = (tech_score * w_tech) + (chip_score * w_chip)
+    raw_final = raw_final * 1.5 # Gain
+
+    # ====================================================
+    # 4. [核心] 結構濾網與否決邏輯 (Veto Logic)
+    # ====================================================
     
+    final_score = np.zeros(len(df))
     logs = []
-    for i in range(len(df)):
-        log = mode_log
-        if inst_z_val[i] < -z_threshold: log = "💀 法人極端倒貨"
-        elif inst_z_val[i] > z_threshold: log = "🔥 法人極端掃貨"
-        elif slope_z_val[i] < -1.0 and inst_z_val[i] > 1.0: log = "💎 底部主力低接"
-        elif slope_z_val[i] > 1.0 and inst_z_val[i] < -1.0: log = "⚠️ 拉高出貨警報"
-        elif final_score_val[i] > 60: log = "🚀 強力多頭"
-        elif final_score_val[i] < -60: log = "📉 空頭修正"
-        logs.append(log)
-        
-    df['Score_Log'] = logs
     
-    # 建議持倉 (負分就建議 0 持倉)
+    # 轉 Numpy
+    raw_vals = raw_final.fillna(0).values
+    slope_vals = slope_z.values
+    er_vals = er_rank.values
+    vol_vals = vol_z.values
+    
+    for i in range(len(df)):
+        score = raw_vals[i]
+        log = "盤整"
+        
+        # 狀態定義
+        is_weak_structure = (slope_vals[i] < 0.8) and (er_vals[i] < 0.5)
+        is_vol_climax = vol_vals[i] > 3.5  # 極端天量
+        
+        # --- 規則 1: 竭盡反轉 (The Climax Trap) ---
+        # 如果爆出天量，但斜率還沒強到像主升段 (Z < 1.5)
+        # 判定為：盤整區的主力倒貨 -> 強制轉空
+        if is_vol_climax and slope_vals[i] < 1.5:
+            score = -50
+            log = "⚠️ 爆量竭盡(避開)"
+            
+        # --- 規則 2: 結構否決權 (Structural Veto) ---
+        # 如果結構鬆散 (斜率平 + 走勢亂)
+        # 強制鎖定分數上限為 50 (只能觀望，不能買)
+        elif is_weak_structure:
+            # 即便籌碼很好，頂多也只能給到 50 (持有)，不能給 60+ (買進)
+            score = min(score, 50)
+            log = "💤 結構鬆散(觀望)"
+            
+        # --- 規則 3: 正常邏輯 ---
+        else:
+            if score > 60: log = "🚀 趨勢轉強"
+            elif score < -60: log = "📉 空頭確立"
+            else: log = "整理"
+            
+        final_score[i] = score
+        logs.append(log)
+
+    # 寫入結果
+    df['Alpha_Score'] = np.clip(final_score, -100, 100)
+    df['Score_Log'] = logs
     df['Recommended_Position'] = np.where(df['Alpha_Score'] > 0, df['Alpha_Score'], 0)
-    df['Inst_Z'] = inst_z
+    
+    # 輔助
+    df['Slope_Z'] = slope_z
+    df['Vol_Z'] = vol_z
     
     return df
-
 
 # ==========================================
 # 6. 主儀表板繪製 (Updated)
