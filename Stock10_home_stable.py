@@ -10,6 +10,7 @@ SENDER_EMAIL = "cypan2000@gmail.com" # 您的 Gmail
 SENDER_PASSWORD = "amds ieiu wgqk exir" # 您的應用程式密碼 (非登入密碼)
 RECEIVER_EMAIL = "cypan2000@gmail.com" # 接收報告的信箱
 
+from finmind.data import DataLoader
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -258,22 +259,69 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 # ==========================================
 # 1. 數據獲取 (Updated)
 # ==========================================
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=300, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
+    """
+    獲取 價量 + 籌碼 數據 (FinMind + yfinance)
+    """
     ticker = str(ticker).strip()
-    candidates = [ticker]
-    if ticker.isdigit(): candidates = [f"{ticker}.TW", f"{ticker}.TWO"]
-    for t in candidates:
-        try:
-            stock = yf.Ticker(t)
-            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1))
-            if not df.empty:
-                df = df.reset_index()
-                df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
-                return df, t
-        except: continue
-    return pd.DataFrame(), ticker
+    
+    # 1. 先用 yfinance 抓即時價量 (速度快、有當日數據)
+    yf_ticker = ticker
+    if not (ticker.endswith('.TW') or ticker.endswith('.TWO')):
+        yf_ticker = f"{ticker}.TW" 
+        
+    try:
+        # 抓取價量
+        stock = yf.Ticker(yf_ticker)
+        df_price = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1))
+        
+        # 如果上市抓不到，試試上櫃
+        if df_price.empty:
+            yf_ticker = f"{ticker}.TWO"
+            stock = yf.Ticker(yf_ticker)
+            df_price = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1))
+            
+        if df_price.empty: return pd.DataFrame(), ticker
+        
+        df_price = df_price.reset_index()
+        df_price['Date'] = df_price['Date'].dt.tz_localize(None).dt.normalize()
+        
+        # 2. 用 FinMind 抓籌碼 (法人買賣超)
+        # 注意：FinMind ticker 不用 .TW
+        clean_ticker = ticker.split('.')[0]
+        start_str = (start_date - timedelta(days=400)).strftime('%Y-%m-%d')
+        
+        # 初始化 FinMind Loader
+        api = DataLoader() 
+        # api.login_by_token("你的_API_TOKEN") # 如果有 token 請在此填入
+        
+        df_chip = api.taiwan_stock_institutional_investors_buy_sell(
+            stock_id=clean_ticker,
+            start_date=start_str
+        )
+        
+        if not df_chip.empty:
+            df_chip['date'] = pd.to_datetime(df_chip['date'])
+            # 匯總三大法人買賣超
+            df_chip['net_buy'] = df_chip['buy'] - df_chip['sell']
+            daily_chip = df_chip.groupby('date')['net_buy'].sum().reset_index()
+            daily_chip.rename(columns={'net_buy': 'Inst_Net_Buy', 'date': 'Date'}, inplace=True)
+            
+            # 3. 合併數據
+            df_final = pd.merge(df_price, daily_chip, on='Date', how='left')
+            df_final['Inst_Net_Buy'] = df_final['Inst_Net_Buy'].fillna(0) # 補 0
+        else:
+            # 抓不到籌碼就給 0
+            df_final = df_price
+            df_final['Inst_Net_Buy'] = 0
+            
+        return df_final, yf_ticker
 
+    except Exception as e:
+        print(f"Error fetching data: {e}")
+        return pd.DataFrame(), ticker
+    
 @st.cache_data(ttl=5, show_spinner=False)
 def get_market_data(start_date, end_date):
     try:
@@ -863,24 +911,24 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v15.0 (Fractal Efficiency):
-    解決「死魚盤中，微小波動被 Z-Score 放大為假趨勢」的問題。
+    Alpha Score v16.1 (Deployment Edition):
+    正式部署版。結合 v16.0 的大一統邏輯，並針對權值股微調敏感度。
     
-    [核心進化] 考夫曼效率濾網 (Efficiency Filter)
-    1. 計算效率比率 (ER)：衡量價格走勢的「乾淨程度」。
-       - 公式：abs(價格位移) / 價格總路徑。
-       - 盤整盤的 ER 極低（走很多路卻沒位移）。
-    2. 自適應門檻 (Adaptive Rank)：
-       - 計算 ER 在過去 60 天的 PR值 (Percentile Rank)。
-       - 只有當 ER_Rank > 0.5 (效率高於該股平均水準) 時，才允許觸發「趨勢/突破」訊號。
-       - 如果 ER_Rank 低 (走勢雜亂)，強制歸零觀望。
+    輸入：
+    - df: 必須包含 'Inst_Net_Buy' (法人買賣超) 欄位。若無，系統會自動降級為純技術模式。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎指標準備
+    # 1. 數據防呆與準備
     # ====================================================
+    # 檢查是否有籌碼數據
+    has_chip_data = 'Inst_Net_Buy' in df.columns
+    if not has_chip_data:
+        # 如果沒有籌碼數據，暫時用成交量模擬 (降級模式)
+        df['Inst_Net_Buy'] = 0 
+    
     close = df['Close']
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
@@ -888,145 +936,108 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
-    curr_rsi = df['RSI'].fillna(50)
+    
+    # 判斷股本/市值屬性 (用成交金額近似)
+    # 這裡使用最後一天的成交金額來定錨
+    avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
+    
+    is_large_cap = avg_dollar_vol > 5_000_000_000 # 50億
+    is_small_cap = avg_dollar_vol < 500_000_000   # 5億
+    
+    # 動態權重與敏感度
+    if is_small_cap:
+        w_tech = 0.3; w_chip = 0.7
+        z_threshold = 2.5 # 小型股波動大，標準要嚴
+        mode_log = "小型股(籌碼戰)"
+    elif is_large_cap:
+        w_tech = 0.6; w_chip = 0.4
+        z_threshold = 2.0 # [微調] 權值股 -2.0 就算極端
+        mode_log = "權值股(趨勢戰)"
+    else:
+        w_tech = 0.5; w_chip = 0.5
+        z_threshold = 2.2
+        mode_log = "中型股(均衡)"
+
+    if not has_chip_data:
+        w_tech = 1.0; w_chip = 0.0
+        mode_log = "純技術模式(缺籌碼)"
 
     # ====================================================
-    # 2. 統計學特徵工程
+    # 2. 技術面因子 (Z-Score)
     # ====================================================
-    
-    # --- A. 考夫曼效率比率 (Efficiency Ratio) ---
-    # 週期 N=10
-    # 淨位移 (Change): 10天後的價格差絕對值
-    net_change = close.diff(10).abs()
-    # 總路徑 (Volatility): 每天價格變動絕對值的總和
-    total_path = close.diff().abs().rolling(10).sum()
-    # ER = 淨位移 / 總路徑 (範圍 0~1)
-    # 趨勢越強越直，ER 越接近 1；盤整越亂，ER 越接近 0
-    efficiency_ratio = net_change / total_path.replace(0, 1)
-    
-    # [自適應關鍵] 計算 ER 的 PR值 (0~1)
-    # 告訴我現在的走勢，跟這檔股票過去的自己比，是不是比較「乾淨」？
-    er_rank = efficiency_ratio.rolling(60).rank(pct=True).fillna(0)
-
-    # --- B. 季線斜率 Z-Score ---
+    # 斜率
     ma60_diff = df['MA60'].diff()
-    slope_mean = ma60_diff.rolling(60).mean()
-    slope_std = ma60_diff.rolling(60).std().replace(0, 0.001)
-    slope_z = (ma60_diff - slope_mean) / slope_std
+    slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std()
     slope_z = slope_z.fillna(0)
-
-    # --- C. 成交量 Z-Score ---
-    vol_mean = df['Volume'].rolling(60).mean()
-    vol_std = df['Volume'].rolling(60).std().replace(0, 1)
-    vol_z = (df['Volume'] - vol_mean) / vol_std
-    vol_z = vol_z.fillna(0)
     
-    # --- D. 自適應 RSI ---
-    rsi_low_band = curr_rsi.rolling(100).quantile(0.05)
-    rsi_high_band = curr_rsi.rolling(100).quantile(0.95)
+    # 效率 (ER)
+    net_change = close.diff(10).abs()
+    total_path = close.diff().abs().rolling(10).sum()
+    er = net_change / total_path.replace(0, 1)
+    er_rank = er.rolling(60).rank(pct=True).fillna(0.5)
     
-    # 布林通道
-    std20 = close.rolling(20).std()
-    bb_up = df['MA20'] + 2.0 * std20
-    bb_low = df['MA20'] - 2.0 * std20
+    # 技術分 (0~100)
+    tech_score_raw = (slope_z.clip(-2, 2) * 25) + (er_rank * 50)
+    tech_score_norm = np.where(tech_score_raw > 0, 50 + tech_score_raw, 50 + tech_score_raw).clip(0, 100)
 
     # ====================================================
-    # 3. 狀態定義 (效率優先)
+    # 3. 籌碼面因子 (Z-Score)
     # ====================================================
+    # 法人買賣佔比 Z-Score
+    inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
+    inst_mean = inst_rate.rolling(60).mean()
+    inst_std = inst_rate.rolling(60).std().replace(0, 0.01)
+    inst_z = (inst_rate - inst_mean) / inst_std
+    inst_z = inst_z.fillna(0)
     
-    # [核心濾網] 雜訊過濾 (Choppy Filter)
-    # 如果 ER_Rank < 0.4 (效率處於後段班)，代表市場處於無序震盪
-    # 此時無論 Z-Score 多高，都視為雜訊
-    is_messy = er_rank < 0.4
+    # 主力線位階
+    inst_obv = df['Inst_Net_Buy'].cumsum()
+    inst_obv_bias = (inst_obv - inst_obv.rolling(20).mean())
+    chip_rank = inst_obv_bias.rolling(60).rank(pct=True).fillna(0.5)
     
-    # 1. 自適應趨勢 (Trend)
-    # 斜率強 + 價格在均線上 + [關鍵] 走勢乾淨 (ER Rank 高)
-    is_adaptive_trend = (slope_z > 0.8) & (close > df['MA20']) & (~is_messy)
-    
-    # 2. 自適應竭盡 (Climax)
-    # 爆出異常天量 (3 Sigma)
-    is_vol_climax = vol_z > 3.0
-    
-    # 3. 自適應黃金坑 (Golden Pit)
-    # 恐慌買點不需要看效率 (因為恐慌時效率通常很差)，只看超賣
-    is_panic_bottom = (df['VIX'] > 25) & (close < bb_low) & (curr_rsi <= rsi_low_band)
-
-    # 4. 自適應突破 (Smart Breakout)
-    is_smart_breakout = (
-        (slope_z > 0.2) &
-        (vol_z > 0.5) & (vol_z < 3.0) & # 有量但非竭盡
-        (close > bb_up) &               # 突破布林上軌
-        (er_rank > 0.6) &               # [關鍵] 效率必須是前段班 (漲真的)
-        (~is_vol_climax)
-    )
+    # 籌碼分 (0~100)
+    chip_score_raw = (inst_z.clip(-3, 3) * 15) + (chip_rank * 55)
+    chip_score_norm = chip_score_raw.clip(0, 100)
 
     # ====================================================
-    # 4. 評分邏輯
+    # 4. 合成決策
     # ====================================================
-    final_score = np.zeros(len(df))
+    final_score = (tech_score_norm * w_tech) + (chip_score_norm * w_chip)
+    
+    # 寫入
+    df['Alpha_Score'] = final_score
+    
+    # 生成人類可讀日誌
     logs = []
-    
-    # 轉 Numpy
-    panic_arr = is_panic_bottom.values
-    breakout_arr = is_smart_breakout.values
-    trend_arr = is_adaptive_trend.values
-    climax_arr = is_vol_climax.values
-    messy_arr = is_messy.values
-    rsi_arr = curr_rsi.values
+    inst_z_val = inst_z.values
+    slope_z_val = slope_z.values
     
     for i in range(len(df)):
-        score = 0
-        log = "盤整"
+        log = mode_log
         
-        # 1. 恐慌黃金坑 (95分) - 唯一不受雜訊影響的訊號
-        if panic_arr[i]:
-            score = 95
-            log = "💎 統計極端超賣"
+        # 異常偵測
+        if inst_z_val[i] < -z_threshold:
+            log = "💀 法人極端倒貨"
+        elif inst_z_val[i] > z_threshold:
+            log = "🔥 法人極端掃貨"
+        elif slope_z_val[i] < -1.0 and inst_z_val[i] > 1.0:
+            log = "💎 底部主力低接"
+        elif slope_z_val[i] > 1.0 and inst_z_val[i] < -1.0:
+            log = "⚠️ 拉高出貨警報"
+        elif final_score[i] > 80:
+            log = "🚀 強力多頭"
+        elif final_score[i] < 20:
+            log = "💤 弱勢觀望"
             
-        # 2. 竭盡/假突破 (-20分)
-        elif climax_arr[i]:
-            score = -20
-            log = "⚠️ 統計極端爆量"
-            
-        # 3. [關鍵] 雜訊封鎖 (0分)
-        # 只要走勢太亂 (ER低)，直接觀望，不管其他指標說什麼
-        elif messy_arr[i]:
-            score = 0
-            log = "💤 雜訊震盪(ER低)"
-            
-        # 4. 聰明突破 (75分)
-        elif breakout_arr[i]:
-            score = 75
-            log = "🔥 高效率突破"
-            
-        # 5. 趨勢延續 (85分)
-        elif trend_arr[i]:
-            score = 85
-            log = "🚀 趨勢延續"
-            if rsi_arr[i] > 90: score = 70; log = "⚠️ 極端過熱"
-        
-        # 6. 其他
-        else:
-            if rsi_arr[i] < 40: score = 50; log = "弱勢整理"
-            else: score = 0; log = "觀望"
-        
-        final_score[i] = score
         logs.append(log)
-
-    # 輸出 (峰值保留)
-    raw_series = pd.Series(final_score, index=df.index)
-    smooth_series = raw_series.rolling(3, min_periods=1).mean()
-    df['Alpha_Score'] = np.maximum(raw_series, smooth_series).clip(-100, 100)
+        
     df['Score_Log'] = logs
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
-    # 輔助指標 (供圖表參考)
-    df['Slope_Z'] = slope_z
-    df['ER_Rank'] = er_rank
+    # 輔助繪圖用
+    df['Inst_Z'] = inst_z
     
     return df
-
-
 # ==========================================
 # 6. 主儀表板繪製 (Updated)
 # ==========================================
