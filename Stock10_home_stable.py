@@ -902,16 +902,10 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v25.0 (The Analog Sentinel):
-    [Analog 精神] 全連續、無閾值、向量合成。
-    
-    解決「太晚賣」的問題：
-    1. 風險連續扣分：不再等 VIX > 25 才反應。VIX 只要從低檔開始爬升，分數就開始「線性衰退」。
-    2. 籌碼連續影響：法人賣超的大小直接影響扣分幅度。
-    3. 趨勢二階導數：引入 MACD 柱狀圖數值，偵測「漲勢變緩」的瞬間。
-    
-    效果：在崩盤前夕，由於風險升高 + 籌碼鬆動，分數會從高檔「滑落」至中性偏空，
-    讓策略能在「血味」出現時就離場，而不是等到「見血」才跑。
+    Alpha Score v25.1 (Bug Fix Edition):
+    修復 KeyError。
+    將 reversion_force 與 risk_factor 轉為 numpy array 後再進入迴圈，
+    解決日期索引與整數迴圈不兼容的問題。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -923,82 +917,57 @@ def calculate_alpha_score(df, margin_df, short_df):
     if not has_chip_data: df['Inst_Net_Buy'] = 0 
     
     close = df['Close']
-    # VIX 處理：確保數值平滑
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     vix = df['VIX'].ffill().fillna(20.0)
     
     if 'Volume' not in df.columns: df['Volume'] = 0
     
-    # 均線 (作為趨勢基線)
     ma20 = close.rolling(20).mean()
     ma60 = close.rolling(60).mean()
     df['MA20'] = ma20; df['MA60'] = ma60
     
-    # 身份識別 (權重調整用，但不改變計算公式結構)
+    # 身份識別
     avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
     if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
     is_titan = avg_dollar_vol > 5_000_000_000 
 
     # ====================================================
     # 2. 類比因子計算 (Analog Factors)
-    # 這裡全部使用 Z-Score 或 標準化數值，不使用 True/False
     # ====================================================
     
-    # [A] 趨勢強度 (Trend Intensity)
-    # 使用距離均線的乖離 Z-Score，反映趨勢的乖離程度
+    # [A] 趨勢強度
     bias = (close - ma60) / ma60
     bias_z = (bias - bias.rolling(60).mean()) / bias.rolling(60).std().fillna(1)
     
-    # [B] 動能變化 (Momentum Derivative)
-    # 使用 MACD Histogram 數值，反映「加速度」
-    # 當股價還在漲但變慢時，MACD柱狀圖會率先下降 -> 分數下降
+    # [B] 動能變化
     ema12 = close.ewm(span=12).mean()
     ema26 = close.ewm(span=26).mean()
     macd = ema12 - ema26
     signal = macd.ewm(span=9).mean()
     hist = macd - signal
-    # 將 Histogram 標準化到 -1 ~ 1 之間 (大約)
-    mom_score = np.tanh(hist / close * 100) * 2 # Tanh 函數讓數值平滑且有邊界
+    mom_score = np.tanh(hist / close * 100) * 2 
     
-    # [C] 籌碼流向 (Chip Flow)
+    # [C] 籌碼流向
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
     inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().fillna(1)
-    # 平滑化籌碼訊號 (避免單日雜訊)
     inst_z_smooth = inst_z.rolling(3).mean().fillna(0)
     
-    # [D] 風險係數 (Risk Factor) - 這是「聞血味」的關鍵
-    # VIX 基準線設為 15 (安逸區)
-    # 當 VIX > 15，每增加 1 點，風險扣分線性增加
-    # 使用 maximum 確保 VIX 低於 15 時不加分(風險為0)，只在變高時扣分
-    risk_factor = np.maximum(0, vix - 15) / 10.0 # VIX 25 -> 1.0, VIX 35 -> 2.0
+    # [D] 風險係數
+    risk_factor = np.maximum(0, vix - 15) / 10.0
     
     # ====================================================
     # 3. 向量合成 (Vector Synthesis)
     # ====================================================
     
-    # 定義權重 (Analog Weights)
     if is_titan:
-        w_trend = 15.0 # 權值股重趨勢
-        w_mom = 10.0
-        w_chip = 10.0
-        w_risk = 20.0 # 權值股對系統性風險(VIX)敏感
+        w_trend = 15.0; w_mom = 10.0; w_chip = 10.0; w_risk = 20.0
     else:
-        w_trend = 10.0
-        w_mom = 15.0  # 小型股重動能
-        w_chip = 20.0 # 小型股重籌碼
-        w_risk = 10.0
+        w_trend = 10.0; w_mom = 15.0; w_chip = 20.0; w_risk = 10.0
         
-    # 核心公式：總分 = 趨勢 + 動能 + 籌碼 - 風險
-    # 基礎分 50
+    # 核心公式
     raw_score = 50 + (bias_z * w_trend) + (mom_score * w_mom * 10) + (inst_z_smooth * w_chip) - (risk_factor * w_risk)
     
-    # 特別處理：乖離過大的「黃金坑」補償
-    # 如果乖離率 Z-Score 極低 (例如 -2.0)，這時候 risk_factor 雖然高，但乖離項會變成大的正數 (負負得正)
-    # 這裡不需要額外的 if-else，數學公式會自動平衡：
-    # 如果 VIX 很高 (扣分)，但跌得夠深 (bias_z 負很多)，總分會自動回升。
-    
-    # [修正] 為了讓恐慌抄底更明顯，我們加入一個「均值回歸力道」
-    # 當 bias_z < -1.5 時，將其負值轉為強大的正向加分
+    # 均值回歸力道 (Reversion Force)
     reversion_force = np.maximum(0, -bias_z - 1.5) * 30
     
     final_score = raw_score + reversion_force
@@ -1006,21 +975,32 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 平滑化輸出
     df['Alpha_Score'] = final_score.rolling(2).mean().clip(0, 100)
     
-    # 生成 Log (僅供人類閱讀，不影響計算)
+    # ====================================================
+    # 4. 生成 Log (Fix: 使用 Numpy Array)
+    # ====================================================
     logs = []
+    
+    # [關鍵修正] 轉為 .values (NumPy Array)
     score_val = df['Alpha_Score'].values
+    reversion_val = reversion_force.values # <--- 修正點
+    risk_val = risk_factor.values          # <--- 修正點
     
     for i in range(len(df)):
         s = score_val[i]
+        
+        # 基礎狀態
         if s > 80: log = "🔥 強力看多"
         elif s > 60: log = "📈 偏多操作"
         elif s < 40: log = "📉 轉弱/偏空"
         elif s < 20: log = "💀 極度弱勢"
         else: log = "⚖️ 中性盤整"
         
-        # 標註特殊狀態
-        if reversion_force[i] > 0: log = "💎 乖離過大(醞釀反彈)"
-        if risk_factor[i] > 1.5 and s < 40: log = "🩸 市場恐慌(現金為王)"
+        # 特殊狀態覆蓋 (使用 numpy array 索引)
+        if reversion_val[i] > 0: 
+            log = "💎 乖離過大(醞釀反彈)"
+        
+        if risk_val[i] > 1.5 and s < 40: 
+            log = "🩸 市場恐慌(現金為王)"
         
         logs.append(log)
         
