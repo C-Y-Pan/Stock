@@ -900,135 +900,153 @@ import pandas as pd
 
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v26.1 (Data Fault Tolerance):
-    緊急修復「近期分數消失 (NaN)」的問題。
+    Alpha Score v26.2 (The Data Healer):
+    針對「近期分數消失 (NaN)」進行最終極修復。
     
-    [核心修正] 數據容錯機制
-    1. 籌碼填補：針對盤中/盤後籌碼數據尚未更新的情況 (NaN)，
-       強制填補為 0 (中性)，避免數學運算導致全盤崩潰。
-    2. VIX 填補：若 VIX 有空窗，沿用昨日數值 (ffill)。
-    3. 最終防呆：若計算結果仍有 NaN，強制設為 50 分 (中性)，確保圖表不會斷頭。
+    [核心進化] 偏執狂防呆
+    1. 源頭強制清洗：進入函式第一件事，把所有可能的 NaN 全部填滿。
+       - 籌碼缺值 -> 補 0
+       - VIX 缺值 -> 補昨日值 (ffill)
+       - 均線缺值 -> 補收盤價
+    2. 過程無縫處理：在 Z-Score、MACD 計算過程中，隨時攔截 NaN。
+    3. 結尾強制輸出：確保輸出的 Alpha_Score 絕對是浮點數，絕無空值。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據清洗 (容錯核心)
+    # 1. 源頭數據清洗 (Paranoid Cleaning)
     # ====================================================
     
-    # [Fix 1] 處理籌碼空值
+    # 籌碼防呆
     if 'Inst_Net_Buy' not in df.columns:
         df['Inst_Net_Buy'] = 0
-    else:
-        # 關鍵：將最新的 NaN 填補為 0，讓程式能跑下去
-        df['Inst_Net_Buy'] = df['Inst_Net_Buy'].fillna(0)
+    df['Inst_Net_Buy'] = df['Inst_Net_Buy'].fillna(0) # 缺值補0
+    
+    # VIX 防呆 (最常見的斷頭原因)
+    if 'VIX' not in df.columns: df['VIX'] = 20.0
+    # 先 ffill (沿用昨日)，若開頭就是空，則補 20
+    df['VIX'] = df['VIX'].ffill().bfill().fillna(20.0) 
+    
+    # 價量防呆
+    df['Close'] = df['Close'].ffill()
+    df['Volume'] = df['Volume'].fillna(0)
     
     close = df['Close']
+    vix = df['VIX']
     
-    # [Fix 2] 處理 VIX 空值 (沿用舊值)
-    if 'VIX' not in df.columns: df['VIX'] = 20.0
-    vix = df['VIX'].ffill().fillna(20.0) # 向後填補，防止當日無 VIX
+    # 均線計算與填補
+    df['MA20'] = close.rolling(20).mean().fillna(close)
+    df['MA60'] = close.rolling(60).mean().fillna(close)
     
-    if 'Volume' not in df.columns: df['Volume'] = 0
-    
-    if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
-    
-    avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
-    if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
+    # 身份識別
+    # 注意：rolling mean 在資料開頭會是 NaN，需填補
+    avg_dollar_vol = (close * df['Volume']).rolling(60).mean().fillna(0).iloc[-1]
     is_titan = avg_dollar_vol > 5_000_000_000 
 
     # ====================================================
-    # 2. 類比因子 (Analog Factors)
+    # 2. 因子計算 (逐步防呆)
     # ====================================================
     
-    # [A] 內部健康度
-    # 1. 籌碼 Z (分母防呆)
+    # [A] 籌碼因子
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_std = inst_rate.rolling(60).std().replace(0, 0.01) # 防止標準差為0
-    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_std
-    inst_z = inst_z.fillna(0) # 再次確保 Z-Score 無 NaN
+    # 處理除以零或無交易量的極端情況
+    inst_rate = inst_rate.fillna(0).replace([np.inf, -np.inf], 0)
+    
+    inst_mean = inst_rate.rolling(60).mean().fillna(0)
+    inst_std = inst_rate.rolling(60).std().fillna(1) # std 補 1 防止除以零
+    inst_z = (inst_rate - inst_mean) / inst_std
+    inst_z = inst_z.fillna(0)
     
     inst_health = np.tanh(inst_z) * 50
     
-    # 2. 趨勢斜率 Z
-    slope = df['MA60'].diff()
-    slope_std = slope.rolling(60).std().replace(0, 0.001)
-    slope_z = (slope - slope.rolling(60).mean()) / slope_std
+    # [B] 趨勢因子
+    slope = df['MA60'].diff().fillna(0)
+    slope_mean = slope.rolling(60).mean().fillna(0)
+    slope_std = slope.rolling(60).std().fillna(1)
+    slope_z = (slope - slope_mean) / slope_std
     slope_z = slope_z.fillna(0)
     
     trend_health = np.tanh(slope_z) * 50
     
+    # 健康度總分
     health_score = (inst_health * 0.6) + (trend_health * 0.4)
+    health_score = health_score.fillna(0) # 再次確保
     
-    # [B] 外部壓力值 (VIX)
+    # [C] 壓力因子 (VIX)
     norm_vix = (vix - 15) / 10.0
-    pressure_factor = np.exp(norm_vix * 0.8) 
+    pressure_factor = np.exp(norm_vix * 0.8)
+    pressure_factor = pressure_factor.fillna(1.0) # 預設壓力為 1
     
-    # [C] 乖離率
+    # [D] 乖離率
     bias_pct = ((close - df['MA60']) / df['MA60']) * 100
+    bias_pct = bias_pct.fillna(0)
     
     # ====================================================
-    # 3. 生物合成運算
+    # 3. 合成運算
     # ====================================================
     
     final_score = np.zeros(len(df))
     logs = []
     
-    # 轉 Numpy (確保無 NaN)
-    health_val = health_score.fillna(0).values
-    pressure_val = pressure_factor.fillna(1.0).values
-    bias_val = bias_pct.fillna(0).values
+    # 轉 Numpy
+    health_val = health_score.values
+    pressure_val = pressure_factor.values
+    bias_val = bias_pct.values
     
     for i in range(len(df)):
-        current_health = health_val[i]
-        current_pressure = pressure_val[i]
-        current_bias = bias_val[i]
-        
-        # 避免除以零
-        if current_pressure == 0: current_pressure = 1.0
-        
-        # 順勢階段
-        if current_bias > 0: 
-            score = 50 + (current_health / current_pressure)
+        # 防呆：確保數值有效
+        if np.isnan(health_val[i]): h = 0
+        else: h = health_val[i]
             
-            if current_health < 0 and current_pressure > 2.0:
-                score -= 50 
+        if np.isnan(pressure_val[i]) or pressure_val[i] == 0: p = 1.0
+        else: p = pressure_val[i]
+            
+        b = bias_val[i]
+        
+        # 邏輯核心
+        if b > 0: # 順勢
+            score = 50 + (h / p)
+            if h < 0 and p > 2.0:
+                score -= 50
                 log = "🩸 窒息(高檔轉弱)"
             elif score > 60:
                 log = "🚀 順勢"
             else:
                 log = "盤整"
-
-        # 逆勢階段
-        else:
-            if current_bias < -5:
-                # 恐慌助燃
-                panic_adrenaline = abs(current_bias) * current_pressure * 1.5
+        else: # 逆勢
+            if b < -5:
+                panic_adrenaline = abs(b) * p * 1.5
                 score = 50 + panic_adrenaline
-                
                 if score > 90: log = "💎 恐慌黃金坑"
                 else: log = "📉 修正"
             else:
-                score = 50 - (current_pressure * 10)
+                score = 50 - (p * 10)
                 log = "📉 空頭壓制"
-
+                
         final_score[i] = score
         logs.append(log)
 
-    # [Fix 3] 最終防呆與平滑
-    raw_series = pd.Series(final_score).fillna(50) # 若有漏網之魚，補 50
-    df['Alpha_Score'] = raw_series.rolling(2).mean().fillna(raw_series).clip(0, 100)
+    # ====================================================
+    # 4. 輸出修復
+    # ====================================================
+    
+    # 將 numpy 轉回 Series 並處理最後的 NaN
+    raw_series = pd.Series(final_score).fillna(50) 
+    
+    # 平滑化 (使用 fillna 確保最新的那一天不會因為 rolling 視窗而消失)
+    # min_periods=1 是關鍵，保證即使只有一天數據也能算平均
+    df['Alpha_Score'] = raw_series.rolling(2, min_periods=1).mean().fillna(raw_series).clip(0, 100)
     
     df['Score_Log'] = logs
     df['Recommended_Position'] = df['Alpha_Score']
     
-    # 輔助指標
+    # 輔助
     df['Health_Index'] = health_score
     df['Pressure_Index'] = pressure_factor
+    df['Inst_Z'] = inst_z
     
     return df
-
 
 
 # ==========================================
