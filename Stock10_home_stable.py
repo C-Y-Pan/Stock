@@ -10,7 +10,7 @@ SENDER_EMAIL = "cypan2000@gmail.com" # 您的 Gmail
 SENDER_PASSWORD = "amds ieiu wgqk exir" # 您的應用程式密碼 (非登入密碼)
 RECEIVER_EMAIL = "cypan2000@gmail.com" # 接收報告的信箱
 
-from finmind.data import DataLoader
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -2473,3 +2473,4 @@ elif page == "💼 持股健診與建議":
     # ==========================================
     st.markdown("---")
     render_live_dashboard(st.session_state['portfolio_data'])
+
