@@ -499,17 +499,19 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v17.0 (The Flow Trader):
-    配合 Analog Score 的連續性，改用「分數衰退」作為賣出訊號。
+    策略引擎 v18.0 (The Trend Anchor):
+    解決「漲勢中頻繁被洗出場 (發神經)」的問題。
     
-    [核心進化]
-    1. 分數高檔滑落 (Score Decay):
-       - 記錄持倉期間的「最高分數 (Peak Score)」。
-       - 如果 當前分數 < 最高分數 - 25 (且最高分曾 > 75)，視為趨勢轉弱，提早出場。
-       - 這能讓你在高檔震盪、VIX 剛開始升高時就跑掉，不用吃完整段下跌。
-    2. 移除泰坦股的死抱邏輯：
-       - 既然分數已經能精準反應基本面與風險，權值股也該尊重分數。
-       - 分數爛了就是爛了，台積電也要賣。
+    [核心進化] 趨勢定錨
+    1. 修正分數衰退賣點：
+       - 舊版：掉 25 分就賣 -> 太敏感。
+       - 新版：掉 30 分 且 目前分數 < 60 才能賣。
+       - 意義：只要分數還維持在多頭區 (60+)，就算回檔也不賣。
+       
+    2. 泰坦定錨 (Titan Anchor):
+       - 對於權值股，只要股價穩守季線 (MA60) 且季線向上，
+       - 強制屏蔽所有「技術指標轉弱」的賣訊。
+       - 只有「跌破季線」或「災難停損」才能讓你下車。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -524,7 +526,7 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     # 記錄持倉期間的「最高評分」
     peak_score = 0.0 
     
-    # 身份識別 (保留權重股識別，僅用於微調，不改變核心邏輯)
+    # 身份識別
     close_val = df['Close'].values
     vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
     avg_dollar_vol = np.nanmean(close_val * vol_val)
@@ -532,6 +534,9 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     is_titan = avg_dollar_vol > 5_000_000_000 
     
     ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
+    # 計算季線斜率 (用於定錨)
+    ma60_slope = pd.Series(ma60).diff(5).fillna(0).values
+    
     scores = df['Alpha_Score'].values
     
     # ATR
@@ -556,52 +561,66 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
         # --- 進場 ---
         if position == 0:
             if valid_score >= buy_threshold:
-                # 只有在分數真的夠強時才進場
-                signal = 1
-                entry_price = curr_price
-                highest_price = curr_price
-                peak_score = valid_score # 初始化最高分
-                
-                action_code = "Buy"
-                reason_str = "評分轉強"
-                if valid_score > 90: reason_str = "極度強勢/抄底"
+                # 再次確認：如果是權值股，空頭走勢(季線下)盡量不追高，除非是恐慌底(>85)
+                if is_titan and curr_price < curr_ma60 and valid_score < 85:
+                    pass
+                else:
+                    signal = 1
+                    entry_price = curr_price
+                    highest_price = curr_price
+                    peak_score = valid_score
+                    
+                    action_code = "Buy"
+                    reason_str = "趨勢啟動" if valid_score < 85 else "恐慌抄底"
             else:
-                pass # 觀望
+                pass 
 
         # --- 出場 ---
         elif position == 1:
             if curr_price > highest_price: highest_price = curr_price
-            if valid_score > peak_score: peak_score = valid_score # 更新最高分
+            if valid_score > peak_score: peak_score = valid_score 
             
             pnl_pct = (curr_price - entry_price) / entry_price
             is_sell = False
             
-            # [核心] Analog Exit Logic
+            # ====================================================
+            # [核心修正] 出場邏輯分流
+            # ====================================================
             
-            # 1. 分數顯著衰退 (The Early Warning)
-            # 如果分數曾經很高 (>75)，但現在掉下來超過 25 分
-            # 代表動能消失、籌碼鬆動或風險升高 -> 提早離場
-            if peak_score > 75 and valid_score < (peak_score - 25):
-                is_sell = True
-                reason_str = "評分顯著衰退"
+            # --- 情境 A: 泰坦定錨 (權值股且季線向上) ---
+            # 只要季線方向是對的，我們就無視短線分數波動
+            is_trend_intact = is_titan and (curr_price > curr_ma60) and (ma60_slope[i] > 0)
+            
+            if is_trend_intact:
+                # 只有極端情況才賣
+                if valid_score < 20: # 1. 基本面/籌碼崩盤
+                    is_sell = True; reason_str = "評分崩盤"
+                elif curr_price < curr_ma60 * 0.99: # 2. 意外跌破季線
+                    is_sell = True; reason_str = "意外破線"
+                # (這裡拿掉了分數衰退賣訊，死抱!)
                 
-            # 2. 結構轉空 (The Structure Break)
-            # 分數直接跌破中性區 ( < 40 )
-            elif valid_score < 40:
-                is_sell = True
-                reason_str = "評分轉空"
-            
-            # 3. 價格保護 (The Price Floor)
-            # 雖然分數還行，但價格跌破季線 (最後防線)
-            elif curr_price < curr_ma60:
-                # 權值股給 1% 緩衝，小型股直接跑
-                buffer = 0.99 if is_titan else 1.0
-                if curr_price < curr_ma60 * buffer:
+            # --- 情境 B: 一般情況 (小型股 或 權值股轉弱) ---
+            else:
+                # 1. 分數顯著衰退 (且分數已轉弱)
+                # [修正點] 必須 Current < 60 才能賣，防止在強勢區被洗掉
+                if peak_score > 75 and valid_score < (peak_score - 30) and valid_score < 60:
                     is_sell = True
-                    reason_str = "跌破季線"
+                    reason_str = "動能衰退"
+                    
+                # 2. 結構轉空
+                elif valid_score < 30:
+                    is_sell = True
+                    reason_str = "評分轉空"
+                
+                # 3. 價格破線
+                elif curr_price < curr_ma60:
+                    buffer = 0.99 if is_titan else 1.0
+                    if curr_price < curr_ma60 * buffer:
+                        is_sell = True
+                        reason_str = "跌破季線"
             
-            # 4. 災難停損
-            elif pnl_pct < -0.15:
+            # --- 通用災難停損 ---
+            if pnl_pct < -0.15:
                 is_sell = True
                 reason_str = "災難停損"
 
@@ -624,7 +643,7 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 績效...
+    # 績效計算
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     cost_series = pd.Series(0.0, index=df.index)
