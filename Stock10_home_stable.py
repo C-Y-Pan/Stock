@@ -836,17 +836,16 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.0 (VIX Panic Standard): 
-    引入 VIX 作為「恐慌量化標準」。
-    區分「系統性錯殺 (VIX高 + 股價跌 -> 買進)」與「個股利空 (VIX低 + 股價跌 -> 觀望)」的關鍵差異。
+    Alpha Score v5.1 (Hybrid Engine): 
+    結合「逆勢抄底」與「順勢趨勢」雙邏輯。
+    修正 v5.0 在強勢主升段因「過熱扣分」導致踏空的問題。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據與 VIX 準備
+    # 1. 基礎數據
     # ====================================================
-    # 確保 VIX 數據存在且連續 (使用 ffill 避免空值)
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
     vix = df['VIX']
@@ -858,7 +857,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     
     # 技術指標
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 # 季線乖離
+    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
     
     # 布林通道
@@ -866,7 +865,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     bb_width = (4 * std20) / df['MA20'] 
 
     # ====================================================
-    # 2. 原始技術評分 (Raw Score)
+    # 2. 原始因子計算
     # ====================================================
     # A. 趨勢/乖離
     score_trend = np.where(bias_60 > 0, 20, -10)
@@ -878,69 +877,68 @@ def calculate_alpha_score(df, margin_df, short_df):
     raw_series = pd.Series(raw_score, index=df.index)
 
     # ====================================================
-    # 3. VIX 恐慌量化濾網 (Panic Quantified)
+    # 3. 情境感知濾網 (Hybrid Logic)
     # ====================================================
     
-    # 狀態定義
     is_downtrend = df['Close'] < df['MA60']
     
-    # [VIX 標準 1] 極度恐慌 (VIX > 25)
-    # 定義：系統性風險發生，好壞股通殺。
-    # 策略：大幅放寬買進標準，只要有跌就是買點。
-    market_panic = vix > 25
+    # [定義] 恐慌殺盤 (逆勢買點)
+    cond_deep_value = bias_60 < -15
+    cond_panic_selling = (curr_rsi < 25) & (df['Volume'] > df['Vol_MA20'] * 1.5)
+    # 系統性恐慌 (VIX > 25) + 個股超賣
+    panic_buy_mask = (vix > 25) & (curr_rsi < 30)
     
-    # [VIX 標準 2] 市場安逸 (VIX < 15)
-    # 定義：風平浪靜。
-    # 策略：如果這時候個股大跌，代表它有自己的問題(Idiosyncratic Risk)，嚴格禁止接刀。
-    market_complacency = vix < 15
+    # [新增定義] 健康的多頭趨勢 (順勢買點)
+    # 1. 均線多頭排列 (Close > MA20 > MA60)
+    # 2. RSI 處於強勢區但未過熱 (50 < RSI < 75)
+    # 3. 股價沒有離季線太遠 (乖離 < 20%，避免末升段追高)
+    is_healthy_trend = (
+        (df['Close'] > df['MA20']) & 
+        (df['MA20'] > df['MA60']) & 
+        (curr_rsi > 50) & (curr_rsi < 78) & 
+        (bias_60 < 20)
+    )
 
-    # [個股訊號]
-    stock_oversold = curr_rsi < 30
-    stock_crash = bias_60 < -10
-    stock_capitulation = df['Volume'] > df['Vol_MA20'] * 1.5
-
+    # --- 評分邏輯層級 ---
+    
     final_score = raw_series.copy()
     
-    # --- 邏輯層級 ---
-
-    # Level 1: 基礎均值回歸 (Sweet Spot)
-    # 原始分數在 -40~10 之間，且非空頭趨勢 -> 加分 (正常回檔)
+    # Level 1: 基礎均值回歸 (正常回檔)
     cond_sweet_spot = (raw_series > -40) & (raw_series <= 10)
     final_score = np.where(cond_sweet_spot & (~is_downtrend), raw_series + 60, final_score)
 
-    # Level 2: 系統性錯殺 (Systematic Opportunity) -> 最高優先級
-    # 條件：市場恐慌 (VIX > 25) + 個股超賣
-    # 意義：覆巢之下無完卵，錯殺機率極高，給予最高分 (90~100)
-    panic_buy_mask = market_panic & stock_oversold
-    final_score = np.where(panic_buy_mask, 90, final_score)
+    # Level 2: [核心修正] 順勢動能加分
+    # 如果符合健康多頭趨勢，強制將分數拉升至「買進區 (70分)」
+    # 這會讓圖表左側的主升段出現連續的紅柱
+    final_score = np.where(is_healthy_trend, np.maximum(final_score, 70), final_score)
+
+    # Level 3: 過熱調節 (Overheat Correction)
+    # 只有當「不符合健康趨勢」且「原始分過高」時，才執行扣分
+    # 意即：RSI > 78 或 乖離過大時，才會被視為過熱
+    cond_real_overheat = (raw_series > 40) & (~is_healthy_trend)
+    final_score = np.where(cond_real_overheat, raw_series - 60, final_score)
+
+    # Level 4: 恐慌黃金坑 (最高優先級)
+    is_golden_pit = (cond_deep_value & cond_panic_selling) | panic_buy_mask
+    final_score = np.where(is_golden_pit, 95, final_score)
     
-    # 若恐慌且爆量，加碼到滿分
-    final_score = np.where(panic_buy_mask & stock_capitulation, 100, final_score)
-
-    # Level 3: 個股利空陷阱 (Idiosyncratic Risk) -> 扣分
-    # 條件：市場沒事 (VIX < 20) + 個股崩跌 (空頭且深跌)
-    # 意義：這是公司出問題，不要接刀
-    bad_stock_mask = (vix < 20) & is_downtrend & stock_crash
+    # Level 5: 個股利空陷阱 (Idiosyncratic Risk)
+    bad_stock_mask = (vix < 20) & is_downtrend & (bias_60 < -10)
     final_score = np.where(bad_stock_mask, -50, final_score)
-
-    # Level 4: 過熱調節
-    final_score = np.where(raw_series > 40, raw_series - 60, final_score)
 
     # ====================================================
     # 4. 輸出
     # ====================================================
     final_series = pd.Series(final_score, index=df.index)
     
-    # 3日平均平滑化
+    # 平滑化
     df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
     
-    # 動態日誌
-    cond_panic_log = (df['VIX'] > 25) & (df['Alpha_Score'] > 60)
-    cond_trap_log = (df['VIX'] < 20) & (is_downtrend) & (df['Alpha_Score'] < 0)
-    
-    df['Score_Log'] = np.where(cond_panic_log, "💎 VIX恐慌錯殺",
-                      np.where(cond_trap_log, "⚠️ 個股弱勢/避開",
-                      np.where(df['Alpha_Score'] > 60, "強勢/反彈", "盤整")))
+    # 狀態標籤
+    df['Score_Log'] = np.where(is_golden_pit, "💎 恐慌抄底",
+                      np.where(is_healthy_trend, "🚀 順勢動能",
+                      np.where(df['Alpha_Score'] > 60, "回檔佈局", 
+                      np.where(bad_stock_mask, "⚠️ 避開", "盤整"))))
     
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
