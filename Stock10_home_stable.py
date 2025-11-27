@@ -437,9 +437,9 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v8.0 (Cooldown Edition):
-    1. 新增「交易冷卻期」：賣出後 N 天內禁止開新倉，防止死魚盤頻繁刷單。
-    2. 提高進場門檻：預設從 60 提高到 65 (更確認趨勢才進)。
+    策略引擎 v8.1 (Bug Fix Edition):
+    修復 v8.0 在冷卻期間導致 confidences 列表長度不匹配的錯誤。
+    改將列表 append 動作統一移至迴圈末端執行，確保資料長度一致。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -450,14 +450,15 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
     position = 0
     entry_price = 0.0
     highest_price = 0.0 
-    
-    # [關鍵] 冷卻計數器
     cooldown_counter = 0 
     
     close = df['Close'].values
     scores = df['Alpha_Score'].values
-    ma60 = df['MA60'].values
+    ma60 = df['MA60'].values if 'MA60' in df.columns else df['Close'].values # 防呆
     
+    # 讀取 Score_Log (若無則補空)
+    score_logs = df['Score_Log'].values if 'Score_Log' in df.columns else [""] * len(df)
+
     for i in range(len(df)):
         signal = position
         reason_str = ""
@@ -466,30 +467,36 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
         curr_score = scores[i]
         curr_price = close[i]
         
-        # 處理冷卻期
+        # 初始化當次迴圈的信心值 (預設為 0)
+        this_confidence = 0
+        
+        # --- 分支 1: 冷卻期 (強制觀望) ---
         if cooldown_counter > 0:
             cooldown_counter -= 1
-            # 強制觀望
             action_code = "Wait" 
             reason_str = f"冷卻中 ({cooldown_counter})"
+            # 這裡不需要 append，統一在最後做
         
-        # --- 進場邏輯 ---
+        # --- 分支 2: 空手進場邏輯 ---
         elif position == 0:
-            # 必須過了冷卻期才能買
             if curr_score >= buy_threshold:
                 signal = 1
                 entry_price = curr_price
                 highest_price = curr_price
                 action_code = "Buy"
-                reason_str = df['Score_Log'].iloc[i]
-                confidences.append(int(curr_score))
+                reason_str = score_logs[i]
+                this_confidence = int(curr_score) # 記錄信心
             else:
-                confidences.append(0)
+                this_confidence = 0
 
-        # --- 出場邏輯 ---
+        # --- 分支 3: 持倉出場邏輯 ---
         elif position == 1:
             if curr_price > highest_price: highest_price = curr_price
             
+            # 防除以零
+            if highest_price == 0: highest_price = curr_price
+            if entry_price == 0: entry_price = curr_price
+
             dd_from_peak = (curr_price - highest_price) / highest_price
             pnl_pct = (curr_price - entry_price) / entry_price
             
@@ -517,31 +524,32 @@ def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.00
                 action_code = "Sell"
                 sign = "+" if pnl_pct > 0 else ""
                 ret_label = f"{sign}{pnl_pct*100:.1f}%"
-                
-                # [關鍵] 設定冷卻期
-                # 賣出後，強迫休息 5 天，讓市場沈澱
-                cooldown_counter = 5 
+                cooldown_counter = 5 # 賣出後冷卻 5 天
             
-            confidences.append(0)
+            this_confidence = 0
 
+        # === 統一在迴圈末端更新列表，確保長度絕對一致 ===
         position = signal
         positions.append(signal)
         reasons.append(reason_str)
         actions.append(action_code)
         return_labels.append(ret_label)
+        confidences.append(this_confidence) # [Fix] 修復點
 
     df['Position'] = positions
     df['Reason'] = reasons
     df['Action'] = actions
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
-    
-    # 計算績效... (與之前相同，省略以節省篇幅)
+
+    # 計算績效
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
+    
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
+    
     df['Strategy_Return'] = (df['Real_Position'] * df['Market_Return']) - cost_series
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
