@@ -958,17 +958,17 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v23.0 (The Panic Injector):
-    解決「恐慌時分數反應遲鈍」的問題。
+    Alpha Score v24.0 (The Titan Value):
+    針對「強勢權值股跌不深導致錯過買點」進行修復。
     
-    [核心進化] 直通式加分 (Direct Injection)
-    不再依賴僵化的 Z-Score 閾值來觸發恐慌訊號。
-    改用「線性增壓」邏輯：
-    1. VIX 增壓：VIX 只要超過 20 (警戒線)，每高 1 點，分數直接 +2。
-    2. 乖離增壓：股價只要在季線下，每低 1%，分數直接 +3。
-    
-    這確保了在「VIX 30 + 負乖離 10%」這種送分題出現時，
-    分數會由數學公式強制推升至 100 分，絕不錯過。
+    [核心進化] 泰坦折扣 (Titan Discount)
+    權值股與小型股的抄底標準完全脫鉤：
+    1. 對於泰坦股 (Titan)：
+       - 只要跌破季線 (Bias < 0) 且 RSI < 45 (稍微回檔)，直接判定為「黃金買點 (90分)」。
+       - 理由：強勢股回測季線即買點，不需等待崩盤。
+    2. 對於游擊股 (Guerrilla)：
+       - 維持 Bias < -15% 且 RSI < 25 的嚴格標準。
+       - 理由：小型股跌破季線可能是趨勢反轉，必須跌到見骨才安全。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -993,21 +993,22 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_titan = avg_dollar_vol > 5_000_000_000 
 
     # ====================================================
-    # 2. 統計因子 (Z-Scores) - 用於判斷趨勢強弱
+    # 2. 統計因子
     # ====================================================
     
-    # A. 斜率 Z
+    # 斜率 & 籌碼
     ma60_diff = df['MA60'].diff()
-    slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std().replace(0, 0.001)
-    slope_z = slope_z.fillna(0)
+    slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std().replace(0, 0.001).fillna(0)
     
-    # B. 籌碼 Z
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().replace(0, 0.01)
-    inst_z = inst_z.fillna(0)
+    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().replace(0, 0.01).fillna(0)
     
+    # 乖離率 (Bias)
+    bias_pct = ((close - df['MA60']) / df['MA60']) * 100
+    curr_rsi = df['RSI'].fillna(50)
+
     # ====================================================
-    # 3. 合成總分 (The Calculation)
+    # 3. 合成總分 (分流邏輯)
     # ====================================================
     
     if is_titan:
@@ -1016,50 +1017,59 @@ def calculate_alpha_score(df, margin_df, short_df):
         w_trend = 0.3; w_chip = 0.7; mode_log = "🐆 游擊"
     
     # [A] 基礎分 (50分中心)
-    # 反映正常的趨勢與籌碼狀態
     weighted_z = (slope_z * w_trend + inst_z * w_chip)
     base_score = 50 + (weighted_z * 15)
     
-    # [B] 泰坦趨勢溢價
-    # 只要權值股在季線上，就給予 10 分的基本盤 (確保不輕易賣出)
-    titan_bonus = np.where((is_titan) & (close > df['MA60']), 10, 0)
+    # [B] 泰坦順勢溢價 (Titan Trend Premium)
+    # 只要在季線上，就是好股，給予 +10 分基本盤
+    titan_trend_bonus = np.where((is_titan) & (close > df['MA60']), 10, 0)
     
-    # [C] 恐慌注油器 (Panic Injector) - 這是解決您問題的關鍵
-    # 1. VIX 溢價：VIX 每超過 20 一點，加 2 分
-    vix_excess = np.maximum(0, df['VIX'] - 20)
-    vix_score = vix_excess * 2.0  # VIX 30 -> +20分, VIX 40 -> +40分
+    # [C] 恐慌注油器 (The Panic Injector - 升級版)
+    # 這是解決「左側沒買」的關鍵
     
-    # 2. 乖離溢價：股價在季線下，每低 1%，加 3 分
-    # 負乖離越大 (bias_pct 越負)，加分越多
-    bias_pct = ((close - df['MA60']) / df['MA60']) * 100
-    bias_excess = np.maximum(0, -bias_pct) # 只取負乖離部分，轉為正數
+    panic_score = np.zeros(len(df))
     
-    # 只有在 VIX 偏高 (>22) 時，負乖離才視為「黃金坑」，否則可能是「基本面轉差」
-    # 使用 sigmoid 函數或簡單的門檻來啟動
-    panic_activation = np.where(df['VIX'] > 22, 1.0, 0.0)
+    # 轉 Numpy 加速
+    bias_val = bias_pct.values
+    rsi_val = curr_rsi.values
+    vix_val = df['VIX'].values
     
-    # 乖離加分：跌 10% -> 30分
-    reversion_score = (bias_excess * 3.0) * panic_activation
-    
+    for i in range(len(df)):
+        bonus = 0
+        
+        # --- 策略分支 ---
+        if is_titan:
+            # === 泰坦股邏輯 (寬容) ===
+            # 只要跌破季線 (Bias < 0) 且 RSI < 45 (稍微超賣)
+            # 或者 VIX > 25 (市場恐慌)
+            if (bias_val[i] < -2 and rsi_val[i] < 45) or (vix_val[i] > 25 and bias_val[i] < 0):
+                bonus = 50 # 直接加爆，讓分數衝上 90+
+        else:
+            # === 游擊股邏輯 (嚴格) ===
+            # 必須跌很深 (Bias < -15) 或 極度恐慌 (VIX > 28 + RSI < 25)
+            if (bias_val[i] < -15 and rsi_val[i] < 25) or (vix_val[i] > 28 and rsi_val[i] < 25):
+                bonus = 50
+        
+        panic_score[i] = bonus
+
     # [D] 最終總分
-    # 基礎分 + 趨勢溢價 + 恐慌溢價
-    final_score_series = base_score + titan_bonus + vix_score + reversion_score
+    final_score_series = base_score + titan_trend_bonus + panic_score
     
-    # 寫入 (平滑化)
-    # 這裡平滑化不能太強，否則會把 V 型反轉的尖點磨掉
-    df['Alpha_Score'] = final_score_series.rolling(2, min_periods=1).mean().clip(0, 100)
+    # 寫入 (平滑化 - 降低雜訊，但保留峰值)
+    # 使用 rolling max 來保留恐慌時的瞬間高分
+    raw_series = final_score_series
+    smooth_series = raw_series.rolling(3, min_periods=1).mean()
+    df['Alpha_Score'] = np.maximum(raw_series, smooth_series).clip(0, 100)
     
     # 生成 Log
     logs = []
     score_val = df['Alpha_Score'].values
-    vix_val = df['VIX'].values
     
     for i in range(len(df)):
         log = mode_log # 預設
         
-        # 優先顯示恐慌訊號
-        if vix_val[i] > 25 and score_val[i] > 80:
-            log = "💎 恐慌黃金坑"
+        if panic_score[i] > 0:
+            log = "💎 價值黃金坑" # 泰坦股跌破季線就是黃金
         elif score_val[i] > 80: 
             log = f"{mode_log} 極強"
         elif score_val[i] > 60: 
