@@ -499,19 +499,12 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v18.0 (The Trend Anchor):
-    解決「漲勢中頻繁被洗出場 (發神經)」的問題。
-    
-    [核心進化] 趨勢定錨
-    1. 修正分數衰退賣點：
-       - 舊版：掉 25 分就賣 -> 太敏感。
-       - 新版：掉 30 分 且 目前分數 < 60 才能賣。
-       - 意義：只要分數還維持在多頭區 (60+)，就算回檔也不賣。
-       
-    2. 泰坦定錨 (Titan Anchor):
-       - 對於權值股，只要股價穩守季線 (MA60) 且季線向上，
-       - 強制屏蔽所有「技術指標轉弱」的賣訊。
-       - 只有「跌破季線」或「災難停損」才能讓你下車。
+    策略引擎 v20.0 (Hysteresis Trend Following)
+    修正目標：解決過早停利與頻繁被洗出場的問題。
+    核心機制：
+    1. 遲滯效應 (Hysteresis): 進場 > 60，出場 < -10。創造持倉緩衝區。
+    2. ATR 動態停損: 使用波動率計算停損點，而非固定 %。
+    3. VWAP 趨勢保護: 只要價格在 VWAP 之上，容忍分數短期回檔。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -522,28 +515,17 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     position = 0
     entry_price = 0.0
     highest_price = 0.0
+    stop_loss_price = 0.0
     
-    # 記錄持倉期間的「最高評分」
-    peak_score = 0.0 
-    
-    # 身份識別
-    close_val = df['Close'].values
-    vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
-    avg_dollar_vol = np.nanmean(close_val * vol_val)
-    if np.isnan(avg_dollar_vol): avg_dollar_vol = 0
-    is_titan = avg_dollar_vol > 5_000_000_000 
-    
-    ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
-    # 計算季線斜率 (用於定錨)
-    ma60_slope = pd.Series(ma60).diff(5).fillna(0).values
+    # 預先計算 ATR 用於動態停損
+    high = df['High']; low = df['Low']; close = df['Close']
+    tr = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean().fillna(0).values
     
     scores = df['Alpha_Score'].values
+    close_val = df['Close'].values
+    vwap_val = df['VWAP_20'].values if 'VWAP_20' in df.columns else close_val # 防呆
     
-    # ATR
-    high = df['High']; low = df['Low']
-    tr = pd.concat([high - low, (high - close_val).abs(), (low - close_val).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().fillna(0).values
-
     for i in range(len(df)):
         signal = position
         reason_str = ""
@@ -552,78 +534,55 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
         
         curr_price = close_val[i]
         curr_score = scores[i]
-        curr_ma60 = ma60[i]
+        curr_atr = atr[i] if atr[i] > 0 else curr_price * 0.02
+        curr_vwap = vwap_val[i]
         
-        # 防呆
-        if np.isnan(curr_score) or np.isinf(curr_score): valid_score = 50
-        else: valid_score = int(curr_score)
-        
-        # --- 進場 ---
+        # --- 進場邏輯 (Entry) ---
         if position == 0:
-            if valid_score >= buy_threshold:
-                # 再次確認：如果是權值股，空頭走勢(季線下)盡量不追高，除非是恐慌底(>85)
-                if is_titan and curr_price < curr_ma60 and valid_score < 85:
-                    pass
-                else:
-                    signal = 1
-                    entry_price = curr_price
-                    highest_price = curr_price
-                    peak_score = valid_score
-                    
-                    action_code = "Buy"
-                    reason_str = "趨勢啟動" if valid_score < 85 else "恐慌抄底"
-            else:
-                pass 
-
-        # --- 出場 ---
+            # 條件：分數夠高 且 價格確認站上 VWAP (避免接到正在下跌的刀子)
+            if curr_score >= buy_threshold and curr_price > curr_vwap:
+                signal = 1
+                entry_price = curr_price
+                highest_price = curr_price
+                
+                # 設定初始停損：成本價 - 2倍 ATR (比固定 % 更能適應波動)
+                stop_loss_price = entry_price - (2.0 * curr_atr)
+                
+                action_code = "Buy"
+                reason_str = "趨勢啟動"
+        
+        # --- 出場邏輯 (Exit) ---
         elif position == 1:
-            if curr_price > highest_price: highest_price = curr_price
-            if valid_score > peak_score: peak_score = valid_score 
+            # 更新最高價與移動停損
+            if curr_price > highest_price:
+                highest_price = curr_price
+                # 移動停損：最高價回檔 3倍 ATR，確保吃到波段
+                new_stop = highest_price - (3.0 * curr_atr)
+                if new_stop > stop_loss_price:
+                    stop_loss_price = new_stop
             
             pnl_pct = (curr_price - entry_price) / entry_price
             is_sell = False
             
-            # ====================================================
-            # [核心修正] 出場邏輯分流
-            # ====================================================
-            
-            # --- 情境 A: 泰坦定錨 (權值股且季線向上) ---
-            # 只要季線方向是對的，我們就無視短線分數波動
-            is_trend_intact = is_titan and (curr_price > curr_ma60) and (ma60_slope[i] > 0)
-            
-            if is_trend_intact:
-                # 只有極端情況才賣
-                if valid_score < 20: # 1. 基本面/籌碼崩盤
-                    is_sell = True; reason_str = "評分崩盤"
-                elif curr_price < curr_ma60 * 0.99: # 2. 意外跌破季線
-                    is_sell = True; reason_str = "意外破線"
-                # (這裡拿掉了分數衰退賣訊，死抱!)
-                
-            # --- 情境 B: 一般情況 (小型股 或 權值股轉弱) ---
-            else:
-                # 1. 分數顯著衰退 (且分數已轉弱)
-                # [修正點] 必須 Current < 60 才能賣，防止在強勢區被洗掉
-                if peak_score > 75 and valid_score < (peak_score - 30) and valid_score < 60:
-                    is_sell = True
-                    reason_str = "動能衰退"
-                    
-                # 2. 結構轉空
-                elif valid_score < 30:
-                    is_sell = True
-                    reason_str = "評分轉空"
-                
-                # 3. 價格破線
-                elif curr_price < curr_ma60:
-                    buffer = 0.99 if is_titan else 1.0
-                    if curr_price < curr_ma60 * buffer:
-                        is_sell = True
-                        reason_str = "跌破季線"
-            
-            # --- 通用災難停損 ---
-            if pnl_pct < -0.15:
+            # 1. 硬性停損 (Hit Stop Loss)
+            if curr_price < stop_loss_price:
                 is_sell = True
-                reason_str = "災難停損"
+                reason_str = "觸價停損"
+            
+            # 2. 趨勢反轉出場 (Trend Reversal)
+            # 邏輯：分數跌破 -10 (轉空) 且 價格跌破 VWAP (趨勢破壞)
+            # [關鍵] 這裡使用了 Hysteresis：進場要 60，出場要 -10，中間區域都是續抱區
+            elif curr_score < -10 and curr_price < curr_vwap:
+                is_sell = True
+                reason_str = "趨勢反轉"
+            
+            # 3. 極端乖離獲利了結 (Climax Profit Taking)
+            # 如果乖離率過大 (例如價格 > VWAP 20%) 且 分數開始掉頭，可以部分獲利(這裡簡化為全出)
+            elif (curr_price - curr_vwap) / curr_vwap > 0.25 and curr_score < 70:
+                is_sell = True
+                reason_str = "乖離過大"
 
+            # 執行賣出
             if is_sell:
                 signal = 0
                 action_code = "Sell"
@@ -635,7 +594,7 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
         reasons.append(reason_str)
         actions.append(action_code)
         return_labels.append(ret_label)
-        confidences.append(valid_score)
+        confidences.append(curr_score)
 
     df['Position'] = positions
     df['Reason'] = reasons
@@ -922,13 +881,11 @@ def analyze_signal(final_df):
 def calculate_alpha_score(df, margin_df, short_df):
     """
     Alpha Score v30.0 (Deep Quantitative Edition)
-    核心邏輯：VWAP成本定錨 + CMF資金流向 + 動能二階導數 + 波動率壓縮
+    修正目標：解決過度敏感與雜訊問題，引入 VWAP 與 CMF 機構邏輯。
     """
     df = df.copy()
     
-    # ==========================================
     # 0. 基礎數據清洗與防呆
-    # ==========================================
     if df.empty or len(df) < 30:
         df['Alpha_Score'] = 0
         df['Score_Log'] = "資料不足"
@@ -952,17 +909,25 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ==========================================
 
     # [F1] VWAP 定錨因子 (Volume Weighted Average Price)
-    # 邏輯：股價在月均成本(VWAP)之上，且乖離率擴大中，代表趨勢強勁
+    # 邏輯：股價在月均成本(VWAP)之上，且乖離率擴大中，代表有效突破
     tp = (high + low + close) / 3
-    vwap = (tp * vol).rolling(20).sum() / vol.rolling(20).sum()
+    # 計算 20日 Rolling VWAP
+    vwap_num = (tp * vol).rolling(20).sum()
+    vwap_den = vol.rolling(20).sum()
+    vwap = vwap_num / vwap_den
     vwap_std = close.rolling(20).std().fillna(method='bfill')
+    
     # Z-Score 標準化：計算股價距離平均成本幾個標準差
-    f_vwap_z = ((close - vwap) / vwap_std).fillna(0)
+    # 限制在 +/- 3 之間，避免極端值
+    f_vwap_z = ((close - vwap) / vwap_std).fillna(0).clip(-3, 3)
     
     # [F2] CMF 資金流向因子 (Chaikin Money Flow)
-    # 邏輯：判斷資金是在吸籌還是出貨 (比單純法人買賣超更即時)
-    mf_multiplier = ((close - low) - (high - close)) / (high - low).replace(0, 0.01)
+    # 邏輯：判斷資金是在吸籌還是出貨 (高位收盤+爆量=吸籌)
+    # 避免 high=low 導致除以零
+    hl_range = (high - low).replace(0, 0.01) 
+    mf_multiplier = ((close - low) - (high - close)) / hl_range
     mf_volume = mf_multiplier * vol
+    # 20日資金流
     f_cmf = mf_volume.rolling(20).sum() / vol.rolling(20).sum()
     f_cmf = f_cmf.fillna(0) * 10  # 放大係數以便權重計算
 
@@ -978,108 +943,82 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 正規化：除以股價以消除高價股數值過大的問題
     f_mom_norm = (f_mom_acc / close) * 1000 
 
-    # [F4] 法人籌碼因子 (Institutional Impact)
-    # 邏輯：法人淨買超佔成交量的比重，並進行平滑處理
-    if 'Inst_Net_Buy' in df.columns:
-        inst_ratio = df['Inst_Net_Buy'] / vol
-        f_inst = inst_ratio.rolling(5).mean().fillna(0) * 20 # 係數調整
-    else:
-        f_inst = pd.Series(0, index=df.index)
-
-    # [F5] 波動率壓縮因子 (Volatility Squeeze)
-    # 邏輯：當布林通道寬度 (BandWidth) 處於低檔，暗示變盤在即
+    # [F4] 波動率壓縮因子 (Volatility Squeeze)
+    # 邏輯：當布林通道寬度處於低檔，暗示變盤在即，用於放大訊號
     bb_std = close.rolling(20).std()
     bb_mid = close.rolling(20).mean()
     bb_width = (4 * bb_std) / bb_mid
-    # 用過去 60 天的寬度百分位數 (Percentile) 來判斷是否壓縮
-    # 如果 bb_width 是近 60 天最低，值會接近 0，我們希望這時候加權重(預備突破)
+    # 計算過去 60 天的寬度位置 (0=最窄/壓縮, 1=最寬/發散)
     min_width = bb_width.rolling(60).min()
     max_width = bb_width.rolling(60).max()
-    f_squeeze = 1 - ((bb_width - min_width) / (max_width - min_width)).fillna(0.5)
+    width_range = (max_width - min_width).replace(0, 1)
+    # 反轉：數值越大代表越壓縮
+    f_squeeze = 1 - ((bb_width - min_width) / width_range).fillna(0.5)
     
     # ==========================================
     # 2. 向量合成 (Vector Synthesis)
     # ==========================================
     
-    # 定義權重 (可根據回測結果微調)
-    w_vwap = 35.0   # 趨勢是王道
-    w_cmf = 25.0    # 資金流向確認真實性
-    w_mom = 20.0    # 動能加速提供切入點
-    w_inst = 20.0   # 籌碼提供續航力
+    # 權重配置：強調 VWAP 趨勢與 CMF 資金真實性
+    w_vwap = 40.0   
+    w_cmf = 30.0    
+    w_mom = 30.0    
     
     # 原始分數合成
     raw_score = (f_vwap_z * w_vwap) + \
                 (f_cmf * w_cmf) + \
-                (f_mom_norm * w_mom) + \
-                (f_inst * w_inst)
+                (f_mom_norm * w_mom)
     
-    # 加入 Squeeze 的乘數效應：
-    # 如果處於壓縮狀態 (f_squeeze 高) 且 動能向上 (raw_score > 0)，放大得分 (預期爆發)
-    # 如果處於壓縮狀態 且 動能向下，放大扣分 (預期崩跌)
-    squeeze_multiplier = 1 + (f_squeeze * 0.5) 
+    # [關鍵修正] Squeeze 乘數效應
+    # 只有在趨勢明確(raw_score絕對值大)且處於壓縮狀態時，才放大分數
+    # 避免在無趨勢的盤整壓縮中產生假訊號
+    squeeze_multiplier = 1 + (f_squeeze * 0.3) 
     adjusted_score = raw_score * squeeze_multiplier
 
     # ==========================================
-    # 3. 激活函數與標準化 (Activation & Normalization)
+    # 3. 激活函數 (Activation)
     # ==========================================
     
-    # 使用 Hyperbolic Tangent (tanh) 將分數非線性映射到 -100 ~ 100
-    # scale_factor 用於調整敏感度，數值越小，分數越容易接近極值
-    scale_factor = 60.0 
+    # 使用 tanh 將分數平滑映射到 -100 ~ 100
+    # scale_factor 越大，分數變化越平緩 (解決方波問題)
+    scale_factor = 50.0 
     final_score = np.tanh(adjusted_score / scale_factor) * 100
     
-    df['Alpha_Score'] = final_score.fillna(0)
+    # 再次平滑：消除單日雜訊，取 3 日移動平均
+    df['Alpha_Score'] = final_score.rolling(3).mean().fillna(0)
+    
+    # 寫入輔助指標供策略使用
+    df['VWAP_20'] = vwap
     
     # ==========================================
-    # 4. 生成分析日誌 (Interpretation Log)
+    # 4. 生成分析日誌
     # ==========================================
     logs = []
-    
-    # 轉為 numpy array 加速迴圈
     score_val = df['Alpha_Score'].values
     vwap_z_val = f_vwap_z.values
     cmf_val = f_cmf.values
     mom_val = f_mom_norm.values
-    inst_val = f_inst.values
-    squeeze_val = f_squeeze.values
     
     for i in range(len(df)):
         s = score_val[i]
         reasons = []
         
         # 狀態判斷
-        if s > 75: 
-            base_log = "🔥 極強多頭"
-            if squeeze_val[i] > 0.8: reasons.append("壓縮後爆發")
-        elif s > 40: 
-            base_log = "📈 趨勢偏多"
-        elif s < -75: 
-            base_log = "💀 崩盤/極空"
-        elif s < -40: 
-            base_log = "📉 趨勢偏空"
-        else: 
-            base_log = "⚖️ 盤整/觀望"
+        if s > 60: base_log = "📈 多頭確立"
+        elif s > 20: base_log = "🌤️ 偏多整理"
+        elif s < -60: base_log = "📉 空頭確立"
+        elif s < -20: base_log = "🌧️ 偏空整理"
+        else: base_log = "⚖️ 多空不明"
             
-        # 細節歸因 (Attribution Analysis)
-        if vwap_z_val[i] > 2.0: reasons.append("成本乖離大")
-        if cmf_val[i] > 1.5: reasons.append("主力吸籌")
-        elif cmf_val[i] < -1.5: reasons.append("主力出貨")
+        # 歸因
+        if vwap_z_val[i] > 1.5: reasons.append("站穩均價")
+        if cmf_val[i] > 1.0: reasons.append("主力進駐")
+        if mom_val[i] > 1.0: reasons.append("動能轉強")
         
-        if mom_val[i] > 1.0: reasons.append("動能加速")
-        elif mom_val[i] < -1.0: reasons.append("動能失速")
-            
-        if inst_val[i] > 2.0: reasons.append("法人重倉")
-        
-        # 組合字串
         detail = f" ({', '.join(reasons)})" if reasons else ""
         logs.append(base_log + detail)
         
     df['Score_Log'] = logs
-    
-    # 輔助變數 (用於圖表顯示)
-    df['Score_VWAP_Z'] = f_vwap_z
-    df['Score_CMF'] = f_cmf
-    
     return df
 
 
