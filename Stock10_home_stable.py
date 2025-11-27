@@ -819,11 +819,10 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v9.0 (The Safety Net):
-    針對「空頭接刀」問題進行最終修復。
-    新增「空頭防禦機制」：
-    1. 當季線向下 (Slope < 0) 時，廢除普通 RSI 超賣訊號。
-    2. 空頭時只有「爆量恐慌 (Capitulation)」才允許抄底，否則視為陰跌 (Slow Bleed)，給予負分。
+    Alpha Score v9.2 (Adaptive Panic Ladder):
+    針對「高 VIX 卻沒買」的問題進行修復。
+    引入「動態恐慌階梯」：
+    VIX 越高，對個股 RSI 的超賣標準越寬鬆，避免因為差 1-2 分的 RSI 而錯過世紀大底。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -855,32 +854,38 @@ def calculate_alpha_score(df, margin_df, short_df):
     bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
     
-    # 均線斜率與距離
     ma60_slope = df['MA60'].diff(5).fillna(0)
     ma_gap = (abs(df['MA20'] - df['MA60']) / df['MA60']) * 100
 
     # ====================================================
-    # 2. 狀態定義 (嚴格化)
+    # 2. 狀態定義 (動態階梯)
     # ====================================================
     
-    # A. 空頭趨勢 (Downtrend)
-    # 定義：股價在季線下 且 季線斜率向下
+    # A. 空頭趨勢
     is_hard_downtrend = (df['Close'] < df['MA60']) & (ma60_slope < 0)
 
-    # B. 恐慌黃金坑 (True Panic)
-    # [修正] 必須區分「多頭回檔」與「空頭接刀」
+    # B. [核心修正] 動態恐慌階梯 (Panic Ladder)
+    vix = df['VIX']
     
-    # 條件1: 系統性恐慌 (VIX > 25) + RSI < 25 (不分多空)
-    systemic_panic = (df['VIX'] > 25) & (curr_rsi < 25)
+    # Level 1: 末日級恐慌 (VIX > 40) -> 閉眼買 (RSI < 45 即可)
+    panic_lvl_1 = (vix > 40) & (curr_rsi < 45)
     
-    # 條件2: 個股恐慌 (爆量趕底)
-    # 必須有量！量是陰跌與恐慌的區別
+    # Level 2: 嚴重恐慌 (VIX > 30) -> 寬鬆買 (RSI < 35)
+    panic_lvl_2 = (vix > 30) & (curr_rsi < 35)
+    
+    # Level 3: 一般恐慌 (VIX > 25) -> 標準買 (RSI < 25)
+    panic_lvl_3 = (vix > 25) & (curr_rsi < 25)
+    
+    # 只要符合任一階梯，視為系統性買點
+    systemic_panic = panic_lvl_1 | panic_lvl_2 | panic_lvl_3
+
+    # 個股恐慌 (爆量趕底) - 這裡維持原樣
     vol_spike = df['Volume'] > df['Vol_MA20'] * 1.8 
     capitulation = is_hard_downtrend & vol_spike & (curr_rsi < 25)
     
     is_golden_pit = systemic_panic | capitulation
     
-    # C. 死魚盤/糾結
+    # C. 死魚盤
     is_choppy = (ma_gap < 2.0) & (df['ADX'] < 25)
     
     # D. 強力噴出
@@ -913,41 +918,39 @@ def calculate_alpha_score(df, margin_df, short_df):
         score = 0
         log = "盤整"
         
-        # --- 1. 真黃金坑 (95分) ---
+        # 1. 黃金坑 (95分)
         if golden_arr[i]:
             score = 95
             log = "💎 恐慌黃金坑"
             
-        # --- 2. 空頭防禦 (負分) ---
-        # [關鍵修正] 如果是空頭趨勢，且沒發生真恐慌
-        # 即便 RSI < 30 也不買，判定為陰跌 (Slow Bleed)
+        # 2. 空頭防禦 (負分)
         elif downtrend_arr[i]:
             score = -50 
             log = "📉 空頭速跌"
-            # 只有 RSI 極端低 (<15) 才考慮搶極短反彈，但分數不給高
-            if rsi_arr[i] < 15:
+            # 空頭中的反彈，如果 VIX 很高但還沒到恐慌買點，可以給一點分數但不追高
+            if rsi_arr[i] < 15: 
                 score = 50
                 log = "搶極短反彈"
                 
-        # --- 3. 死魚盤 (0分) ---
+        # 3. 死魚盤 (0分)
         elif choppy_arr[i]:
             score = 0
             log = "💤 均線糾結"
             
-        # --- 4. 強力噴出 (85分) ---
+        # 4. 強力噴出 (85分)
         elif super_arr[i]:
             score = 85
             log = "🚀 強勢噴出"
             if rsi_arr[i] > 85: 
                 score = 70; log = "⚠️ 過熱警戒"
                 
-        # --- 5. 初升段 (65~75分) ---
+        # 5. 初升段 (65~75分)
         elif early_arr[i]:
             score = 65
             log = "📈 趨勢發散"
             if rsi_arr[i] < 70: score += 10
         
-        # --- 6. 盤整 (均值回歸) ---
+        # 6. 盤整
         else:
             if rsi_arr[i] < 40: score = 50; log = "弱勢盤整"
             else: score = 0; log = "觀望"
@@ -955,8 +958,12 @@ def calculate_alpha_score(df, margin_df, short_df):
         final_score[i] = score
         logs.append(log)
 
-    final_series = pd.Series(final_score, index=df.index)
-    df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
+    # ====================================================
+    # 4. 輸出優化 (峰值保留)
+    # ====================================================
+    raw_series = pd.Series(final_score, index=df.index)
+    smooth_series = raw_series.rolling(3, min_periods=1).mean()
+    df['Alpha_Score'] = np.maximum(raw_series, smooth_series).clip(-100, 100)
     df['Score_Log'] = logs
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
