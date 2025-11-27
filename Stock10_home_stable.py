@@ -2034,6 +2034,7 @@ elif page == "📋 全台股清單":
         st.dataframe(df_show, use_container_width=True, hide_index=True)
 
 # --- 頁面 3.5 (局部無感刷新版): 持股健診 ---
+# --- 頁面 3.5 (局部無感刷新版): 持股健診 ---
 elif page == "💼 持股健診與建議":
     st.markdown("### 💼 智能持股健診 (Portfolio Doctor)")
     
@@ -2044,8 +2045,20 @@ elif page == "💼 持股健診與建議":
         st.caption("⚠️ 訪客模式")
 
     # ==========================================
-    # 1. 準備輸入資料與 [關鍵] 控制開關
+    # 1. [修正] 準備輸入資料 (使用 Callback 鎖定狀態)
     # ==========================================
+    
+    # 定義 Callback：當表格被編輯時，立刻執行此函式存檔
+    def on_portfolio_change():
+        # 從 editor 的 key 中取出最新資料，強制更新到 portfolio_data
+        new_df = st.session_state["portfolio_editor"]
+        st.session_state['portfolio_data'] = new_df
+        
+        # 如果已登入，同步寫入資料庫
+        if st.session_state.get('logged_in'):
+            save_portfolio_to_db(st.session_state['username'], new_df)
+
+    # 初始化資料 (只在第一次執行)
     if 'portfolio_data' not in st.session_state:
         if st.session_state.get('logged_in'):
             db_df = load_portfolio_from_db(st.session_state['username'])
@@ -2059,17 +2072,20 @@ elif page == "💼 持股健診與建議":
     
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
-        edited_df = st.data_editor(
-            st.session_state['portfolio_data'], num_rows="dynamic", use_container_width=True, key="portfolio_editor",
+        
+        # [關鍵修正]：移除原本的返回值賦值，改用 key + on_change
+        # 這樣做可以確保資料在編輯當下就被鎖定，不會因為頁面刷新而重置
+        st.data_editor(
+            st.session_state['portfolio_data'], 
+            num_rows="dynamic", 
+            use_container_width=True, 
+            key="portfolio_editor",  # 綁定 Session Key
+            on_change=on_portfolio_change, # 綁定觸發函式
             column_config={
                 "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號"),
                 "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
             }
         )
-        if not edited_df.equals(st.session_state['portfolio_data']):
-            st.session_state['portfolio_data'] = edited_df
-            if st.session_state.get('logged_in'):
-                save_portfolio_to_db(st.session_state['username'], edited_df)
 
     with col_ctrl:
         st.markdown("#### 2. 監控設定")
@@ -2078,6 +2094,7 @@ elif page == "💼 持股健診與建議":
         # [關鍵] 必須先定義這個變數，下面的 @st.fragment 才能讀取到
         enable_monitor = st.toggle("🔴 啟動盤中實時監控 (每 60 秒更新)", value=False)
 
+        
     # ==========================================
     # 3. 定義局部刷新片段 (The Fragment)
     # [注意] 這個函式必須放在 enable_monitor 定義之後
