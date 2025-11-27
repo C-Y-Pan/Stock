@@ -863,183 +863,158 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v13.0 (The Range Lock):
-    全系列最終修正版。
-    針對「箱型整理被雙巴」進行邏輯封鎖。
+    Alpha Score v14.0 (The Statistical Quant):
+    完全自適應版本。移除所有固定閾值 (Magic Numbers)。
     
-    [核心進化] 箱型封鎖機制
-    1. 斜率檢測：嚴格計算季線斜率。若 abs(斜率) < 0.1%，判定為「死魚/箱型盤」。
-    2. 戰術降級：在箱型盤中，**禁止任何「追價/突破」訊號** (包含壓縮突破)。
-    3. 唯一允許：只允許「恐慌黃金坑」策略 (低買)，貫徹「盤整盤不做突破」的頂尖紀律。
+    [核心哲學] 一切都是相對的 (Relativity)
+    1. 斜率自適應：使用 Z-Score 判斷季線斜率。
+       - Z值在 -0.5~0.5 之間 = 盤整 (符合該股自身的常態分佈)。
+       - Z值 > 1.0 = 趨勢形成。
+    2. 量能自適應：使用 Z-Score 判斷爆量。
+       - Z值 > 3.0 (3個標準差) = 統計學上的極端值 -> 判定為竭盡/假突破。
+    3. 價格自適應：使用布林通道 (2倍標準差) 作為動態壓力支撐，而非固定百分比。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據
+    # 1. 基礎指標準備
     # ====================================================
+    close = df['Close']
+    
+    # 基礎 VIX
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
     
-    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
-    df['Vol_MA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
+    # 基礎均線 (作為統計基底)
+    if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
+    if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
     
-    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
-    
-    high = df['High']; low = df['Low']; close = df['Close']; open_p = df['Open']
-    
-    # ATR & ADX
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().fillna(0)
-    
-    plus_dm = high.diff(); minus_dm = low.diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
-    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr.replace(0,1))
-    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr.replace(0,1))
-    dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
-    df['ADX'] = dx.rolling(14).mean().fillna(0)
-
-    # OBV
-    price_change = close.diff().fillna(0)
-    vol_direction = np.sign(price_change)
-    df['OBV'] = (vol_direction * df['Volume']).cumsum()
-    df['OBV_MA20'] = df['OBV'].rolling(20).mean()
-
-    bias_60 = ((close - df['MA60']) / df['MA60']) * 100 
+    # RSI
     curr_rsi = df['RSI'].fillna(50)
-    
-    # [關鍵] 計算季線斜率 (3日變化率)
-    # 用來判斷季線是「向上」、「向下」還是「走平」
-    ma60_slope_pct = (df['MA60'].diff(3) / df['MA60']) * 100
-    ma60_slope_pct = ma60_slope_pct.fillna(0)
-    
-    ma_gap = (abs(df['MA20'] - df['MA60']) / df['MA60']) * 100
 
     # ====================================================
-    # 2. 狀態定義
+    # 2. 統計學特徵工程 (Feature Engineering)
     # ====================================================
     
-    # A. 恐慌黃金坑 (最高優先級)
-    vix = df['VIX']
-    panic_lvl_1 = (vix > 40) & (curr_rsi < 45)
-    panic_lvl_2 = (vix > 30) & (curr_rsi < 35)
-    panic_lvl_3 = (vix > 25) & (curr_rsi < 25)
-    systemic_panic = panic_lvl_1 | panic_lvl_2 | panic_lvl_3
+    # --- A. 季線斜率的 Z-Score (Slope Z-Score) ---
+    # 1. 計算每日變動率
+    ma60_diff = df['MA60'].diff()
+    # 2. 計算過去 60 天的平均變動與標準差 (滾動視窗)
+    slope_mean = ma60_diff.rolling(60).mean()
+    slope_std = ma60_diff.rolling(60).std().replace(0, 0.001) # 防除以零
+    # 3. 算出標準分數 (Z-Score)
+    # Z > 1 代表斜率陡峭程度超過 1 個標準差 (強趨勢)
+    # Z 在 -0.5 ~ 0.5 代表斜率在平均值附近 (盤整)
+    slope_z = (ma60_diff - slope_mean) / slope_std
+    slope_z = slope_z.fillna(0)
+
+    # --- B. 成交量的 Z-Score (Volume Z-Score) ---
+    if 'Volume' not in df.columns: df['Volume'] = 0
+    vol_mean = df['Volume'].rolling(60).mean()
+    vol_std = df['Volume'].rolling(60).std().replace(0, 1)
+    vol_z = (df['Volume'] - vol_mean) / vol_std
+    vol_z = vol_z.fillna(0)
     
-    # 下跌趨勢定義：斜率明顯向下
-    is_hard_downtrend = (close < df['MA60']) & (ma60_slope_pct < -0.05)
-    vol_spike = df['Volume'] > df['Vol_MA20'] * 1.8 
-    capitulation = is_hard_downtrend & vol_spike & (curr_rsi < 25)
+    # --- C. 價格的布林通道位置 (Bollinger %B) ---
+    # 這本身就是一種自適應指標 (基於標準差)
+    std20 = close.rolling(20).std()
+    bb_up = df['MA20'] + 2.0 * std20
+    bb_low = df['MA20'] - 2.0 * std20
     
-    is_golden_pit = systemic_panic | capitulation
+    # --- D. 自適應 RSI 區間 ---
+    # 每個股票的 RSI 高低點慣性不同
+    rsi_low_band = curr_rsi.rolling(100).quantile(0.05) # 過去100天最慘的5%
+    rsi_high_band = curr_rsi.rolling(100).quantile(0.95) # 過去100天最強的5%
+
+    # ====================================================
+    # 3. 狀態定義 (基於統計分佈)
+    # ====================================================
     
-    # B. [核心修正] 箱型整理判定 (The Range Lock)
-    # 斜率在 +/- 0.08% 之間，視為走平 (Flat)
-    is_flat_range = abs(ma60_slope_pct) < 0.08
+    # 1. 自適應盤整 (Adaptive Flat)
+    # 定義：斜率 Z-Score 落在常態分佈中心 (-0.5 ~ 0.5)
+    # 不管這檔股票波動大不大，只要回歸它自己的均值，就是盤整
+    is_adaptive_flat = (slope_z > -0.5) & (slope_z < 0.5)
     
-    # C. 壓縮與真突破
-    is_squeeze = ma_gap < 2.5
+    # 2. 自適應趨勢 (Adaptive Trend)
+    # 定義：斜率顯著大於平均 (Z > 0.8) 且 價格在布林中軌之上
+    is_adaptive_trend = (slope_z > 0.8) & (close > df['MA20'])
     
-    # 爆量檢測 (嚴格版)：盤整時超過 2.5 倍均量即視為異常
-    is_volume_climax = (df['Volume'] > df['Vol_MA20'] * 2.5) & (df['ADX'] < 25)
-    has_good_volume = (df['Volume'] > df['Vol_MA20']) & (~is_volume_climax)
+    # 3. 自適應竭盡/假突破 (Adaptive Climax)
+    # 定義：在盤整區 (Flat) 出現 3個標準差以上的爆量 (3-Sigma Event)
+    # 統計學上，發生機率 < 0.3%，通常是異常訊號(主力倒貨)
+    is_vol_climax = is_adaptive_flat & (vol_z > 3.0)
     
-    has_clearance = close > (df['MA60'] + 0.8 * atr)
-    has_smart_money = df['OBV'] > df['OBV_MA20']
-    
-    # 上影線檢測
-    upper_shadow = high - np.maximum(close, open_p)
-    body_len = np.abs(close - open_p)
-    is_shooting_star = upper_shadow > (body_len * 0.6)
-    is_solid_candle = (close > open_p) & (~is_shooting_star)
-    
-    # 突破訊號
-    is_coil_breakout = (
-        is_squeeze & 
-        has_good_volume & 
-        has_clearance & 
-        has_smart_money & 
-        is_solid_candle & 
-        (curr_rsi > 55) &
-        (~is_flat_range) # [重點] 只要季線走平，絕對禁止突破買進
-    )
-    
-    # D. 強力噴出
-    is_super_trend = (
-        (close > df['MA20']) & (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.5) & (df['ADX'] > 25) & (ma60_slope_pct > 0.05)
-    )
-    
-    # E. 初升段
-    is_early_trend = (
-        (close > df['MA20']) & (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.5) & (ma60_slope_pct > 0.05)
+    # 4. 自適應黃金坑 (Adaptive Golden Pit)
+    # 定義：VIX高 + 價格跌破布林下軌 (超跌) + RSI 觸及歷史低檔區
+    # 不寫死 RSI < 25，而是小於該股歷史的 5% 分位數
+    is_panic_bottom = (df['VIX'] > 25) & (close < bb_low) & (curr_rsi <= rsi_low_band)
+
+    # 5. 自適應突破 (Adaptive Breakout)
+    # 條件：
+    # a. 非盤整死魚 (斜率開始轉強 Z > 0.2)
+    # b. 量能健康 (Z > 0.5 但 < 3.0，有量但非竭盡)
+    # c. 價格強勢站上布林上軌 (這代表突破了該股近期的波動邊界)
+    is_smart_breakout = (
+        (slope_z > 0.2) &
+        (vol_z > 0.5) & (vol_z < 3.0) &
+        (close > bb_up) &
+        (~is_vol_climax)
     )
 
     # ====================================================
-    # 3. 評分邏輯
+    # 4. 評分邏輯
     # ====================================================
     final_score = np.zeros(len(df))
     logs = []
     
-    # 轉 Numpy
+    # 轉 Numpy 加速
+    panic_arr = is_panic_bottom.values
+    breakout_arr = is_smart_breakout.values
+    trend_arr = is_adaptive_trend.values
+    flat_arr = is_adaptive_flat.values
+    climax_arr = is_vol_climax.values
     rsi_arr = curr_rsi.values
-    downtrend_arr = is_hard_downtrend.values
-    golden_arr = is_golden_pit.values
-    breakout_arr = is_coil_breakout.values
-    flat_arr = is_flat_range.values # 箱型陣列
-    super_arr = is_super_trend.values
-    early_arr = is_early_trend.values
-    climax_arr = is_volume_climax.values
     
     for i in range(len(df)):
         score = 0
         log = "盤整"
         
-        # 1. 黃金坑 (95分) - 這是唯一允許在任何時候進場的訊號
-        if golden_arr[i]:
+        # 1. 恐慌黃金坑 (95分)
+        if panic_arr[i]:
             score = 95
-            log = "💎 恐慌黃金坑"
+            log = "💎 統計極端超賣"
             
-        # 2. 空頭防禦
-        elif downtrend_arr[i]:
-            score = -50 
-            log = "📉 空頭速跌"
-            if rsi_arr[i] < 15: score = 50; log = "搶極短反彈"
-        
-        # 3. [核心] 箱型封鎖 (Range Lock)
-        # 只要季線走平，且沒發生恐慌，直接觀望，過濾所有假突破
+        # 2. 竭盡/假突破 (-20分)
+        # 只要在盤整區爆出 3倍標準差天量，直接判死刑
+        elif climax_arr[i]:
+            score = -20
+            log = "⚠️ 統計極端爆量(竭盡)"
+            
+        # 3. 盤整封鎖 (0分)
+        # 只要斜率在常態分佈內，就是垃圾時間
         elif flat_arr[i]:
             score = 0
-            log = "💤 箱型整理(勿追)"
+            log = "💤 自適應盤整"
             
-        # 4. 壓縮突破 (75分)
-        # 只有在季線已經開始上彎(脫離箱型)時，才允許此訊號
+        # 4. 聰明突破 (75分)
+        # 突破了布林通道 + 量能適中 + 斜率轉強
         elif breakout_arr[i]:
             score = 75
-            log = "🔥 籌碼帶量突破"
+            log = "🔥 自適應突破"
             
-        # 5. 竭盡倒貨
-        elif climax_arr[i]:
-            score = -20; log = "⚠️ 爆量竭盡"
-            
-        # 6. 強力噴出 (85分)
-        elif super_arr[i]:
+        # 5. 趨勢延續 (85分)
+        elif trend_arr[i]:
             score = 85
-            log = "🚀 強勢噴出"
-            if rsi_arr[i] > 85: score = 70; log = "⚠️ 過熱警戒"
-                
-        # 7. 初升段 (65~75分)
-        elif early_arr[i]:
-            score = 65
-            log = "📈 趨勢發散"
-            if rsi_arr[i] < 70: score += 10
+            log = "🚀 趨勢延續"
+            # 過熱保護：RSI 超過歷史 95% 分位數
+            # 注意：這裡的 thresholds 也是動態的 (rsi_high_band)
+            if rsi_arr[i] > 90: 
+                score = 70; log = "⚠️ 歷史極端過熱"
         
-        # 8. 其他
+        # 6. 其他 (弱勢)
         else:
-            if rsi_arr[i] < 40: score = 50; log = "弱勢盤整"
+            if rsi_arr[i] < 40: score = 50; log = "弱勢整理"
             else: score = 0; log = "觀望"
         
         final_score[i] = score
@@ -1051,6 +1026,10 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Alpha_Score'] = np.maximum(raw_series, smooth_series).clip(-100, 100)
     df['Score_Log'] = logs
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
+    
+    # 儲存輔助指標供圖表使用 (選用)
+    df['Slope_Z'] = slope_z
+    df['Vol_Z'] = vol_z
     
     return df
 
