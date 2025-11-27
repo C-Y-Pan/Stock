@@ -819,10 +819,11 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v8.0 (The Sniper):
-    狙擊手版。
-    1. 新增「均線糾結濾網」：當 MA20 與 MA60 差距 < 2% 時，視為死魚盤，強制觀望。
-    2. 優化「ADX 權重」：只有趨勢真正拉開 (ADX > 25) 且均線發散時，才允許高分。
+    Alpha Score v9.0 (The Safety Net):
+    針對「空頭接刀」問題進行最終修復。
+    新增「空頭防禦機制」：
+    1. 當季線向下 (Slope < 0) 時，廢除普通 RSI 超賣訊號。
+    2. 空頭時只有「爆量恐慌 (Capitulation)」才允許抄底，否則視為陰跌 (Slow Bleed)，給予負分。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -854,48 +855,45 @@ def calculate_alpha_score(df, margin_df, short_df):
     bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
     
-    # [核心新增] 均線糾結度 (Entanglement)
-    # 計算月線與季線的距離百分比
+    # 均線斜率與距離
+    ma60_slope = df['MA60'].diff(5).fillna(0)
     ma_gap = (abs(df['MA20'] - df['MA60']) / df['MA60']) * 100
-    
-    # 季線斜率
-    ma60_slope = df['MA60'].diff(5)
 
     # ====================================================
-    # 2. 狀態定義
+    # 2. 狀態定義 (嚴格化)
     # ====================================================
     
-    # A. 恐慌黃金坑 (最高優先級，無視盤整)
-    is_panic = (df['VIX'] > 25) & (curr_rsi < 30)
-    is_deep_value = (bias_60 < -15) & (curr_rsi < 30)
+    # A. 空頭趨勢 (Downtrend)
+    # 定義：股價在季線下 且 季線斜率向下
+    is_hard_downtrend = (df['Close'] < df['MA60']) & (ma60_slope < 0)
+
+    # B. 恐慌黃金坑 (True Panic)
+    # [修正] 必須區分「多頭回檔」與「空頭接刀」
     
-    # B. 死魚盤/糾結 (The Dead Fish)
-    # 條件：均線距離 < 2% (黏在一起) 且 ADX < 30 (無趨勢)
-    # 除非發生恐慌，否則這裡絕對不動作
-    is_choppy = (ma_gap < 2.0) & (df['ADX'] < 30)
+    # 條件1: 系統性恐慌 (VIX > 25) + RSI < 25 (不分多空)
+    systemic_panic = (df['VIX'] > 25) & (curr_rsi < 25)
     
-    # C. 強力噴出 (Super Trend)
-    # 均線多頭 + 發散 (>2%) + ADX 強 + 季線向上
+    # 條件2: 個股恐慌 (爆量趕底)
+    # 必須有量！量是陰跌與恐慌的區別
+    vol_spike = df['Volume'] > df['Vol_MA20'] * 1.8 
+    capitulation = is_hard_downtrend & vol_spike & (curr_rsi < 25)
+    
+    is_golden_pit = systemic_panic | capitulation
+    
+    # C. 死魚盤/糾結
+    is_choppy = (ma_gap < 2.0) & (df['ADX'] < 25)
+    
+    # D. 強力噴出
     is_super_trend = (
-        (df['Close'] > df['MA20']) & 
-        (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.0) &
-        (df['ADX'] > 25) & 
-        (ma60_slope > 0)
+        (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & 
+        (ma_gap >= 2.0) & (df['ADX'] > 25) & (ma60_slope > 0)
     )
     
-    # D. 初升段 (Early Trend)
-    # 均線多頭 + 發散 (>2%) + 季線向上
-    # 重點：一定要發散！不能黏在一起！
+    # E. 初升段
     is_early_trend = (
-        (df['Close'] > df['MA20']) & 
-        (df['MA20'] > df['MA60']) & 
-        (ma_gap >= 2.0) &
-        (ma60_slope > 0)
+        (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & 
+        (ma_gap >= 2.0) & (ma60_slope > 0)
     )
-    
-    # E. 空頭
-    is_downtrend = (df['Close'] < df['MA60']) & (~is_panic) & (~is_deep_value)
 
     # ====================================================
     # 3. 評分邏輯
@@ -905,211 +903,54 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     # 轉 Numpy
     rsi_arr = curr_rsi.values
-    panic_arr = is_panic.values
-    deep_val_arr = is_deep_value.values
+    downtrend_arr = is_hard_downtrend.values
+    golden_arr = is_golden_pit.values
     choppy_arr = is_choppy.values
     super_arr = is_super_trend.values
     early_arr = is_early_trend.values
-    down_arr = is_downtrend.values
     
     for i in range(len(df)):
         score = 0
         log = "盤整"
         
-        # --- 1. 黃金坑 (95分) ---
-        if panic_arr[i] or deep_val_arr[i]:
+        # --- 1. 真黃金坑 (95分) ---
+        if golden_arr[i]:
             score = 95
             log = "💎 恐慌黃金坑"
             
-        # --- 2. 死魚盤/糾結 (0分) ---
-        # [關鍵] 只要均線糾結，直接判死刑，強制觀望
-        # 這是避免「被雙巴」的最強濾網
+        # --- 2. 空頭防禦 (負分) ---
+        # [關鍵修正] 如果是空頭趨勢，且沒發生真恐慌
+        # 即便 RSI < 30 也不買，判定為陰跌 (Slow Bleed)
+        elif downtrend_arr[i]:
+            score = -50 
+            log = "📉 空頭速跌"
+            # 只有 RSI 極端低 (<15) 才考慮搶極短反彈，但分數不給高
+            if rsi_arr[i] < 15:
+                score = 50
+                log = "搶極短反彈"
+                
+        # --- 3. 死魚盤 (0分) ---
         elif choppy_arr[i]:
             score = 0
             log = "💤 均線糾結"
             
-        # --- 3. 強力噴出 (85分) ---
+        # --- 4. 強力噴出 (85分) ---
         elif super_arr[i]:
             score = 85
             log = "🚀 強勢噴出"
             if rsi_arr[i] > 85: 
-                score = 70 
-                log = "⚠️ 過熱警戒"
+                score = 70; log = "⚠️ 過熱警戒"
                 
-        # --- 4. 初升段 (65~75分) ---
+        # --- 5. 初升段 (65~75分) ---
         elif early_arr[i]:
             score = 65
             log = "📈 趨勢發散"
-            if rsi_arr[i] < 70:
-                score += 10
+            if rsi_arr[i] < 70: score += 10
         
-        # --- 5. 空頭 (負分) ---
-        elif down_arr[i]:
-            score = -40
-            log = "空頭抵抗"
-            if rsi_arr[i] < 20: 
-                score = 50
-                log = "搶反彈"
-                
-        # --- 6. 其他盤整 ---
+        # --- 6. 盤整 (均值回歸) ---
         else:
             if rsi_arr[i] < 40: score = 50; log = "弱勢盤整"
             else: score = 0; log = "觀望"
-        
-        final_score[i] = score
-        logs.append(log)
-
-    final_series = pd.Series(final_score, index=df.index)
-    df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
-    df['Score_Log'] = logs
-    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
-    
-    return df
-    
-    """
-    Alpha Score v7.2 (The Slope Filter):
-    修正「盤整盤假突破」導致的連續停損。
-    新增「均線斜率 (Slope)」檢測：
-    1. 嚴格要求季線 (MA60) 必須「向上」，才能判定為趨勢。
-    2. 若季線走平或向下，即使站上均線，也視為盤整震盪，給予低分觀望。
-    """
-    df = df.copy()
-    if 'Score_Log' not in df.columns: df['Score_Log'] = ""
-
-    # ====================================================
-    # 1. 基礎數據
-    # ====================================================
-    if 'VIX' not in df.columns: df['VIX'] = 20.0
-    df['VIX'] = df['VIX'].ffill().fillna(20.0)
-    
-    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
-    df['Vol_MA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
-    
-    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
-    
-    # 計算 ADX
-    high = df['High']; low = df['Low']; close = df['Close']
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
-    plus_dm = high.diff()
-    minus_dm = low.diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
-    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
-    dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
-    df['ADX'] = dx.rolling(14).mean().fillna(0)
-
-    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
-    curr_rsi = df['RSI'].fillna(50)
-    
-    # [核心修正] 計算季線斜率 (看過去 5 天的變化)
-    # 若數值 > 0 代表向上， <= 0 代表走平或向下
-    ma60_slope = df['MA60'].diff(5) 
-    
-    # ====================================================
-    # 2. 狀態定義
-    # ====================================================
-    
-    # A. 恐慌黃金坑
-    is_panic = (df['VIX'] > 25) & (curr_rsi < 30)
-    is_deep_value = (bias_60 < -15) & (curr_rsi < 30)
-    
-    # B. 強力噴出 (Super Trend)
-    # 均線多頭 + ADX 強 + [新增] 季線必須向上
-    is_super_trend = (
-        (df['Close'] > df['MA20']) & 
-        (df['MA20'] > df['MA60']) & 
-        (df['ADX'] > 25) & 
-        (ma60_slope > 0)
-    )
-    
-    # C. 初升段 / 溫和多頭 (Early Trend)
-    # [修正] 必須滿足：1. 多頭排列  2. 季線斜率為正 (Slope > 0)
-    # 這條規則會過濾掉圖中那種「季線走平」的假突破
-    is_early_trend = (
-        (df['Close'] > df['MA20']) & 
-        (df['MA20'] > df['MA60']) & 
-        (ma60_slope > 0)  # 關鍵濾網：季線不准下彎或走平
-    )
-    
-    # D. 空頭
-    is_downtrend = (df['Close'] < df['MA60']) & (~is_panic) & (~is_deep_value)
-
-    # ====================================================
-    # 3. 評分邏輯
-    # ====================================================
-    final_score = np.zeros(len(df))
-    logs = []
-    
-    # 轉 Numpy
-    rsi_arr = curr_rsi.values
-    panic_arr = is_panic.values
-    deep_val_arr = is_deep_value.values
-    super_arr = is_super_trend.values
-    early_arr = is_early_trend.values
-    down_arr = is_downtrend.values
-    ma60_slope_arr = ma60_slope.fillna(0).values # 斜率數據
-    
-    for i in range(len(df)):
-        score = 0
-        log = "盤整"
-        
-        # --- 1. 黃金坑 (95分) ---
-        if panic_arr[i] or deep_val_arr[i]:
-            score = 95
-            log = "💎 恐慌黃金坑"
-            
-        # --- 2. 強力噴出 (85分) ---
-        elif super_arr[i]:
-            score = 85
-            log = "🚀 強勢噴出"
-            if rsi_arr[i] > 85: 
-                score = 70 
-                log = "⚠️ 過熱警戒"
-                
-        # --- 3. 初升段 (65~75分) ---
-        elif early_arr[i]:
-            score = 65
-            log = "📈 趨勢成形"
-            if rsi_arr[i] < 70:
-                score += 10
-        
-        # --- 4. 空頭 (負分) ---
-        elif down_arr[i]:
-            score = -40
-            log = "空頭抵抗"
-            if rsi_arr[i] < 20: 
-                score = 50
-                log = "搶反彈"
-                
-        # --- 5. 盤整 (均值回歸) ---
-        # 重點：圖中的案例會全部落入這裡
-        else:
-            # 判斷是「多頭整理」還是「空頭整理」
-            # 如果季線是平的 (slope <= 0)，我們視為無趨勢
-            
-            if ma60_slope_arr[i] <= 0:
-                # 季線走平或下彎 -> 標準盤整策略
-                # 只有跌深才買，漲上來就賣，不追價
-                if rsi_arr[i] < 40:
-                    score = 60
-                    log = "區間低檔"
-                elif rsi_arr[i] > 60: # [加嚴] 盤整時RSI > 60 就開始扣分
-                    score = -20
-                    log = "區間高檔"
-                else:
-                    score = 0
-                    log = "盤整觀望"
-            else:
-                # 雖然季線向上，但不符合多頭排列 (可能跌破月線) -> 回檔策略
-                if rsi_arr[i] < 45:
-                    score = 65
-                    log = "多頭回檔"
-                else:
-                    score = 30
-                    log = "整理中"
         
         final_score[i] = score
         logs.append(log)
