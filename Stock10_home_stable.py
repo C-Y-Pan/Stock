@@ -499,19 +499,15 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v18.0 (The Trend Anchor):
-    解決「漲勢中頻繁被洗出場 (發神經)」的問題。
+    策略引擎 v21.0 (The Hysteresis Guard):
+    解決頻繁進出場問題。
     
-    [核心進化] 趨勢定錨
-    1. 修正分數衰退賣點：
-       - 舊版：掉 25 分就賣 -> 太敏感。
-       - 新版：掉 30 分 且 目前分數 < 60 才能賣。
-       - 意義：只要分數還維持在多頭區 (60+)，就算回檔也不賣。
-       
-    2. 泰坦定錨 (Titan Anchor):
-       - 對於權值股，只要股價穩守季線 (MA60) 且季線向上，
-       - 強制屏蔽所有「技術指標轉弱」的賣訊。
-       - 只有「跌破季線」或「災難停損」才能讓你下車。
+    [核心進化] 遲滯現象 (Hysteresis)
+    1. 寬進寬出：買進門檻 60，但賣出門檻降至 30。
+       - 這創造了一個 30~60 分的「緩衝區」。只要分數掉進這裡，視為「正常回檔」，不賣出。
+    2. 泰坦鎖定 (Titan Lock):
+       - 對於權值股，只要價格 > 季線，完全無視「分數衰退」。
+       - 也就是說，就算分數從 90 掉到 40，只要季線沒破，台積電一張都不賣。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -523,9 +519,6 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     entry_price = 0.0
     highest_price = 0.0
     
-    # 記錄持倉期間的「最高評分」
-    peak_score = 0.0 
-    
     # 身份識別
     close_val = df['Close'].values
     vol_val = df['Volume'].values if 'Volume' in df.columns else np.zeros(len(df))
@@ -534,9 +527,6 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     is_titan = avg_dollar_vol > 5_000_000_000 
     
     ma60 = df['MA60'].values if 'MA60' in df.columns else close_val
-    # 計算季線斜率 (用於定錨)
-    ma60_slope = pd.Series(ma60).diff(5).fillna(0).values
-    
     scores = df['Alpha_Score'].values
     
     # ATR
@@ -554,75 +544,66 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
         curr_score = scores[i]
         curr_ma60 = ma60[i]
         
-        # 防呆
-        if np.isnan(curr_score) or np.isinf(curr_score): valid_score = 50
+        if np.isnan(curr_score): valid_score = 50
         else: valid_score = int(curr_score)
         
         # --- 進場 ---
         if position == 0:
             if valid_score >= buy_threshold:
-                # 再次確認：如果是權值股，空頭走勢(季線下)盡量不追高，除非是恐慌底(>85)
+                # 泰坦股空頭濾網
                 if is_titan and curr_price < curr_ma60 and valid_score < 85:
                     pass
                 else:
                     signal = 1
                     entry_price = curr_price
                     highest_price = curr_price
-                    peak_score = valid_score
-                    
                     action_code = "Buy"
-                    reason_str = "趨勢啟動" if valid_score < 85 else "恐慌抄底"
-            else:
-                pass 
-
+                    reason_str = "恐慌抄底" if valid_score > 85 else "趨勢啟動"
+                    
         # --- 出場 ---
         elif position == 1:
             if curr_price > highest_price: highest_price = curr_price
-            if valid_score > peak_score: peak_score = valid_score 
-            
             pnl_pct = (curr_price - entry_price) / entry_price
             is_sell = False
             
-            # ====================================================
-            # [核心修正] 出場邏輯分流
-            # ====================================================
-            
-            # --- 情境 A: 泰坦定錨 (權值股且季線向上) ---
-            # 只要季線方向是對的，我們就無視短線分數波動
-            is_trend_intact = is_titan and (curr_price > curr_ma60) and (ma60_slope[i] > 0)
-            
-            if is_trend_intact:
-                # 只有極端情況才賣
-                if valid_score < 20: # 1. 基本面/籌碼崩盤
-                    is_sell = True; reason_str = "評分崩盤"
-                elif curr_price < curr_ma60 * 0.99: # 2. 意外跌破季線
-                    is_sell = True; reason_str = "意外破線"
-                # (這裡拿掉了分數衰退賣訊，死抱!)
+            # ============================================
+            # [核心分流]
+            # ============================================
+            if is_titan:
+                # --- 泰坦模式 (死抱) ---
+                # 規則：只看季線，無視分數波動 (除非分數極低代表基本面爛了)
                 
-            # --- 情境 B: 一般情況 (小型股 或 權值股轉弱) ---
-            else:
-                # 1. 分數顯著衰退 (且分數已轉弱)
-                # [修正點] 必須 Current < 60 才能賣，防止在強勢區被洗掉
-                if peak_score > 75 and valid_score < (peak_score - 30) and valid_score < 60:
+                # 1. 跌破季線 (給 1% 緩衝)
+                if curr_price < curr_ma60 * 0.99:
                     is_sell = True
-                    reason_str = "動能衰退"
+                    reason_str = "趨勢結束(破季線)"
+                
+                # 2. 評分崩盤 (極端狀況才賣)
+                # 舊版是衰退就賣，現在要 < 20 才賣
+                elif valid_score < 20:
+                    is_sell = True
+                    reason_str = "基本面/籌碼崩盤"
                     
-                # 2. 結構轉空
-                elif valid_score < 30:
+                # 3. 災難停損
+                elif pnl_pct < -0.15:
                     is_sell = True
-                    reason_str = "評分轉空"
+                    reason_str = "災難停損"
+                    
+            else:
+                # --- 游擊模式 (靈活) ---
+                # 1. 吊燈停利
+                chandelier_stop = highest_price - (3 * atr[i])
+                if curr_price < chandelier_stop:
+                    is_sell = True; reason_str = "吊燈停利"
                 
-                # 3. 價格破線
+                # 2. 遲滯賣點 (Hysteresis Exit)
+                # 買點是 60，但賣點是 30。中間的 30~60 是「持有區」。
+                elif valid_score < 30:
+                    is_sell = True; reason_str = "評分轉空"
+                    
+                # 3. 破季線
                 elif curr_price < curr_ma60:
-                    buffer = 0.99 if is_titan else 1.0
-                    if curr_price < curr_ma60 * buffer:
-                        is_sell = True
-                        reason_str = "跌破季線"
-            
-            # --- 通用災難停損 ---
-            if pnl_pct < -0.15:
-                is_sell = True
-                reason_str = "災難停損"
+                    is_sell = True; reason_str = "破季線"
 
             if is_sell:
                 signal = 0
@@ -921,113 +902,101 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v25.1 (Bug Fix Edition):
-    修復 KeyError。
-    將 reversion_force 與 risk_factor 轉為 numpy array 後再進入迴圈，
-    解決日期索引與整數迴圈不兼容的問題。
+    Alpha Score v26.3 (The Smooth Operator):
+    針對「訊號過於敏感導致頻繁交易」進行修復。
+    
+    [核心進化] 5日平滑化
+    將原本的 rolling(2) 改為 rolling(5)。
+    這代表我們看的是「週級別」的趨勢強度，而非「日級別」的波動。
+    這能有效過濾掉 1~2 天的假跌破或雜訊，讓分數曲線更圓滑穩定。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
-    # ====================================================
-    # 1. 基礎數據清洗
-    # ====================================================
-    has_chip_data = 'Inst_Net_Buy' in df.columns
-    if not has_chip_data: df['Inst_Net_Buy'] = 0 
+    # 1. 基礎數據與防呆 (Data Healer 邏輯)
+    if 'Inst_Net_Buy' not in df.columns: df['Inst_Net_Buy'] = 0
+    df['Inst_Net_Buy'] = df['Inst_Net_Buy'].fillna(0)
     
     close = df['Close']
     if 'VIX' not in df.columns: df['VIX'] = 20.0
-    vix = df['VIX'].ffill().fillna(20.0)
-    
+    df['VIX'] = df['VIX'].ffill().bfill().fillna(20.0)
     if 'Volume' not in df.columns: df['Volume'] = 0
     
-    ma20 = close.rolling(20).mean()
-    ma60 = close.rolling(60).mean()
-    df['MA20'] = ma20; df['MA60'] = ma60
+    df['MA20'] = close.rolling(20).mean().fillna(close)
+    df['MA60'] = close.rolling(60).mean().fillna(close)
     
     # 身份識別
-    avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
-    if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
+    avg_dollar_vol = (close * df['Volume']).rolling(60).mean().fillna(0).iloc[-1]
     is_titan = avg_dollar_vol > 5_000_000_000 
 
-    # ====================================================
-    # 2. 類比因子計算 (Analog Factors)
-    # ====================================================
-    
-    # [A] 趨勢強度
-    bias = (close - ma60) / ma60
-    bias_z = (bias - bias.rolling(60).mean()) / bias.rolling(60).std().fillna(1)
-    
-    # [B] 動能變化
-    ema12 = close.ewm(span=12).mean()
-    ema26 = close.ewm(span=26).mean()
-    macd = ema12 - ema26
-    signal = macd.ewm(span=9).mean()
-    hist = macd - signal
-    mom_score = np.tanh(hist / close * 100) * 2 
-    
-    # [C] 籌碼流向
+    # 2. 因子計算
+    # [A] 籌碼
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().fillna(1)
-    inst_z_smooth = inst_z.rolling(3).mean().fillna(0)
+    inst_rate = inst_rate.fillna(0).replace([np.inf, -np.inf], 0)
+    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().replace(0, 1)
+    inst_health = np.tanh(inst_z.fillna(0)) * 50
     
-    # [D] 風險係數
-    risk_factor = np.maximum(0, vix - 15) / 10.0
+    # [B] 趨勢
+    slope = df['MA60'].diff().fillna(0)
+    slope_z = (slope - slope.rolling(60).mean()) / slope.rolling(60).std().replace(0, 0.001)
+    trend_health = np.tanh(slope_z.fillna(0)) * 50
     
-    # ====================================================
-    # 3. 向量合成 (Vector Synthesis)
-    # ====================================================
+    health_score = (inst_health * 0.6) + (trend_health * 0.4)
     
-    if is_titan:
-        w_trend = 15.0; w_mom = 10.0; w_chip = 10.0; w_risk = 20.0
-    else:
-        w_trend = 10.0; w_mom = 15.0; w_chip = 20.0; w_risk = 10.0
-        
-    # 核心公式
-    raw_score = 50 + (bias_z * w_trend) + (mom_score * w_mom * 10) + (inst_z_smooth * w_chip) - (risk_factor * w_risk)
+    # [C] 壓力 (VIX)
+    norm_vix = (df['VIX'] - 15) / 10.0
+    pressure_factor = np.exp(norm_vix * 0.8).fillna(1.0)
     
-    # 均值回歸力道 (Reversion Force)
-    reversion_force = np.maximum(0, -bias_z - 1.5) * 30
+    # [D] 乖離
+    bias_pct = ((close - df['MA60']) / df['MA60']) * 100
+    bias_pct = bias_pct.fillna(0)
     
-    final_score = raw_score + reversion_force
-    
-    # 平滑化輸出
-    df['Alpha_Score'] = final_score.rolling(2).mean().clip(0, 100)
-    
-    # ====================================================
-    # 4. 生成 Log (Fix: 使用 Numpy Array)
-    # ====================================================
+    # 3. 合成
+    final_score = np.zeros(len(df))
     logs = []
     
-    # [關鍵修正] 轉為 .values (NumPy Array)
-    score_val = df['Alpha_Score'].values
-    reversion_val = reversion_force.values # <--- 修正點
-    risk_val = risk_factor.values          # <--- 修正點
+    # 轉 Numpy
+    health_val = health_score.fillna(0).values
+    pressure_val = pressure_factor.values
+    bias_val = bias_pct.values
     
     for i in range(len(df)):
-        s = score_val[i]
+        h = health_val[i]
+        p = pressure_val[i] if pressure_val[i] > 0 else 1.0
+        b = bias_val[i]
         
-        # 基礎狀態
-        if s > 80: log = "🔥 強力看多"
-        elif s > 60: log = "📈 偏多操作"
-        elif s < 40: log = "📉 轉弱/偏空"
-        elif s < 20: log = "💀 極度弱勢"
-        else: log = "⚖️ 中性盤整"
-        
-        # 特殊狀態覆蓋 (使用 numpy array 索引)
-        if reversion_val[i] > 0: 
-            log = "💎 乖離過大(醞釀反彈)"
-        
-        if risk_val[i] > 1.5 and s < 40: 
-            log = "🩸 市場恐慌(現金為王)"
-        
+        # 順勢
+        if b > 0: 
+            score = 50 + (h / p)
+            if h < 0 and p > 2.0: # 窒息
+                score -= 50
+                log = "🩸 窒息(高檔轉弱)"
+            elif score > 60:
+                log = "🚀 順勢"
+            else:
+                log = "盤整"
+        # 逆勢
+        else:
+            if b < -5: # 恐慌助燃
+                panic_adrenaline = abs(b) * p * 1.5
+                score = 50 + panic_adrenaline
+                if score > 90: log = "💎 恐慌黃金坑"
+                else: log = "📉 修正"
+            else:
+                score = 50 - (p * 10)
+                log = "📉 空頭壓制"
+                
+        final_score[i] = score
         logs.append(log)
-        
+
+    # 4. [關鍵修正] 5日平滑化 (Stability)
+    raw_series = pd.Series(final_score).fillna(50)
+    # rolling(5) 讓分數更穩定，不容易忽上忽下
+    df['Alpha_Score'] = raw_series.rolling(5, min_periods=1).mean().clip(0, 100)
+    
     df['Score_Log'] = logs
     df['Recommended_Position'] = df['Alpha_Score']
-    
-    # 輔助
-    df['Inst_Z'] = inst_z_smooth
+    df['Inst_Z'] = inst_z
     
     return df
 
