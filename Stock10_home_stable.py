@@ -895,33 +895,41 @@ def analyze_signal(final_df):
 import numpy as np
 import pandas as pd
 
+import numpy as np
+import pandas as pd
+
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v26.0 (The Bio-Feedback):
-    真正落實 Analog 精神與市場嗅覺。
+    Alpha Score v26.1 (Data Fault Tolerance):
+    緊急修復「近期分數消失 (NaN)」的問題。
     
-    [核心進化]
-    1. 指數級風險感知 (Exponential Risk):
-       - 使用 np.exp() 處理 VIX。VIX 越高，其影響力呈指數放大。
-       - 模擬人類在極端行情下的情緒反應。
-    2. 健康度分離 (Health Separation):
-       - 將「內部體質 (籌碼/動能)」與「外部環境 (VIX)」分離計算。
-       - 當體質轉弱 (Health Down) 且 環境轉差 (VIX Up) 時，產生強烈的「窒息訊號」，提前賣出。
-    3. 恐慌接刀 (Panic Catch):
-       - 當 VIX 指數級飆升 且 乖離率極負 時，觸發「腎上腺素模式」，分數強制爆表。
+    [核心修正] 數據容錯機制
+    1. 籌碼填補：針對盤中/盤後籌碼數據尚未更新的情況 (NaN)，
+       強制填補為 0 (中性)，避免數學運算導致全盤崩潰。
+    2. VIX 填補：若 VIX 有空窗，沿用昨日數值 (ffill)。
+    3. 最終防呆：若計算結果仍有 NaN，強制設為 50 分 (中性)，確保圖表不會斷頭。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
 
     # ====================================================
-    # 1. 基礎數據
+    # 1. 基礎數據清洗 (容錯核心)
     # ====================================================
-    has_chip_data = 'Inst_Net_Buy' in df.columns
-    if not has_chip_data: df['Inst_Net_Buy'] = 0 
+    
+    # [Fix 1] 處理籌碼空值
+    if 'Inst_Net_Buy' not in df.columns:
+        df['Inst_Net_Buy'] = 0
+    else:
+        # 關鍵：將最新的 NaN 填補為 0，讓程式能跑下去
+        df['Inst_Net_Buy'] = df['Inst_Net_Buy'].fillna(0)
     
     close = df['Close']
+    
+    # [Fix 2] 處理 VIX 空值 (沿用舊值)
     if 'VIX' not in df.columns: df['VIX'] = 20.0
-    vix = df['VIX'].ffill().fillna(20.0)
+    vix = df['VIX'].ffill().fillna(20.0) # 向後填補，防止當日無 VIX
+    
+    if 'Volume' not in df.columns: df['Volume'] = 0
     
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
@@ -934,58 +942,56 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 2. 類比因子 (Analog Factors)
     # ====================================================
     
-    # [A] 內部健康度 (Internal Health) - 籌碼 + 趨勢
-    # 1. 籌碼 Z
+    # [A] 內部健康度
+    # 1. 籌碼 Z (分母防呆)
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
-    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().fillna(1)
-    inst_health = np.tanh(inst_z) * 50 # 映射到 -50 ~ 50
+    inst_std = inst_rate.rolling(60).std().replace(0, 0.01) # 防止標準差為0
+    inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_std
+    inst_z = inst_z.fillna(0) # 再次確保 Z-Score 無 NaN
+    
+    inst_health = np.tanh(inst_z) * 50
     
     # 2. 趨勢斜率 Z
     slope = df['MA60'].diff()
-    slope_z = (slope - slope.rolling(60).mean()) / slope.rolling(60).std().fillna(1)
-    trend_health = np.tanh(slope_z) * 50 # 映射到 -50 ~ 50
+    slope_std = slope.rolling(60).std().replace(0, 0.001)
+    slope_z = (slope - slope.rolling(60).mean()) / slope_std
+    slope_z = slope_z.fillna(0)
     
-    # 健康度總分 (反映個股自身強弱)
+    trend_health = np.tanh(slope_z) * 50
+    
     health_score = (inst_health * 0.6) + (trend_health * 0.4)
     
-    # [B] 外部壓力值 (External Pressure) - VIX
-    # 使用指數函數模擬恐慌：VIX 15是常態(1倍)，VIX 30是(4倍)，VIX 45是(20倍)
-    # Normalized VIX: (VIX - 15) / 10
+    # [B] 外部壓力值 (VIX)
     norm_vix = (vix - 15) / 10.0
-    # 壓力係數 (Pressure): 範圍約 1.0 ~ 20.0
     pressure_factor = np.exp(norm_vix * 0.8) 
     
-    # [C] 乖離率 (Mean Reversion Potential)
+    # [C] 乖離率
     bias_pct = ((close - df['MA60']) / df['MA60']) * 100
     
     # ====================================================
-    # 3. 生物合成運算 (Bio-Synthesis)
+    # 3. 生物合成運算
     # ====================================================
     
     final_score = np.zeros(len(df))
     logs = []
     
-    # 轉 Numpy
-    health_val = health_score.values
-    pressure_val = pressure_factor.values
-    bias_val = bias_pct.values
+    # 轉 Numpy (確保無 NaN)
+    health_val = health_score.fillna(0).values
+    pressure_val = pressure_factor.fillna(1.0).values
+    bias_val = bias_pct.fillna(0).values
     
     for i in range(len(df)):
         current_health = health_val[i]
         current_pressure = pressure_val[i]
         current_bias = bias_val[i]
         
-        # 核心邏輯：分數 = 健康度 / 壓力值 (但有方向性)
+        # 避免除以零
+        if current_pressure == 0: current_pressure = 1.0
         
-        # 情境 1: 順勢階段 (在高檔)
-        # 壓力越大(VIX高)，健康度會被快速折抵
+        # 順勢階段
         if current_bias > 0: 
-            # 如果 VIX 很高 (Pressure > 2.0)，就算籌碼好，分數也會被壓下來
-            # 這就是「聞到血味」：大盤不對勁，個股再好也要打折
             score = 50 + (current_health / current_pressure)
             
-            # [嗅覺感知] 窒息預警
-            # 如果健康度轉弱 (<0) 且 壓力極大 (>2.0) -> 強制轉空
             if current_health < 0 and current_pressure > 2.0:
                 score -= 50 
                 log = "🩸 窒息(高檔轉弱)"
@@ -994,35 +1000,26 @@ def calculate_alpha_score(df, margin_df, short_df):
             else:
                 log = "盤整"
 
-        # 情境 2: 逆勢階段 (在低檔) - 恐慌抄底
-        # 這裡 VIX 越高 (Pressure 大)，反而變成「助燃劑」
+        # 逆勢階段
         else:
-            # 只有當乖離夠大 (bias < -5%) 時，VIX 才是助燃劑
-            # 否則 VIX 高只是代表空頭趨勢強
-            
             if current_bias < -5:
-                # 恐慌係數：乖離越負 * 壓力越大 = 分數越高
-                # 這模擬了「別人恐慌我貪婪」的指數級興奮
+                # 恐慌助燃
                 panic_adrenaline = abs(current_bias) * current_pressure * 1.5
                 score = 50 + panic_adrenaline
                 
                 if score > 90: log = "💎 恐慌黃金坑"
                 else: log = "📉 修正"
-            
             else:
-                # 跌得不夠深，VIX 又高 -> 視為單純空頭
                 score = 50 - (current_pressure * 10)
                 log = "📉 空頭壓制"
 
         final_score[i] = score
-        if "窒息" not in locals().get('log', "") and "黃金坑" not in locals().get('log', ""):
-             # 補上普通 Log
-             pass
-
         logs.append(log)
 
-    # 平滑化 (保留靈敏度)
-    df['Alpha_Score'] = pd.Series(final_score).rolling(2).mean().clip(0, 100)
+    # [Fix 3] 最終防呆與平滑
+    raw_series = pd.Series(final_score).fillna(50) # 若有漏網之魚，補 50
+    df['Alpha_Score'] = raw_series.rolling(2).mean().fillna(raw_series).clip(0, 100)
+    
     df['Score_Log'] = logs
     df['Recommended_Position'] = df['Alpha_Score']
     
