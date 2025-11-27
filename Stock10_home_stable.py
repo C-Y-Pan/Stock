@@ -10,7 +10,7 @@ SENDER_EMAIL = "cypan2000@gmail.com" # 您的 Gmail
 SENDER_PASSWORD = "amds ieiu wgqk exir" # 您的應用程式密碼 (非登入密碼)
 RECEIVER_EMAIL = "cypan2000@gmail.com" # 接收報告的信箱
 
-from finmind.data import DataLoader
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -258,15 +258,16 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 
 # ==========================================
 # 1. 數據獲取 (Updated)
-# ==========================================
+
 @st.cache_data(ttl=300, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    獲取 價量 + 籌碼 數據 (FinMind + yfinance)
+    [強健版] 獲取 價量 + 籌碼 數據
+    使用 requests 直接連線，不依賴 finmind 套件，解決雲端部署 ModuleNotFoundError 問題。
     """
     ticker = str(ticker).strip()
     
-    # 1. 先用 yfinance 抓即時價量 (速度快、有當日數據)
+    # 1. 先用 yfinance 抓即時價量 (速度快)
     yf_ticker = ticker
     if not (ticker.endswith('.TW') or ticker.endswith('.TWO')):
         yf_ticker = f"{ticker}.TW" 
@@ -287,22 +288,30 @@ def get_stock_data(ticker, start_date, end_date):
         df_price = df_price.reset_index()
         df_price['Date'] = df_price['Date'].dt.tz_localize(None).dt.normalize()
         
-        # 2. 用 FinMind 抓籌碼 (法人買賣超)
-        # 注意：FinMind ticker 不用 .TW
+        # 2. [核心修正] 使用 requests 直接抓取 FinMind 籌碼
+        # 這種寫法不需要 pip install finmind，只要有網路就能跑
         clean_ticker = ticker.split('.')[0]
         start_str = (start_date - timedelta(days=400)).strftime('%Y-%m-%d')
         
-        # 初始化 FinMind Loader
-        api = DataLoader() 
-        # api.login_by_token("你的_API_TOKEN") # 如果有 token 請在此填入
+        url = "https://api.finmindtrade.com/api/v4/data"
+        parameter = {
+            "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
+            "data_id": clean_ticker,
+            "start_date": start_str,
+            "token": "" # 如果您有 token 可以填入，沒有也通常能抓一段時間
+        }
         
-        df_chip = api.taiwan_stock_institutional_investors_buy_sell(
-            stock_id=clean_ticker,
-            start_date=start_str
-        )
+        resp = requests.get(url, params=parameter)
+        data = resp.json()
         
-        if not df_chip.empty:
+        if data['msg'] == 'success' and data['data']:
+            df_chip = pd.DataFrame(data['data'])
             df_chip['date'] = pd.to_datetime(df_chip['date'])
+            
+            # 轉換數值型態
+            df_chip['buy'] = pd.to_numeric(df_chip['buy'], errors='coerce').fillna(0)
+            df_chip['sell'] = pd.to_numeric(df_chip['sell'], errors='coerce').fillna(0)
+            
             # 匯總三大法人買賣超
             df_chip['net_buy'] = df_chip['buy'] - df_chip['sell']
             daily_chip = df_chip.groupby('date')['net_buy'].sum().reset_index()
@@ -310,9 +319,10 @@ def get_stock_data(ticker, start_date, end_date):
             
             # 3. 合併數據
             df_final = pd.merge(df_price, daily_chip, on='Date', how='left')
-            df_final['Inst_Net_Buy'] = df_final['Inst_Net_Buy'].fillna(0) # 補 0
+            df_final['Inst_Net_Buy'] = df_final['Inst_Net_Buy'].fillna(0)
         else:
-            # 抓不到籌碼就給 0
+            # 抓不到籌碼就給 0 (降級模式)
+            print(f"FinMind 無數據或連線失敗: {data.get('msg')}")
             df_final = df_price
             df_final['Inst_Net_Buy'] = 0
             
@@ -320,8 +330,12 @@ def get_stock_data(ticker, start_date, end_date):
 
     except Exception as e:
         print(f"Error fetching data: {e}")
+        # 出錯時至少回傳價量，不讓程式崩潰
+        if 'df_price' in locals() and not df_price.empty:
+            df_price['Inst_Net_Buy'] = 0
+            return df_price, yf_ticker
         return pd.DataFrame(), ticker
-    
+        
 @st.cache_data(ttl=5, show_spinner=False)
 def get_market_data(start_date, end_date):
     try:
