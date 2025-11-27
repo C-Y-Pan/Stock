@@ -298,7 +298,7 @@ def get_stock_data(ticker, start_date, end_date):
             "dataset": "TaiwanStockInstitutionalInvestorsBuySell",
             "data_id": clean_ticker,
             "start_date": start_str,
-            "token": "" # 如果您有 token 可以填入，沒有也通常能抓一段時間
+            "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9.eyJkYXRlIjoiMjAyNS0xMS0yNyAyMzoxMDoxOCIsInVzZXJfaWQiOiJjeXBhbiIsImlwIjoiMTgwLjE3Ny4yMDUuNzEiLCJleHAiOjE3NjQ4NjEwMTh9.ANQ9OWXh5FEejlwRfGjWgTWre9LjGLLRsPJ1HMWtoZQ" # 如果您有 token 可以填入，沒有也通常能抓一段時間
         }
         
         resp = requests.get(url, params=parameter)
@@ -925,11 +925,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v16.1 (Deployment Edition):
-    正式部署版。結合 v16.0 的大一統邏輯，並針對權值股微調敏感度。
-    
-    輸入：
-    - df: 必須包含 'Inst_Net_Buy' (法人買賣超) 欄位。若無，系統會自動降級為純技術模式。
+    Alpha Score v16.2 (Bug Fix Edition):
+    修復 KeyError。
+    將 final_score 轉為 numpy array 後再進入迴圈，解決日期索引與整數迴圈不兼容的問題。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -937,10 +935,8 @@ def calculate_alpha_score(df, margin_df, short_df):
     # ====================================================
     # 1. 數據防呆與準備
     # ====================================================
-    # 檢查是否有籌碼數據
     has_chip_data = 'Inst_Net_Buy' in df.columns
     if not has_chip_data:
-        # 如果沒有籌碼數據，暫時用成交量模擬 (降級模式)
         df['Inst_Net_Buy'] = 0 
     
     close = df['Close']
@@ -951,21 +947,22 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
     
-    # 判斷股本/市值屬性 (用成交金額近似)
-    # 這裡使用最後一天的成交金額來定錨
+    # 判斷股本/市值屬性
     avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
     
-    is_large_cap = avg_dollar_vol > 5_000_000_000 # 50億
-    is_small_cap = avg_dollar_vol < 500_000_000   # 5億
+    # 防呆：如果成交額是空值 (例如剛上市)，預設為中型股
+    if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
+
+    is_large_cap = avg_dollar_vol > 5_000_000_000 
+    is_small_cap = avg_dollar_vol < 500_000_000   
     
-    # 動態權重與敏感度
     if is_small_cap:
         w_tech = 0.3; w_chip = 0.7
-        z_threshold = 2.5 # 小型股波動大，標準要嚴
+        z_threshold = 2.5 
         mode_log = "小型股(籌碼戰)"
     elif is_large_cap:
         w_tech = 0.6; w_chip = 0.4
-        z_threshold = 2.0 # [微調] 權值股 -2.0 就算極端
+        z_threshold = 2.0 
         mode_log = "權值股(趨勢戰)"
     else:
         w_tech = 0.5; w_chip = 0.5
@@ -974,62 +971,58 @@ def calculate_alpha_score(df, margin_df, short_df):
 
     if not has_chip_data:
         w_tech = 1.0; w_chip = 0.0
-        mode_log = "純技術模式(缺籌碼)"
+        mode_log = "純技術模式"
 
     # ====================================================
     # 2. 技術面因子 (Z-Score)
     # ====================================================
-    # 斜率
     ma60_diff = df['MA60'].diff()
     slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std()
     slope_z = slope_z.fillna(0)
     
-    # 效率 (ER)
     net_change = close.diff(10).abs()
     total_path = close.diff().abs().rolling(10).sum()
     er = net_change / total_path.replace(0, 1)
     er_rank = er.rolling(60).rank(pct=True).fillna(0.5)
     
-    # 技術分 (0~100)
     tech_score_raw = (slope_z.clip(-2, 2) * 25) + (er_rank * 50)
     tech_score_norm = np.where(tech_score_raw > 0, 50 + tech_score_raw, 50 + tech_score_raw).clip(0, 100)
 
     # ====================================================
     # 3. 籌碼面因子 (Z-Score)
     # ====================================================
-    # 法人買賣佔比 Z-Score
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
     inst_mean = inst_rate.rolling(60).mean()
     inst_std = inst_rate.rolling(60).std().replace(0, 0.01)
     inst_z = (inst_rate - inst_mean) / inst_std
     inst_z = inst_z.fillna(0)
     
-    # 主力線位階
     inst_obv = df['Inst_Net_Buy'].cumsum()
     inst_obv_bias = (inst_obv - inst_obv.rolling(20).mean())
     chip_rank = inst_obv_bias.rolling(60).rank(pct=True).fillna(0.5)
     
-    # 籌碼分 (0~100)
     chip_score_raw = (inst_z.clip(-3, 3) * 15) + (chip_rank * 55)
     chip_score_norm = chip_score_raw.clip(0, 100)
 
     # ====================================================
     # 4. 合成決策
     # ====================================================
-    final_score = (tech_score_norm * w_tech) + (chip_score_norm * w_chip)
+    final_score_series = (tech_score_norm * w_tech) + (chip_score_norm * w_chip)
     
-    # 寫入
-    df['Alpha_Score'] = final_score
+    # [Fix] 寫入 DataFrame
+    df['Alpha_Score'] = final_score_series.fillna(0)
     
-    # 生成人類可讀日誌
-    logs = []
+    # [Fix] 轉為 Numpy Array 以供迴圈使用 (解決 KeyError)
+    final_score_val = df['Alpha_Score'].values
     inst_z_val = inst_z.values
     slope_z_val = slope_z.values
+    
+    logs = []
     
     for i in range(len(df)):
         log = mode_log
         
-        # 異常偵測
+        # 使用 numpy array 進行索引，這是安全的
         if inst_z_val[i] < -z_threshold:
             log = "💀 法人極端倒貨"
         elif inst_z_val[i] > z_threshold:
@@ -1038,9 +1031,9 @@ def calculate_alpha_score(df, margin_df, short_df):
             log = "💎 底部主力低接"
         elif slope_z_val[i] > 1.0 and inst_z_val[i] < -1.0:
             log = "⚠️ 拉高出貨警報"
-        elif final_score[i] > 80:
+        elif final_score_val[i] > 80:
             log = "🚀 強力多頭"
-        elif final_score[i] < 20:
+        elif final_score_val[i] < 20:
             log = "💤 弱勢觀望"
             
         logs.append(log)
@@ -1048,10 +1041,10 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Score_Log'] = logs
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
-    # 輔助繪圖用
     df['Inst_Z'] = inst_z
     
     return df
+
 # ==========================================
 # 6. 主儀表板繪製 (Updated)
 # ==========================================
