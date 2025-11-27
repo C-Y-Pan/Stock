@@ -863,16 +863,17 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v14.0 (The Statistical Quant):
-    完全自適應版本。移除所有固定閾值 (Magic Numbers)。
+    Alpha Score v15.0 (Fractal Efficiency):
+    解決「死魚盤中，微小波動被 Z-Score 放大為假趨勢」的問題。
     
-    [核心哲學] 一切都是相對的 (Relativity)
-    1. 斜率自適應：使用 Z-Score 判斷季線斜率。
-       - Z值在 -0.5~0.5 之間 = 盤整 (符合該股自身的常態分佈)。
-       - Z值 > 1.0 = 趨勢形成。
-    2. 量能自適應：使用 Z-Score 判斷爆量。
-       - Z值 > 3.0 (3個標準差) = 統計學上的極端值 -> 判定為竭盡/假突破。
-    3. 價格自適應：使用布林通道 (2倍標準差) 作為動態壓力支撐，而非固定百分比。
+    [核心進化] 考夫曼效率濾網 (Efficiency Filter)
+    1. 計算效率比率 (ER)：衡量價格走勢的「乾淨程度」。
+       - 公式：abs(價格位移) / 價格總路徑。
+       - 盤整盤的 ER 極低（走很多路卻沒位移）。
+    2. 自適應門檻 (Adaptive Rank)：
+       - 計算 ER 在過去 60 天的 PR值 (Percentile Rank)。
+       - 只有當 ER_Rank > 0.5 (效率高於該股平均水準) 時，才允許觸發「趨勢/突破」訊號。
+       - 如果 ER_Rank 低 (走勢雜亂)，強制歸零觀望。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -881,84 +882,81 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 1. 基礎指標準備
     # ====================================================
     close = df['Close']
-    
-    # 基礎 VIX
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
+    if 'Volume' not in df.columns: df['Volume'] = 0
     
-    # 基礎均線 (作為統計基底)
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
-    
-    # RSI
     curr_rsi = df['RSI'].fillna(50)
 
     # ====================================================
-    # 2. 統計學特徵工程 (Feature Engineering)
+    # 2. 統計學特徵工程
     # ====================================================
     
-    # --- A. 季線斜率的 Z-Score (Slope Z-Score) ---
-    # 1. 計算每日變動率
+    # --- A. 考夫曼效率比率 (Efficiency Ratio) ---
+    # 週期 N=10
+    # 淨位移 (Change): 10天後的價格差絕對值
+    net_change = close.diff(10).abs()
+    # 總路徑 (Volatility): 每天價格變動絕對值的總和
+    total_path = close.diff().abs().rolling(10).sum()
+    # ER = 淨位移 / 總路徑 (範圍 0~1)
+    # 趨勢越強越直，ER 越接近 1；盤整越亂，ER 越接近 0
+    efficiency_ratio = net_change / total_path.replace(0, 1)
+    
+    # [自適應關鍵] 計算 ER 的 PR值 (0~1)
+    # 告訴我現在的走勢，跟這檔股票過去的自己比，是不是比較「乾淨」？
+    er_rank = efficiency_ratio.rolling(60).rank(pct=True).fillna(0)
+
+    # --- B. 季線斜率 Z-Score ---
     ma60_diff = df['MA60'].diff()
-    # 2. 計算過去 60 天的平均變動與標準差 (滾動視窗)
     slope_mean = ma60_diff.rolling(60).mean()
-    slope_std = ma60_diff.rolling(60).std().replace(0, 0.001) # 防除以零
-    # 3. 算出標準分數 (Z-Score)
-    # Z > 1 代表斜率陡峭程度超過 1 個標準差 (強趨勢)
-    # Z 在 -0.5 ~ 0.5 代表斜率在平均值附近 (盤整)
+    slope_std = ma60_diff.rolling(60).std().replace(0, 0.001)
     slope_z = (ma60_diff - slope_mean) / slope_std
     slope_z = slope_z.fillna(0)
 
-    # --- B. 成交量的 Z-Score (Volume Z-Score) ---
-    if 'Volume' not in df.columns: df['Volume'] = 0
+    # --- C. 成交量 Z-Score ---
     vol_mean = df['Volume'].rolling(60).mean()
     vol_std = df['Volume'].rolling(60).std().replace(0, 1)
     vol_z = (df['Volume'] - vol_mean) / vol_std
     vol_z = vol_z.fillna(0)
     
-    # --- C. 價格的布林通道位置 (Bollinger %B) ---
-    # 這本身就是一種自適應指標 (基於標準差)
+    # --- D. 自適應 RSI ---
+    rsi_low_band = curr_rsi.rolling(100).quantile(0.05)
+    rsi_high_band = curr_rsi.rolling(100).quantile(0.95)
+    
+    # 布林通道
     std20 = close.rolling(20).std()
     bb_up = df['MA20'] + 2.0 * std20
     bb_low = df['MA20'] - 2.0 * std20
-    
-    # --- D. 自適應 RSI 區間 ---
-    # 每個股票的 RSI 高低點慣性不同
-    rsi_low_band = curr_rsi.rolling(100).quantile(0.05) # 過去100天最慘的5%
-    rsi_high_band = curr_rsi.rolling(100).quantile(0.95) # 過去100天最強的5%
 
     # ====================================================
-    # 3. 狀態定義 (基於統計分佈)
+    # 3. 狀態定義 (效率優先)
     # ====================================================
     
-    # 1. 自適應盤整 (Adaptive Flat)
-    # 定義：斜率 Z-Score 落在常態分佈中心 (-0.5 ~ 0.5)
-    # 不管這檔股票波動大不大，只要回歸它自己的均值，就是盤整
-    is_adaptive_flat = (slope_z > -0.5) & (slope_z < 0.5)
+    # [核心濾網] 雜訊過濾 (Choppy Filter)
+    # 如果 ER_Rank < 0.4 (效率處於後段班)，代表市場處於無序震盪
+    # 此時無論 Z-Score 多高，都視為雜訊
+    is_messy = er_rank < 0.4
     
-    # 2. 自適應趨勢 (Adaptive Trend)
-    # 定義：斜率顯著大於平均 (Z > 0.8) 且 價格在布林中軌之上
-    is_adaptive_trend = (slope_z > 0.8) & (close > df['MA20'])
+    # 1. 自適應趨勢 (Trend)
+    # 斜率強 + 價格在均線上 + [關鍵] 走勢乾淨 (ER Rank 高)
+    is_adaptive_trend = (slope_z > 0.8) & (close > df['MA20']) & (~is_messy)
     
-    # 3. 自適應竭盡/假突破 (Adaptive Climax)
-    # 定義：在盤整區 (Flat) 出現 3個標準差以上的爆量 (3-Sigma Event)
-    # 統計學上，發生機率 < 0.3%，通常是異常訊號(主力倒貨)
-    is_vol_climax = is_adaptive_flat & (vol_z > 3.0)
+    # 2. 自適應竭盡 (Climax)
+    # 爆出異常天量 (3 Sigma)
+    is_vol_climax = vol_z > 3.0
     
-    # 4. 自適應黃金坑 (Adaptive Golden Pit)
-    # 定義：VIX高 + 價格跌破布林下軌 (超跌) + RSI 觸及歷史低檔區
-    # 不寫死 RSI < 25，而是小於該股歷史的 5% 分位數
+    # 3. 自適應黃金坑 (Golden Pit)
+    # 恐慌買點不需要看效率 (因為恐慌時效率通常很差)，只看超賣
     is_panic_bottom = (df['VIX'] > 25) & (close < bb_low) & (curr_rsi <= rsi_low_band)
 
-    # 5. 自適應突破 (Adaptive Breakout)
-    # 條件：
-    # a. 非盤整死魚 (斜率開始轉強 Z > 0.2)
-    # b. 量能健康 (Z > 0.5 但 < 3.0，有量但非竭盡)
-    # c. 價格強勢站上布林上軌 (這代表突破了該股近期的波動邊界)
+    # 4. 自適應突破 (Smart Breakout)
     is_smart_breakout = (
         (slope_z > 0.2) &
-        (vol_z > 0.5) & (vol_z < 3.0) &
-        (close > bb_up) &
+        (vol_z > 0.5) & (vol_z < 3.0) & # 有量但非竭盡
+        (close > bb_up) &               # 突破布林上軌
+        (er_rank > 0.6) &               # [關鍵] 效率必須是前段班 (漲真的)
         (~is_vol_climax)
     )
 
@@ -968,51 +966,46 @@ def calculate_alpha_score(df, margin_df, short_df):
     final_score = np.zeros(len(df))
     logs = []
     
-    # 轉 Numpy 加速
+    # 轉 Numpy
     panic_arr = is_panic_bottom.values
     breakout_arr = is_smart_breakout.values
     trend_arr = is_adaptive_trend.values
-    flat_arr = is_adaptive_flat.values
     climax_arr = is_vol_climax.values
+    messy_arr = is_messy.values
     rsi_arr = curr_rsi.values
     
     for i in range(len(df)):
         score = 0
         log = "盤整"
         
-        # 1. 恐慌黃金坑 (95分)
+        # 1. 恐慌黃金坑 (95分) - 唯一不受雜訊影響的訊號
         if panic_arr[i]:
             score = 95
             log = "💎 統計極端超賣"
             
         # 2. 竭盡/假突破 (-20分)
-        # 只要在盤整區爆出 3倍標準差天量，直接判死刑
         elif climax_arr[i]:
             score = -20
-            log = "⚠️ 統計極端爆量(竭盡)"
+            log = "⚠️ 統計極端爆量"
             
-        # 3. 盤整封鎖 (0分)
-        # 只要斜率在常態分佈內，就是垃圾時間
-        elif flat_arr[i]:
+        # 3. [關鍵] 雜訊封鎖 (0分)
+        # 只要走勢太亂 (ER低)，直接觀望，不管其他指標說什麼
+        elif messy_arr[i]:
             score = 0
-            log = "💤 自適應盤整"
+            log = "💤 雜訊震盪(ER低)"
             
         # 4. 聰明突破 (75分)
-        # 突破了布林通道 + 量能適中 + 斜率轉強
         elif breakout_arr[i]:
             score = 75
-            log = "🔥 自適應突破"
+            log = "🔥 高效率突破"
             
         # 5. 趨勢延續 (85分)
         elif trend_arr[i]:
             score = 85
             log = "🚀 趨勢延續"
-            # 過熱保護：RSI 超過歷史 95% 分位數
-            # 注意：這裡的 thresholds 也是動態的 (rsi_high_band)
-            if rsi_arr[i] > 90: 
-                score = 70; log = "⚠️ 歷史極端過熱"
+            if rsi_arr[i] > 90: score = 70; log = "⚠️ 極端過熱"
         
-        # 6. 其他 (弱勢)
+        # 6. 其他
         else:
             if rsi_arr[i] < 40: score = 50; log = "弱勢整理"
             else: score = 0; log = "觀望"
@@ -1027,11 +1020,12 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Score_Log'] = logs
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
-    # 儲存輔助指標供圖表使用 (選用)
+    # 輔助指標 (供圖表參考)
     df['Slope_Z'] = slope_z
-    df['Vol_Z'] = vol_z
+    df['ER_Rank'] = er_rank
     
     return df
+
 
 # ==========================================
 # 6. 主儀表板繪製 (Updated)
