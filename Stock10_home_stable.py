@@ -918,18 +918,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v19.0 (The Dual Core):
-    解決「權值股緩漲被誤判為無趨勢」的問題。
-    
-    [核心進化] 雙軌分流機制
-    根據市值 (成交金額) 自動切換邏輯：
-    1. 泰坦模式 (Large Cap): 
-       - 只要 Price > MA60 且 MA60 向上，強制給予高分 (75+)。
-       - 移除 ADX 低標限制 (允許緩漲)。
-       - 移除天量扣分 (允許法人換手)。
-    2. 游擊模式 (Small/Mid Cap):
-       - 維持嚴格的 v18.0 濾網 (ADX限制、天量竭盡、盤整封鎖)。
-       - 防止被主力騙線。
+    Alpha Score v19.1 (Bug Fix Edition):
+    修復 KeyError。
+    將 inst_z 轉為 numpy array (inst_z_val) 後再進入迴圈，解決日期索引與整數迴圈不兼容的問題。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -948,18 +939,11 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'MA20' not in df.columns: df['MA20'] = close.rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = close.rolling(60).mean()
     
-    # ----------------------------------------------------
-    # [關鍵判斷] 身份識別：你是大象還是猴子？
-    # ----------------------------------------------------
-    # 計算 60日平均成交金額
+    # 身份識別
     avg_dollar_vol = (close * df['Volume']).rolling(60).mean().iloc[-1]
     if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
-    
-    # 定義門檻：50億以上為大型股 (泰坦模式)，以下為中小型 (游擊模式)
     is_titan_mode = avg_dollar_vol > 5_000_000_000 
     
-    # ----------------------------------------------------
-
     # 計算 ADX
     high = df['High']; low = df['Low']
     tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
@@ -983,10 +967,10 @@ def calculate_alpha_score(df, margin_df, short_df):
     vol_z = (df['Volume'] - vol_mean) / df['Volume'].rolling(60).std().replace(0, 1)
 
     curr_rsi = df['RSI'].fillna(50)
-    
-    # 恐慌條件 (通用)
     bias_60 = ((close - df['MA60']) / df['MA60']) * 100
     vix = df['VIX']
+    
+    # 恐慌條件
     is_panic_bottom = ((vix > 25) & (curr_rsi < 30)) | ((bias_60 < -15) & (curr_rsi < 25))
 
     # ====================================================
@@ -995,70 +979,51 @@ def calculate_alpha_score(df, margin_df, short_df):
     final_score = np.zeros(len(df))
     logs = []
     
-    # 轉 Numpy
+    # [Fix] 轉 Numpy (關鍵修正：inst_z 也要轉)
     close_val = close.values
     ma60_val = df['MA60'].values
     slope_val = slope_z.values
+    inst_z_val = inst_z.values  # <--- 這裡修正了
     adx_val = df['ADX'].values
     vol_z_val = vol_z.values
     panic_val = is_panic_bottom.values
     
-    # 為了計算斜率絕對值 (判斷是否走平)
     ma60_slope_raw = df['MA60'].diff(5).fillna(0).values 
     
     for i in range(len(df)):
         score = 0
         log = "盤整"
         
-        # --- 通用規則：恐慌黃金坑 (最高優先) ---
+        # --- 通用規則：恐慌黃金坑 ---
         if panic_val[i]:
             score = 95
             log = "💎 恐慌黃金坑"
             
-        # =================================================
-        # 分流 A: 泰坦模式 (針對台積電等權值股)
-        # 策略：趨勢跟隨，寬容濾網
-        # =================================================
+        # --- 分流 A: 泰坦模式 (權值股) ---
         elif is_titan_mode:
-            # 條件：股價在季線上 + 季線趨勢向上
-            # 注意：這裡不看 ADX，不看量能竭盡，只要趨勢對了就抱
             if close_val[i] > ma60_val[i] and ma60_slope_raw[i] > 0:
                 score = 75
                 log = "🐘 權值順勢(持有)"
                 
-                # 加分：如果還有法人買超或斜率夠強
-                if inst_z[i] > 0.5 or slope_val[i] > 1.0:
+                # [Fix] 使用 inst_z_val[i] 而不是 inst_z[i]
+                if inst_z_val[i] > 0.5 or slope_val[i] > 1.0:
                     score = 85
                     log = "🚀 權值強勢噴出"
-                    
-                # 唯一賣訊：破季線 或 季線下彎
             
-            # 空頭修正
             elif close_val[i] < ma60_val[i]:
                 score = -40
                 log = "📉 權值轉弱"
                 
-        # =================================================
-        # 分流 B: 游擊模式 (針對旺宏等中小型股)
-        # 策略：嚴格篩選，防守優先 (v18.0 邏輯)
-        # =================================================
+        # --- 分流 B: 游擊模式 (中小型股) ---
         else:
-            # 1. 竭盡殺手
             if vol_z_val[i] > 3.0:
                 score = -50; log = "⚠️ 爆天量竭盡"
-                
-            # 2. ADX 門檻 (無趨勢不買)
             elif adx_val[i] < 20:
                 score = 0; log = "💤 無趨勢(ADX低)"
-                
-            # 3. 結構濾網 (斜率要夠陡)
             elif slope_val[i] < 0.5:
                 score = 0; log = "💤 結構鬆散"
-                
-            # 4. 正常趨勢
             elif close_val[i] > ma60_val[i]:
                 score = 70; log = "🔥 游擊突破"
-            
             else:
                 score = -20; log = "整理"
 
@@ -1075,6 +1040,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 輔助
     df['Slope_Z'] = slope_z
     df['Vol_Z'] = vol_z
+    df['Inst_Z'] = inst_z
     
     return df
 
