@@ -813,10 +813,11 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v7.1 (The Trend Bridge):
-    修復「主升段踏空」問題。
-    新增「初升段 (Early Trend)」識別：只要均線多頭排列，即便 ADX 不強，也給予 65+ 分數，
-    防止在起漲點因 RSI 過熱而被系統誤判為賣出。
+    Alpha Score v7.2 (The Slope Filter):
+    修正「盤整盤假突破」導致的連續停損。
+    新增「均線斜率 (Slope)」檢測：
+    1. 嚴格要求季線 (MA60) 必須「向上」，才能判定為趨勢。
+    2. 若季線走平或向下，即使站上均線，也視為盤整震盪，給予低分觀望。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -835,12 +836,12 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     # 計算 ADX
     high = df['High']; low = df['Low']; close = df['Close']
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
     plus_dm = high.diff()
     minus_dm = low.diff()
     plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
     minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean()
     plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
     minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
     dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
@@ -849,23 +850,35 @@ def calculate_alpha_score(df, margin_df, short_df):
     bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
     curr_rsi = df['RSI'].fillna(50)
     
+    # [核心修正] 計算季線斜率 (看過去 5 天的變化)
+    # 若數值 > 0 代表向上， <= 0 代表走平或向下
+    ma60_slope = df['MA60'].diff(5) 
+    
     # ====================================================
-    # 2. 狀態定義 (Regime)
+    # 2. 狀態定義
     # ====================================================
     
-    # A. 恐慌黃金坑 (最優先)
-    # VIX高 + RSI低 + 乖離大
+    # A. 恐慌黃金坑
     is_panic = (df['VIX'] > 25) & (curr_rsi < 30)
     is_deep_value = (bias_60 < -15) & (curr_rsi < 30)
     
     # B. 強力噴出 (Super Trend)
-    # 均線多頭 + ADX 強
-    is_super_trend = (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60']) & (df['ADX'] > 25)
+    # 均線多頭 + ADX 強 + [新增] 季線必須向上
+    is_super_trend = (
+        (df['Close'] > df['MA20']) & 
+        (df['MA20'] > df['MA60']) & 
+        (df['ADX'] > 25) & 
+        (ma60_slope > 0)
+    )
     
-    # C. [新增] 初升段 / 溫和多頭 (Early Trend)
-    # 關鍵：只要站穩季線且均線多頭，就算 ADX 不強，也是多頭！
-    # 這就是填補真空帶的關鍵
-    is_early_trend = (df['Close'] > df['MA20']) & (df['MA20'] > df['MA60'])
+    # C. 初升段 / 溫和多頭 (Early Trend)
+    # [修正] 必須滿足：1. 多頭排列  2. 季線斜率為正 (Slope > 0)
+    # 這條規則會過濾掉圖中那種「季線走平」的假突破
+    is_early_trend = (
+        (df['Close'] > df['MA20']) & 
+        (df['MA20'] > df['MA60']) & 
+        (ma60_slope > 0)  # 關鍵濾網：季線不准下彎或走平
+    )
     
     # D. 空頭
     is_downtrend = (df['Close'] < df['MA60']) & (~is_panic) & (~is_deep_value)
@@ -878,12 +891,12 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     # 轉 Numpy
     rsi_arr = curr_rsi.values
-    bias_arr = bias_60.values
     panic_arr = is_panic.values
     deep_val_arr = is_deep_value.values
     super_arr = is_super_trend.values
     early_arr = is_early_trend.values
     down_arr = is_downtrend.values
+    ma60_slope_arr = ma60_slope.fillna(0).values # 斜率數據
     
     for i in range(len(df)):
         score = 0
@@ -898,44 +911,51 @@ def calculate_alpha_score(df, margin_df, short_df):
         elif super_arr[i]:
             score = 85
             log = "🚀 強勢噴出"
-            # 只有極度過熱才微調，絕不賣出
             if rsi_arr[i] > 85: 
                 score = 70 
                 log = "⚠️ 過熱警戒"
                 
-        # --- 3. [關鍵修正] 初升段 (65~75分) ---
-        # 只要均線多頭，基礎分就是 65 (確保會買進/持有)
+        # --- 3. 初升段 (65~75分) ---
         elif early_arr[i]:
             score = 65
             log = "📈 趨勢成形"
-            
-            # 如果還沒過熱，加分
             if rsi_arr[i] < 70:
-                score += 10 # 變 75
-            
-            # 在這裡，我們 *完全移除* 負乖離扣分
-            # 哪怕 RSI 75，只要在多頭排列中，最低也是 65 分 (持有)
-            
+                score += 10
+        
         # --- 4. 空頭 (負分) ---
         elif down_arr[i]:
             score = -40
             log = "空頭抵抗"
-            if rsi_arr[i] < 20: # 搶極短反彈
+            if rsi_arr[i] < 20: 
                 score = 50
                 log = "搶反彈"
                 
         # --- 5. 盤整 (均值回歸) ---
-        # 只有不符合上述任何多頭條件時，才執行高出低進
+        # 重點：圖中的案例會全部落入這裡
         else:
-            if rsi_arr[i] < 40:
-                score = 60
-                log = "區間低檔"
-            elif rsi_arr[i] > 70:
-                score = -20 # 只有在盤整時，RSI高才賣
-                log = "區間高檔"
+            # 判斷是「多頭整理」還是「空頭整理」
+            # 如果季線是平的 (slope <= 0)，我們視為無趨勢
+            
+            if ma60_slope_arr[i] <= 0:
+                # 季線走平或下彎 -> 標準盤整策略
+                # 只有跌深才買，漲上來就賣，不追價
+                if rsi_arr[i] < 40:
+                    score = 60
+                    log = "區間低檔"
+                elif rsi_arr[i] > 60: # [加嚴] 盤整時RSI > 60 就開始扣分
+                    score = -20
+                    log = "區間高檔"
+                else:
+                    score = 0
+                    log = "盤整觀望"
             else:
-                score = 0
-                log = "觀望"
+                # 雖然季線向上，但不符合多頭排列 (可能跌破月線) -> 回檔策略
+                if rsi_arr[i] < 45:
+                    score = 65
+                    log = "多頭回檔"
+                else:
+                    score = 30
+                    log = "整理中"
         
         final_score[i] = score
         logs.append(log)
