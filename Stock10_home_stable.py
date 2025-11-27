@@ -299,19 +299,33 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 # ==========================================
 @st.cache_data(ttl=5, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
-    ticker = str(ticker).strip()
-    candidates = [ticker]
-    if ticker.isdigit(): candidates = [f"{ticker}.TW", f"{ticker}.TWO"]
+    ticker = str(ticker).strip().upper()
+    
+    # [修正邏輯] 不管有沒有字母，只要沒有後綴，都嘗試加上 .TW 與 .TWO
+    # 這能解決 00981A, 2881A, 2002A 等含字母股票抓不到的問題
+    if not ticker.endswith('.TW') and not ticker.endswith('.TWO'):
+        candidates = [f"{ticker}.TWO", f"{ticker}.TW", ticker] # 優先嘗試 .TWO (很多含A的是債券/上櫃)
+    else:
+        candidates = [ticker]
+        
     for t in candidates:
         try:
             stock = yf.Ticker(t)
-            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1))
+            # 增加 auto_adjust=True 以獲得還原股價，並設定 timeout
+            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=True)
+            
             if not df.empty:
                 df = df.reset_index()
                 df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
-                return df, t
+                
+                # Yahoo Finance 有時會回傳空列，需再次檢查長度
+                if len(df) > 0:
+                    return df, t
         except: continue
+        
     return pd.DataFrame(), ticker
+
+
 
 @st.cache_data(ttl=5, show_spinner=False)
 def get_market_data(start_date, end_date):
@@ -1448,18 +1462,27 @@ elif page == "📊 單股深度分析":
             current_fee = fee_input if 'fee_input' in locals() else 0.001425
             current_tax = tax_input if 'tax_input' in locals() else 0.003
             
+            # 初始化變數，防止 NameError
+            final_df = None
+            best_params = None
+            validation_result = None
+            
+            # 1. 獲取資料
             raw_df, fmt_ticker = get_stock_data(ticker_input, start_date, end_date)
             name = get_stock_name(fmt_ticker)
             
+            # 2. 判斷資料是否獲取成功
             if raw_df.empty:
-                st.error(f"❌ 無法獲取 {ticker_input} 資料，請確認代號是否正確。")
+                st.error(f"❌ 無法獲取 {ticker_input} 資料。原因可能是：\n1. 代號錯誤\n2. 該 ETF/股票剛上市，Yahoo Finance 尚未收錄\n3. 該商品無近期交易量")
             else:
-                # 執行運算
+                # 3. 若成功，才執行策略運算
                 best_params, final_df = run_optimization(raw_df, market_df, start_date, current_fee, current_tax)
                 validation_result = validate_strategy_robust(raw_df, market_df, 0.7, current_fee, current_tax)
 
+            # 4. 顯示結果 (檢查 final_df 是否存在且不為空)
             if final_df is None or final_df.empty:
-                st.warning("⚠️ 選定區間內無資料。")
+                if not raw_df.empty: # 如果有原始資料但策略跑不出結果 (極少見)
+                    st.warning("⚠️ 選定區間內無足夠資料進行策略運算 (可能上市時間太短)。")
             else:
                 # ... (以下顯示邏輯保持不變，直接沿用原本的程式碼即可) ...
                 # 為節省篇幅，請保留您原本從 `stock_alpha_df = calculate_alpha_score(...)` 開始的後續顯示程式碼
