@@ -435,13 +435,11 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, buy_threshold=65, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略引擎 v7.0 (Trailing Stop Edition):
-    解決「賣飛」問題。
-    1. 買進：依據 Alpha Score (>60)。
-    2. 賣出：不再單純依賴 Score 下降，而是使用「移動停損 (Trailing Stop)」。
-       只要價格沒有跌破「最高價回檔 X%」，就死抱不放。
+    策略引擎 v8.0 (Cooldown Edition):
+    1. 新增「交易冷卻期」：賣出後 N 天內禁止開新倉，防止死魚盤頻繁刷單。
+    2. 提高進場門檻：預設從 60 提高到 65 (更確認趨勢才進)。
     """
     df = data.copy()
     if 'Alpha_Score' not in df.columns: return df
@@ -451,9 +449,11 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     
     position = 0
     entry_price = 0.0
-    highest_price = 0.0 # 紀錄持倉期間最高價
+    highest_price = 0.0 
     
-    # 轉 numpy
+    # [關鍵] 冷卻計數器
+    cooldown_counter = 0 
+    
     close = df['Close'].values
     scores = df['Alpha_Score'].values
     ma60 = df['MA60'].values
@@ -466,13 +466,20 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
         curr_score = scores[i]
         curr_price = close[i]
         
+        # 處理冷卻期
+        if cooldown_counter > 0:
+            cooldown_counter -= 1
+            # 強制觀望
+            action_code = "Wait" 
+            reason_str = f"冷卻中 ({cooldown_counter})"
+        
         # --- 進場邏輯 ---
-        if position == 0:
-            # 門檻設為 60 (包含 強勢噴出80 和 區間低檔60)
+        elif position == 0:
+            # 必須過了冷卻期才能買
             if curr_score >= buy_threshold:
                 signal = 1
                 entry_price = curr_price
-                highest_price = curr_price # 初始化最高價
+                highest_price = curr_price
                 action_code = "Buy"
                 reason_str = df['Score_Log'].iloc[i]
                 confidences.append(int(curr_score))
@@ -481,35 +488,26 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
 
         # --- 出場邏輯 ---
         elif position == 1:
-            # 更新最高價
-            if curr_price > highest_price:
-                highest_price = curr_price
+            if curr_price > highest_price: highest_price = curr_price
             
-            # 計算回檔幅度 (Drawdown from Peak)
             dd_from_peak = (curr_price - highest_price) / highest_price
             pnl_pct = (curr_price - entry_price) / entry_price
             
             is_sell = False
             
-            # [核心修正] 移動停損機制 (Dynamic Trailing Stop)
-            
-            # 1. 停利保護：如果已經大賺 (>20%)，回檔 10% 就走 (保住獲利)
+            # 1. 停利保護
             if pnl_pct > 0.20 and dd_from_peak < -0.10:
                 is_sell = True
-                reason_str = "移動停利 (高檔回落)"
-                
-            # 2. 趨勢破壞：跌破季線 (MA60) 且分數轉弱
+                reason_str = "移動停利"
+            # 2. 趨勢破壞
             elif curr_price < ma60[i] and curr_score < 40:
                 is_sell = True
                 reason_str = "跌破季線"
-                
-            # 3. 硬性停損：虧損超過 10%
+            # 3. 硬性停損
             elif pnl_pct < -0.10:
                 is_sell = True
-                reason_str = "停損 (-10%)"
-            
-            # 4. 評分極度轉空：分數 < -20 (這代表型態真的爛掉了)
-            # 注意：我們不再因為分數 < 50 就賣，必須爛到 -20 才賣
+                reason_str = "停損"
+            # 4. 評分轉空
             elif curr_score < -20:
                 is_sell = True
                 reason_str = "評分轉空"
@@ -519,6 +517,10 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
                 action_code = "Sell"
                 sign = "+" if pnl_pct > 0 else ""
                 ret_label = f"{sign}{pnl_pct*100:.1f}%"
+                
+                # [關鍵] 設定冷卻期
+                # 賣出後，強迫休息 5 天，讓市場沈澱
+                cooldown_counter = 5 
             
             confidences.append(0)
 
@@ -533,22 +535,18 @@ def run_simple_strategy(data, buy_threshold=60, fee_rate=0.001425, tax_rate=0.00
     df['Action'] = actions
     df['Return_Label'] = return_labels
     df['Confidence'] = confidences
-
-    # 計算績效
+    
+    # 計算績效... (與之前相同，省略以節省篇幅)
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
-    df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
-    
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
-    
-    df['Strategy_Return'] = df['Strategy_Return'] - cost_series
+    df['Strategy_Return'] = (df['Real_Position'] * df['Market_Return']) - cost_series
     df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
-
 # 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
     """
@@ -812,6 +810,154 @@ def analyze_signal(final_df):
 # 5. [核心演算法] 買賣評等 (Alpha Score) - 實務嚴謹版
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
+    """
+    Alpha Score v8.0 (The Sniper):
+    狙擊手版。
+    1. 新增「均線糾結濾網」：當 MA20 與 MA60 差距 < 2% 時，視為死魚盤，強制觀望。
+    2. 優化「ADX 權重」：只有趨勢真正拉開 (ADX > 25) 且均線發散時，才允許高分。
+    """
+    df = df.copy()
+    if 'Score_Log' not in df.columns: df['Score_Log'] = ""
+
+    # ====================================================
+    # 1. 基礎數據
+    # ====================================================
+    if 'VIX' not in df.columns: df['VIX'] = 20.0
+    df['VIX'] = df['VIX'].ffill().fillna(20.0)
+    
+    if 'Volume' in df.columns: df['Volume'] = df['Volume'].fillna(0)
+    df['Vol_MA20'] = df['Volume'].rolling(20).mean().replace(0, 1)
+    
+    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
+    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    
+    # 計算 ADX
+    high = df['High']; low = df['Low']; close = df['Close']
+    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+    atr = tr.rolling(14).mean()
+    plus_dm = high.diff(); minus_dm = low.diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
+    dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
+    df['ADX'] = dx.rolling(14).mean().fillna(0)
+
+    bias_60 = ((df['Close'] - df['MA60']) / df['MA60']) * 100 
+    curr_rsi = df['RSI'].fillna(50)
+    
+    # [核心新增] 均線糾結度 (Entanglement)
+    # 計算月線與季線的距離百分比
+    ma_gap = (abs(df['MA20'] - df['MA60']) / df['MA60']) * 100
+    
+    # 季線斜率
+    ma60_slope = df['MA60'].diff(5)
+
+    # ====================================================
+    # 2. 狀態定義
+    # ====================================================
+    
+    # A. 恐慌黃金坑 (最高優先級，無視盤整)
+    is_panic = (df['VIX'] > 25) & (curr_rsi < 30)
+    is_deep_value = (bias_60 < -15) & (curr_rsi < 30)
+    
+    # B. 死魚盤/糾結 (The Dead Fish)
+    # 條件：均線距離 < 2% (黏在一起) 且 ADX < 30 (無趨勢)
+    # 除非發生恐慌，否則這裡絕對不動作
+    is_choppy = (ma_gap < 2.0) & (df['ADX'] < 30)
+    
+    # C. 強力噴出 (Super Trend)
+    # 均線多頭 + 發散 (>2%) + ADX 強 + 季線向上
+    is_super_trend = (
+        (df['Close'] > df['MA20']) & 
+        (df['MA20'] > df['MA60']) & 
+        (ma_gap >= 2.0) &
+        (df['ADX'] > 25) & 
+        (ma60_slope > 0)
+    )
+    
+    # D. 初升段 (Early Trend)
+    # 均線多頭 + 發散 (>2%) + 季線向上
+    # 重點：一定要發散！不能黏在一起！
+    is_early_trend = (
+        (df['Close'] > df['MA20']) & 
+        (df['MA20'] > df['MA60']) & 
+        (ma_gap >= 2.0) &
+        (ma60_slope > 0)
+    )
+    
+    # E. 空頭
+    is_downtrend = (df['Close'] < df['MA60']) & (~is_panic) & (~is_deep_value)
+
+    # ====================================================
+    # 3. 評分邏輯
+    # ====================================================
+    final_score = np.zeros(len(df))
+    logs = []
+    
+    # 轉 Numpy
+    rsi_arr = curr_rsi.values
+    panic_arr = is_panic.values
+    deep_val_arr = is_deep_value.values
+    choppy_arr = is_choppy.values
+    super_arr = is_super_trend.values
+    early_arr = is_early_trend.values
+    down_arr = is_downtrend.values
+    
+    for i in range(len(df)):
+        score = 0
+        log = "盤整"
+        
+        # --- 1. 黃金坑 (95分) ---
+        if panic_arr[i] or deep_val_arr[i]:
+            score = 95
+            log = "💎 恐慌黃金坑"
+            
+        # --- 2. 死魚盤/糾結 (0分) ---
+        # [關鍵] 只要均線糾結，直接判死刑，強制觀望
+        # 這是避免「被雙巴」的最強濾網
+        elif choppy_arr[i]:
+            score = 0
+            log = "💤 均線糾結"
+            
+        # --- 3. 強力噴出 (85分) ---
+        elif super_arr[i]:
+            score = 85
+            log = "🚀 強勢噴出"
+            if rsi_arr[i] > 85: 
+                score = 70 
+                log = "⚠️ 過熱警戒"
+                
+        # --- 4. 初升段 (65~75分) ---
+        elif early_arr[i]:
+            score = 65
+            log = "📈 趨勢發散"
+            if rsi_arr[i] < 70:
+                score += 10
+        
+        # --- 5. 空頭 (負分) ---
+        elif down_arr[i]:
+            score = -40
+            log = "空頭抵抗"
+            if rsi_arr[i] < 20: 
+                score = 50
+                log = "搶反彈"
+                
+        # --- 6. 其他盤整 ---
+        else:
+            if rsi_arr[i] < 40: score = 50; log = "弱勢盤整"
+            else: score = 0; log = "觀望"
+        
+        final_score[i] = score
+        logs.append(log)
+
+    final_series = pd.Series(final_score, index=df.index)
+    df['Alpha_Score'] = final_series.rolling(3, min_periods=1).mean().clip(-100, 100)
+    df['Score_Log'] = logs
+    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
+    
+    return df
+    
     """
     Alpha Score v7.2 (The Slope Filter):
     修正「盤整盤假突破」導致的連續停損。
