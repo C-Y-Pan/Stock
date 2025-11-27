@@ -918,9 +918,19 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v19.1 (Bug Fix Edition):
-    修復 KeyError。
-    將 inst_z 轉為 numpy array (inst_z_val) 後再進入迴圈，解決日期索引與整數迴圈不兼容的問題。
+    Alpha Score v20.0 (The Smart Aggressor):
+    針對「飆股爆量被誤判」與「盤整均線被雙巴」的最終修正。
+    
+    [核心進化]
+    1. 攻擊量識別 (Ignition Volume):
+       - 在小型股飆升段，爆量往往是攻擊訊號。
+       - 修正：若 Vol_Z > 3.0 但 K線強勢 (實體紅K)，判定為「主力點火」，給予極高分。
+       - 只有出現「避雷針/長上影」配合爆量，才視為竭盡。
+       
+    2. 唐奇安突破 (Donchian Breakout):
+       - 解決盤整區均線糾纏的問題。
+       - 修正：不再單看站上季線。必須「創20日新高 (Break 20-Day High)」才准買進。
+       - 這能過濾掉 90% 的盤整雜訊。
     """
     df = df.copy()
     if 'Score_Log' not in df.columns: df['Score_Log'] = ""
@@ -931,7 +941,8 @@ def calculate_alpha_score(df, margin_df, short_df):
     has_chip_data = 'Inst_Net_Buy' in df.columns
     if not has_chip_data: df['Inst_Net_Buy'] = 0 
     
-    close = df['Close']
+    close = df['Close']; high = df['High']; low = df['Low']; open_p = df['Open']
+    
     if 'VIX' not in df.columns: df['VIX'] = 20.0
     df['VIX'] = df['VIX'].ffill().fillna(20.0)
     if 'Volume' not in df.columns: df['Volume'] = 0
@@ -944,34 +955,32 @@ def calculate_alpha_score(df, margin_df, short_df):
     if pd.isna(avg_dollar_vol): avg_dollar_vol = 1_000_000_000
     is_titan_mode = avg_dollar_vol > 5_000_000_000 
     
-    # 計算 ADX
-    high = df['High']; low = df['Low']
-    tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    atr = tr.rolling(14).mean().replace(0, 1)
-    plus_dm = high.diff(); minus_dm = low.diff()
-    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
-    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), -minus_dm, 0.0)
-    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / atr)
-    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / atr)
-    dx = (abs(plus_di - minus_di) / abs(plus_di + minus_di).replace(0, 1)) * 100
-    df['ADX'] = dx.rolling(14).mean().fillna(0)
+    # [新增] 唐奇安通道 (過去 20 天最高價，不含今日)
+    donchian_high = high.shift(1).rolling(20).max()
 
-    # 籌碼與技術因子
+    # Z-Score 計算
+    vol_mean = df['Volume'].rolling(60).mean()
+    vol_std = df['Volume'].rolling(60).std().replace(0, 1)
+    vol_z = (df['Volume'] - vol_mean) / vol_std
+    
     inst_rate = df['Inst_Net_Buy'] / df['Volume'].replace(0, 1)
     inst_z = (inst_rate - inst_rate.rolling(60).mean()) / inst_rate.rolling(60).std().fillna(1)
     
     ma60_diff = df['MA60'].diff()
     slope_z = (ma60_diff - ma60_diff.rolling(60).mean()) / ma60_diff.rolling(60).std().fillna(1)
-    
-    vol_mean = df['Volume'].rolling(60).mean()
-    vol_z = (df['Volume'] - vol_mean) / df['Volume'].rolling(60).std().replace(0, 1)
 
-    curr_rsi = df['RSI'].fillna(50)
+    # 恐慌條件
     bias_60 = ((close - df['MA60']) / df['MA60']) * 100
+    curr_rsi = df['RSI'].fillna(50)
     vix = df['VIX']
     
-    # 恐慌條件
-    is_panic_bottom = ((vix > 25) & (curr_rsi < 30)) | ((bias_60 < -15) & (curr_rsi < 25))
+    # K線型態分析
+    body_len = (close - open_p).abs()
+    upper_shadow = high - np.maximum(close, open_p)
+    # 實體紅K：收盤 > 開盤 且 實體長度夠大
+    is_strong_candle = (close > open_p) & (body_len > (high - low) * 0.5)
+    # 避雷針：上影線很長
+    is_shooting_star = upper_shadow > body_len
 
     # ====================================================
     # 2. 決策邏輯 (分流)
@@ -979,14 +988,19 @@ def calculate_alpha_score(df, margin_df, short_df):
     final_score = np.zeros(len(df))
     logs = []
     
-    # [Fix] 轉 Numpy (關鍵修正：inst_z 也要轉)
+    # 轉 Numpy
     close_val = close.values
+    donchian_val = donchian_high.values
     ma60_val = df['MA60'].values
     slope_val = slope_z.values
-    inst_z_val = inst_z.values  # <--- 這裡修正了
-    adx_val = df['ADX'].values
-    vol_z_val = vol_z.values
-    panic_val = is_panic_bottom.values
+    inst_z_val = inst_z.values
+    vol_z_val = vol_z.fillna(0).values
+    
+    strong_candle_val = is_strong_candle.values
+    shooting_star_val = is_shooting_star.values
+    
+    # 恐慌階梯
+    panic_val = (((vix > 30) & (curr_rsi < 35)) | ((bias_60 < -15) & (curr_rsi < 25))).values
     
     ma60_slope_raw = df['MA60'].diff(5).fillna(0).values 
     
@@ -994,38 +1008,72 @@ def calculate_alpha_score(df, margin_df, short_df):
         score = 0
         log = "盤整"
         
-        # --- 通用規則：恐慌黃金坑 ---
+        # --- 1. 恐慌黃金坑 (最高優先) ---
         if panic_val[i]:
             score = 95
             log = "💎 恐慌黃金坑"
             
-        # --- 分流 A: 泰坦模式 (權值股) ---
+        # =================================================
+        # 分流 A: 泰坦模式 (權值股) - 邏輯維持 v19.0 (因權值股表現良好)
+        # =================================================
         elif is_titan_mode:
             if close_val[i] > ma60_val[i] and ma60_slope_raw[i] > 0:
                 score = 75
-                log = "🐘 權值順勢(持有)"
-                
-                # [Fix] 使用 inst_z_val[i] 而不是 inst_z[i]
+                log = "🐘 權值順勢"
                 if inst_z_val[i] > 0.5 or slope_val[i] > 1.0:
                     score = 85
-                    log = "🚀 權值強勢噴出"
-            
+                    log = "🚀 權值強勢"
             elif close_val[i] < ma60_val[i]:
                 score = -40
                 log = "📉 權值轉弱"
                 
-        # --- 分流 B: 游擊模式 (中小型股) ---
+        # =================================================
+        # 分流 B: 游擊模式 (中小型股) - [大改版]
+        # =================================================
         else:
-            if vol_z_val[i] > 3.0:
-                score = -50; log = "⚠️ 爆天量竭盡"
-            elif adx_val[i] < 20:
-                score = 0; log = "💤 無趨勢(ADX低)"
-            elif slope_val[i] < 0.5:
-                score = 0; log = "💤 結構鬆散"
-            elif close_val[i] > ma60_val[i]:
-                score = 70; log = "🔥 游擊突破"
+            # --- 量能判斷 (The Volume Judge) ---
+            is_climax_volume = vol_z_val[i] > 3.0
+            
+            # 狀況 1: 爆天量 + 爛K線 (避雷針/收黑) -> 這是真的竭盡
+            if is_climax_volume and (shooting_star_val[i] or close_val[i] < open_p.values[i]):
+                score = -50
+                log = "⚠️ 爆量出貨(避雷針)"
+                
+            # 狀況 2: 爆天量 + 強紅K -> 這是攻擊訊號 (Ignition)
+            elif is_climax_volume and strong_candle_val[i]:
+                # 這裡不再扣分，反而加分，但要求已經突破
+                if close_val[i] > donchian_val[i]:
+                    score = 90
+                    log = "🔥 主力點火攻擊"
+                else:
+                    score = 60 # 還沒突破，先觀察
+                    log = "👀 底部吸籌"
+            
+            # --- 趨勢判斷 (Donchian Breakout) ---
+            # 狀況 3: 創 20日新高 (突破盤整區)
+            elif close_val[i] > donchian_val[i]:
+                # 必須有季線支撐 (季線不能下彎太嚴重)
+                if slope_val[i] > -0.5:
+                    score = 75
+                    log = "🚀 創20日高(突破)"
+                    
+                    # 如果有法人買超，加分
+                    if inst_z_val[i] > 0.5:
+                        score = 85
+                        log = "🚀 籌碼突破"
+                else:
+                    score = 0
+                    log = "💤 逆勢突破(觀望)"
+                    
+            # 狀況 4: 盤整區 (沒創新高，也沒爆量)
+            # 在這裡，就算站上季線也不給分 (解決左側雙巴)
             else:
-                score = -20; log = "整理"
+                if close_val[i] < ma60_val[i]:
+                    score = -20
+                    log = "弱勢整理"
+                else:
+                    score = 0
+                    log = "區間震盪(等待突破)"
 
         final_score[i] = score
         logs.append(log)
