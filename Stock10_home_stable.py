@@ -1636,10 +1636,37 @@ elif page == "📊 單股深度分析":
                 real_win_rate, real_wins, real_total, avg_pnl = calculate_realized_win_rate(final_df)
                 risk_metrics = calculate_risk_metrics(final_df)
                 
-                # UI 顯示部分
-                st.markdown(f"## {ticker_input} {name}")
-                st.caption(f"策略邏輯: {reason} | 波動率: {vol}")
+# ==========================================
+                # UI 顯示部分 (已優化：新增現價顯示)
+                # ==========================================
                 
+                # 1. 準備漲跌數據
+                last_close = final_df['Close'].iloc[-1]
+                prev_close = final_df['Close'].iloc[-2]
+                price_chg = last_close - prev_close
+                price_pct = (price_chg / prev_close) * 100
+                
+                # 2. 頂部資訊欄 (標題 + 現價)
+                # 使用 columns 將版面切分為 [左: 資訊, 右: 股價]
+                col_header, col_price = st.columns([3, 1])
+                
+                with col_header:
+                    st.markdown(f"## {ticker_input} {name}")
+                    # 使用不同顏色區分波動率屬性
+                    vol_color = "red" if "高波動" in personality else ("green" if "低波動" in personality else "orange")
+                    st.markdown(f"**策略邏輯**: `{reason}` | **波動屬性**: :{vol_color}[{personality}] ({vol})")
+                
+                with col_price:
+                    # 顯示大字體現價
+                    st.metric(
+                        label="最新現價", 
+                        value=f"{last_close:.2f}", 
+                        delta=f"{price_chg:.2f} ({price_pct:.2f}%)"
+                    )
+
+                st.markdown("---")
+
+                # 3. AI 評分區塊 (維持不變，僅微調版面)
                 st.markdown("### 🏆 AI 綜合評分與決策依據")
                 score_col, log_col = st.columns([1, 3])
                 
@@ -1648,7 +1675,6 @@ elif page == "📊 單股深度分析":
                     if final_composite_score >= 60: s_color = "off" 
                     elif final_composite_score <= -20: s_color = "inverse"
                     
-                    # 這裡現在安全了，因為我們確保了 final_composite_score 一定是數字
                     st.metric(
                         label="綜合評分 (Alpha Score)",
                         value=f"{int(final_composite_score)} 分",
