@@ -297,34 +297,46 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 # ==========================================
 # 1. 數據獲取 (Updated)
 # ==========================================
-@st.cache_data(ttl=5, show_spinner=False)
+@st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
+    """
+    [修復版] 獲取股價資料
+    1. 修正順序：優先嘗試 .TW (上市)，再嘗試 .TWO (上櫃)
+    2. 增加 ETF 相容性
+    """
     ticker = str(ticker).strip().upper()
     
-    # [修正邏輯] 不管有沒有字母，只要沒有後綴，都嘗試加上 .TW 與 .TWO
-    # 這能解決 00981A, 2881A, 2002A 等含字母股票抓不到的問題
-    if not ticker.endswith('.TW') and not ticker.endswith('.TWO'):
-        candidates = [f"{ticker}.TWO", f"{ticker}.TW", ticker] # 優先嘗試 .TWO (很多含A的是債券/上櫃)
-    else:
+    # 如果使用者已經輸入完整代號 (e.g., 2330.TW)，直接使用
+    if ticker.endswith('.TW') or ticker.endswith('.TWO'):
         candidates = [ticker]
+    else:
+        # [關鍵修正] 0050 等上市股票需優先使用 .TW
+        # 大多數熱門股都是上市，將 .TW 放前面可大幅減少錯誤與等待時間
+        candidates = [f"{ticker}.TW", f"{ticker}.TWO", ticker] 
         
     for t in candidates:
         try:
             stock = yf.Ticker(t)
-            # 增加 auto_adjust=True 以獲得還原股價，並設定 timeout
+            # auto_adjust=True 對某些 ETF (如 0050) 有時會導致資料缺失，若失敗可改 False
             df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=True)
             
-            if not df.empty:
+            # 如果 auto_adjust 抓不到資料，嘗試關閉自動調整 (針對部分 ETF)
+            if df.empty:
+                df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False)
+
+            if not df.empty and len(df) > 10: # 確保至少有 10 天資料
                 df = df.reset_index()
+                # 處理時區問題，統一轉為無時區格式
                 df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
                 
-                # Yahoo Finance 有時會回傳空列，需再次檢查長度
-                if len(df) > 0:
+                # 檢查是否有收盤價
+                if 'Close' in df.columns:
                     return df, t
-        except: continue
-        
+        except Exception as e:
+            continue
+            
+    # 若全數失敗，回傳空表
     return pd.DataFrame(), ticker
-
 
 
 @st.cache_data(ttl=5, show_spinner=False)
