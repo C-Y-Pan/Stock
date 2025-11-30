@@ -8,3 +8,4 @@ finmind
 statsmodels
 extra-streamlit-components
 pytz
+matplotlib
