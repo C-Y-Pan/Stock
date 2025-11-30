@@ -1270,44 +1270,34 @@ def draw_market_dashboard(market_df, start_date, end_date):
 
 
 def send_analysis_email(df, market_analysis_text):
-    """
-    發送持股分析報告 Email (含分數變動顯示)
-    """
     if df.empty: return False
 
-    # [關鍵修正] 設定台北時區
     tw = pytz.timezone('Asia/Taipei')
     now_tw = datetime.now(tw)
-
-    # 1. 準備內容與格式化
     subject = f"📊 持股評分變動通知 - {now_tw.strftime('%H:%M')}"
     
-    # 建立副本以免影響原始顯示
     email_df = df.copy()
     
-    # 格式化收盤價
-    try:
-        if "收盤價" in email_df.columns:
-            email_df["收盤價"] = pd.to_numeric(email_df["收盤價"], errors='coerce')
-            email_df["收盤價"] = email_df["收盤價"].map('{:,.2f}'.format)
-    except: pass
+    # [修正] 確保收盤價是字串格式，避免 float 格式化錯誤
+    if "收盤價" in email_df.columns:
+        email_df["收盤價"] = pd.to_numeric(email_df["收盤價"], errors='coerce').fillna(0)
+        email_df["收盤價"] = email_df["收盤價"].apply(lambda x: f"{x:,.2f}")
 
-    # [修改這裡] 設定要顯示在 Email 中的欄位
-    # 我們優先顯示 "分數變動"，如果沒有這個欄位(例如第一次執行)，才顯示 "綜合評分"
+    # [修正] 動態抓取評分欄位 (優先抓 '分數變動'，沒有則抓 '綜合評分')
     target_score_col = "分數變動" if "分數變動" in email_df.columns else "綜合評分"
     
-    cols = ["代號", "名稱", "收盤價", target_score_col, "AI 建議"]
-    final_cols = [c for c in cols if c in email_df.columns]
+    # [修正] 確保選取的欄位真的存在，避免 KeyError
+    cols_to_check = ["代號", "名稱", "收盤價", target_score_col, "AI 建議"]
+    final_cols = [c for c in cols_to_check if c in email_df.columns]
     
-    # 轉為 HTML 表格 (加入 CSS 讓表格好看一點)
     html_table = email_df[final_cols].to_html(
         index=False, 
         classes='table', 
         border=1, 
         justify='center',
-        escape=False # [重要] 允許 HTML 標籤 (為了讓箭頭或顏色生效)
+        escape=False 
     )
-    
+ 
     # 優化表格樣式：將表頭背景設為深色，文字置中
     html_table = html_table.replace('<table border="1" class="dataframe table">', '<table style="border-collapse: collapse; width: 100%; font-family: Arial, sans-serif;">')
     html_table = html_table.replace('<th>', '<th style="background-color: #f2f2f2; padding: 8px; text-align: center; border: 1px solid #ddd;">')
@@ -1481,23 +1471,25 @@ elif page == "📊 單股深度分析":
         selection = st.session_state['stock_selector']
         st.session_state['last_ticker'] = selection.split(" ")[0]
 
-    # 當使用者點擊按鈕時
+# 當使用者點擊按鈕時
     def on_button_click(direction):
         current_ticker = st.session_state['last_ticker']
         
-        # 找出當前 ticker 在完整清單中的位置
-        current_idx = 0
-        for i, opt in enumerate(full_search_options):
-            if opt.startswith(str(current_ticker)):
-                current_idx = i
-                break
+        # [修正] 增加 try-except 防呆
+        try:
+            # 嘗試找出當前 ticker 在完整清單中的位置
+            current_idx = 0
+            for i, opt in enumerate(full_search_options):
+                if opt.startswith(str(current_ticker)):
+                    current_idx = i
+                    break
+        except:
+            current_idx = 0 # 若發生任何錯誤，歸零
         
         # 計算新的 Index
         new_idx = (current_idx + direction) % len(full_search_options)
         new_option = full_search_options[new_idx]
         
-        # [關鍵] 只更新核心變數 last_ticker
-        # 我們不這在裡更新 stock_selector，而是交給下方的「強制同步」區塊處理
         st.session_state['last_ticker'] = new_option.split(" ")[0]
 
     # ==================================================
@@ -2161,7 +2153,10 @@ elif page == "🚀 科技股掃描":
     def start_scan_callback():
         st.session_state['is_scanning'] = True
         st.session_state['stop_scan'] = False
-    
+        # [新增] 重置斷點狀態，確保是「全新」的掃描
+        st.session_state['scan_current_index'] = 0
+        st.session_state['scan_temp_results'] = []
+
     def stop_scan_callback():
         st.session_state['is_scanning'] = False
         st.session_state['stop_scan'] = True
@@ -2175,15 +2170,14 @@ elif page == "🚀 科技股掃描":
     if 'is_scanning' not in st.session_state:
         st.session_state['is_scanning'] = False
 
-    # ==========================================
-    # 3. 執行掃描
+# ==========================================
+    # 3. 執行掃描 (斷點續傳版)
     # ==========================================
     if st.session_state['is_scanning']:
         
-        # [關鍵] 直接讀取已經同步的 Session State
-        raw_list = st.session_state['scan_list_input']
-        
-        # 為了能在結果中顯示板塊名稱，嘗試讀取選單，若無則顯示自訂
+        # 讀取清單
+        raw_list = st.session_state.get('scan_list_input', "")
+        # 讀取板塊名稱 (用於結果標記)
         current_sector = st.session_state.get('sector_selector', '自訂清單')
         
         tickers = [t.strip().replace(',','') for t in raw_list.split('\n') if t.strip()]
@@ -2191,152 +2185,163 @@ elif page == "🚀 科技股掃描":
         
         if not tickers:
             st.warning("⚠️ 清單為空，請輸入代號。")
-            st.session_state['is_scanning'] = False # 沒東西掃就關掉
+            st.session_state['is_scanning'] = False
         else:
             if len(tickers) > 1000:
                 st.warning(f"⚠️ 標的數量 ({len(tickers)}) 過多，建議分批執行。")
             
+            # --- [關鍵新增] 初始化斷點狀態 ---
+            # 用於儲存「目前掃到第幾支」
+            if 'scan_current_index' not in st.session_state:
+                st.session_state['scan_current_index'] = 0
+            
+            # 用於儲存「已經掃到的結果」(避免重跑時清空)
+            if 'scan_temp_results' not in st.session_state:
+                st.session_state['scan_temp_results'] = []
+
+            # 計算剩下的股票 (從上次中斷的地方開始切片)
+            start_idx = st.session_state['scan_current_index']
+            remaining_tickers = tickers[start_idx:]
+            
+            # 建立容器與進度條
             result_container = st.container()
             progress_bar = st.progress(0)
             status_text = st.empty()
             
-            results = []
             import time 
             
-            # --- 迴圈開始 ---
-            for idx, ticker in enumerate(tickers):
-                # 檢查是否被強制中止
-                if st.session_state.get('stop_scan'):
-                    status_text.warning(f"🛑 掃描已由使用者中止。")
-                    st.session_state['is_scanning'] = False # 關閉掃描狀態
-                    break
+            # 若已經全部掃完 (但狀態仍是 True，可能是重整導致)，則直接顯示完成
+            if not remaining_tickers and start_idx > 0:
+                pass # 直接跳到下方處理結果
+            else:
+                # --- 迴圈開始 (只跑剩下的) ---
+                for loop_idx, ticker in enumerate(remaining_tickers):
+                    # 真實的進度索引 = 起始點 + 迴圈次數
+                    current_real_idx = start_idx + loop_idx
                     
-                status_text.text(f"AI 正在運算 ({idx+1}/{len(tickers)}): {ticker} ...")
-                progress_bar.progress((idx + 1) / len(tickers))
-                
-                try:
-                    time.sleep(0.05) 
+                    # 1. 檢查是否被強制中止
+                    if st.session_state.get('stop_scan'):
+                        status_text.warning(f"🛑 掃描已由使用者中止。")
+                        st.session_state['is_scanning'] = False 
+                        break
+                        
+                    # 2. 更新進度顯示
+                    status_text.text(f"AI 正在運算 ({current_real_idx+1}/{len(tickers)}): {ticker} ...")
+                    progress_bar.progress((current_real_idx + 1) / len(tickers))
                     
-                    # 獲取資料
-                    raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
-                    
-                    if raw_df.empty or len(raw_df) < 60: continue
+                    try:
+                        time.sleep(0.05) 
                         
-                    # 策略運算
-                    best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input)
-                    
-                    if final_df is not None and not final_df.empty:
-                        # ==========================================
-                        # 1. 計算基礎 Alpha Score (與 Page 2 共用函式)
-                        # ==========================================
-                        # 雖然掃描時不傳入籌碼資料 (margin_df/short_df)，但 v5.1 版主要依賴價量，影響極微
-                        stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
-                        base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-                        base_log = stock_alpha_df['Score_Log'].iloc[-1]
+                        raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
                         
-                        # 取得技術訊號
-                        action, color, tech_reason = analyze_signal(final_df)
-                        name = get_stock_name(fmt_ticker)
+                        if raw_df.empty or len(raw_df) < 60: 
+                            # [關鍵] 即使跳過，也要更新進度索引，確保下次不重跑
+                            st.session_state['scan_current_index'] = current_real_idx + 1
+                            continue
+                            
+                        # 策略運算
+                        best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input)
                         
-                        # ==========================================
-                        # 2. [關鍵修正] 完整情境感知調整 (Context-Aware Adjustment)
-                        # 確保這裡的邏輯與 Page 2 完全一致
-                        # ==========================================
-                        final_score = base_alpha_score
-                        adjustment_log = []
-                        
-                        # 準備數據
-                        current_price = final_df['Close'].iloc[-1]
-                        ma60 = final_df['MA60'].iloc[-1]
-                        
-                        # 判斷策略屬性 (是否為反彈/抄底策略)
-                        last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
-                        is_rebound = False
-                        if last_trade is not None:
-                            buy_reason = str(last_trade['Reason'])
-                            if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]): is_rebound = True
-                        
-                        # 分數修正邏輯 (完全同步 Page 2)
-                        if action == "✊ 續抱" or action == "🚀 買進":
-                            if is_rebound:
-                                # 情境 A: 反彈策略
-                                if current_price < ma60: 
-                                    final_score += 15; adjustment_log.append("反彈位階+15")
-                                
-                                ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
-                                if current_price > ma5: 
-                                    final_score += 10; adjustment_log.append("站穩MA5+10")
+                        if final_df is not None and not final_df.empty:
+                            # 計算指標
+                            stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
+                            base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
+                            base_log = stock_alpha_df['Score_Log'].iloc[-1]
+                            
+                            action, color, tech_reason = analyze_signal(final_df)
+                            name = get_stock_name(fmt_ticker)
+                            
+                            # === 情境感知微調 (同步 Page 2) ===
+                            final_score = base_alpha_score
+                            adjustment_log = []
+                            current_price = final_df['Close'].iloc[-1]
+                            ma60 = final_df['MA60'].iloc[-1]
+                            
+                            last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
+                            is_rebound = False
+                            if last_trade is not None:
+                                buy_reason = str(last_trade['Reason'])
+                                if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]): is_rebound = True
+                            
+                            if action == "✊ 續抱" or action == "🚀 買進":
+                                if is_rebound:
+                                    if current_price < ma60: final_score += 15; adjustment_log.append("反彈位階+15")
+                                    ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
+                                    if current_price > ma5: final_score += 10; adjustment_log.append("站穩MA5+10")
+                                    else: final_score -= 5; adjustment_log.append("破MA5-5")
+                                    
+                                    rsi_now = final_df['RSI'].iloc[-1]
+                                    rsi_prev = final_df['RSI'].iloc[-2]
+                                    if rsi_now > rsi_prev: final_score += 10; adjustment_log.append("動能翻揚+10")
+                                    elif rsi_now < 30: final_score += 5; adjustment_log.append("低檔鈍化+5")
                                 else:
-                                    final_score -= 5; adjustment_log.append("破MA5-5")
-                                
-                                rsi_now = final_df['RSI'].iloc[-1]
-                                rsi_prev = final_df['RSI'].iloc[-2]
-                                if rsi_now > rsi_prev: 
-                                    final_score += 10; adjustment_log.append("動能翻揚+10")
-                                elif rsi_now < 30:
-                                    final_score += 5; adjustment_log.append("低檔鈍化+5")
-                            else:
-                                # 情境 B: 順勢策略
-                                vol_now = final_df['Volume'].iloc[-1]
-                                vol_ma = final_df['Vol_MA20'].iloc[-1]
-                                # 高檔爆量滯漲扣分
-                                if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
-                                    final_score -= 15; adjustment_log.append("高檔爆量滯漲-15")
+                                    vol_now = final_df['Volume'].iloc[-1]
+                                    vol_ma = final_df['Vol_MA20'].iloc[-1]
+                                    if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
+                                        final_score -= 15; adjustment_log.append("高檔爆量滯漲-15")
+                            
+                            final_score = max(min(final_score, 100), -100)
+                            
+                            display_reason = base_log
+                            if adjustment_log: display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
+                            
+                            prev_price = final_df['Close'].iloc[-2]
+                            price_chg_pct = (current_price - prev_price) / prev_price
+                            volume = final_df['Volume'].iloc[-1]
+                            turnover = current_price * volume
 
-                        # 限制分數範圍
-                        final_score = max(min(final_score, 100), -100)
-                        
-                        # 組合顯示理由
-                        display_reason = base_log
-                        if adjustment_log:
-                            display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
+                            res_item = {
+                                "代號": fmt_ticker.split('.')[0], 
+                                "名稱": name, 
+                                "建議": action,
+                                "收盤價": current_price,
+                                "漲跌幅": price_chg_pct,
+                                "成交金額": turnover,
+                                "Alpha_Score": int(final_score), 
+                                "計算過程": display_reason,
+                                "回測報酬": best_params['Return'],
+                                "板塊": current_sector
+                            }
+                            
+                            # [關鍵] 將結果存入 Session State 列表
+                            st.session_state['scan_temp_results'].append(res_item)
 
-                        # ==========================================
-                        # 3. 存入結果
-                        # ==========================================
-                        prev_price = final_df['Close'].iloc[-2]
-                        price_chg_pct = (current_price - prev_price) / prev_price
-                        volume = final_df['Volume'].iloc[-1]
-                        turnover = current_price * volume
-
-                        res_item = {
-                            "代號": fmt_ticker.split('.')[0], 
-                            "名稱": name, 
-                            "建議": action,
-                            "收盤價": current_price,
-                            "漲跌幅": price_chg_pct,
-                            "成交金額": turnover,
-                            "Alpha_Score": int(final_score), 
-                            "計算過程": display_reason, # 更新為完整的理由
-                            "回測報酬": best_params['Return'],
-                            "板塊": current_sector
-                        }
-                        results.append(res_item)
-
-                except Exception as e:
-                    continue
-            # --- 迴圈結束 ---
+                    except Exception as e:
+                        pass
+                    
+                    # [關鍵] 每跑完一支，就更新進度索引
+                    # 這樣下次重跑時，start_idx 就會是這裡，不會重頭開始
+                    st.session_state['scan_current_index'] = current_real_idx + 1
+                    
+                # --- 迴圈結束 ---
 
             status_text.empty()
             progress_bar.empty()
             
-            # 掃描完成後，關閉掃描狀態，避免頁面刷新後又自動重跑
-            st.session_state['is_scanning'] = False 
-            
-            if results:
-                full_df = pd.DataFrame(results)
-                top_10_df = full_df.sort_values(by=['Alpha_Score', '回測報酬'], ascending=[False, False]).head(10)
-                top_10_df.index = range(1, len(top_10_df) + 1)
+            # 掃描完成 (進度 >= 總數)
+            if st.session_state['scan_current_index'] >= len(tickers):
+                st.session_state['is_scanning'] = False
+                st.session_state['scan_current_index'] = 0 # 重置以便下次使用
                 
-                st.session_state['scan_results_df'] = full_df
-                st.session_state['top_10_df'] = top_10_df
+                # 將暫存結果轉正
+                results = st.session_state['scan_temp_results']
                 
-                st.success(f"✅ 掃描完成！共分析 {len(full_df)} 檔標的。")
-                # 這裡不需要 rerun，因為資料已經寫入 session，下方會自動渲染
+                if results:
+                    full_df = pd.DataFrame(results)
+                    top_10_df = full_df.sort_values(by=['Alpha_Score', '回測報酬'], ascending=[False, False]).head(10)
+                    top_10_df.index = range(1, len(top_10_df) + 1)
+                    
+                    st.session_state['scan_results_df'] = full_df
+                    st.session_state['top_10_df'] = top_10_df
+                    st.success(f"✅ 掃描完成！共分析 {len(full_df)} 檔標的。")
+                else:
+                    if not st.session_state.get('stop_scan'):
+                        st.warning("未發現有效標的。")
             else:
-                if not st.session_state.get('stop_scan'):
-                    st.warning("未發現有效標的。")
-
+                # 如果是中途停止 (stop_scan=True)，保留目前的結果
+                if st.session_state['scan_temp_results']:
+                     st.info(f"掃描中止，目前已累積 {len(st.session_state['scan_temp_results'])} 筆結果。")
+                     
     # ==========================================
     # 4. 結果顯示與資金流向圖
     # ==========================================
