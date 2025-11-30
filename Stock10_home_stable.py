@@ -2119,30 +2119,45 @@ elif page == "🚀 科技股掃描":
     }
 
     # ==========================================
-    # 2. 介面控制
+    # 2. 介面控制 (修正版：雙向綁定)
     # ==========================================
+    
+    # 初始化 session state (若無則預設載入熱門50)
+    if 'scan_list_input' not in st.session_state:
+        st.session_state['scan_list_input'] = "\n".join(PRESET_LISTS["🔥 台股熱門 50 (權值)"])
+
     col_sel, col_btn = st.columns([3, 1])
     
     with col_sel:
-        # 下拉選單選擇板塊
-        selected_sector = st.selectbox("📂 選擇掃描板塊", list(PRESET_LISTS.keys()))
+        # 下拉選單 (綁定 key 以便 callback 讀取)
+        st.selectbox("📂 選擇掃描板塊", list(PRESET_LISTS.keys()), key="sector_selector")
     
     with col_btn:
         st.write("") # Layout spacing
-        if st.button("📥 載入清單"):
-            # 將選單內容轉為字串填入
-            tickers_to_load = PRESET_LISTS[selected_sector]
-            st.session_state['scan_list_input'] = "\n".join(tickers_to_load)
-
-    if 'scan_list_input' not in st.session_state:
-        st.session_state['scan_list_input'] = "\n".join(PRESET_LISTS["🔥 台股熱門 50 (權值)"])
         
-    user_list = st.text_area("掃描清單 (可手動增減，每行一支)", value=st.session_state['scan_list_input'], height=150)
+        # 定義載入清單的 Callback
+        def load_preset_callback():
+            # 從下拉選單的 key 讀取目前選項
+            sector = st.session_state['sector_selector']
+            # 更新 text_area 綁定的 key
+            st.session_state['scan_list_input'] = "\n".join(PRESET_LISTS[sector])
+
+        # 按鈕綁定 callback
+        st.button("📥 載入清單", on_click=load_preset_callback)
+
+    # [關鍵修正]：
+    # 1. 移除 value=... 參數 (因為已經設了 key，Streamlit 會自動讀取 state)
+    # 2. 設定 key="scan_list_input"，這樣您手動打字時，session_state 會同步更新
+    st.text_area(
+        "掃描清單 (可手動增減，每行一支)", 
+        height=150, 
+        key="scan_list_input" 
+    )
     
-# 掃描控制按鈕區
+    # 掃描控制按鈕區
     col_go, col_stop = st.columns([1, 1])
     
-    # 1. 定義啟動與停止的 Callback 函式
+    # 定義啟動與停止 Callback
     def start_scan_callback():
         st.session_state['is_scanning'] = True
         st.session_state['stop_scan'] = False
@@ -2151,27 +2166,26 @@ elif page == "🚀 科技股掃描":
         st.session_state['is_scanning'] = False
         st.session_state['stop_scan'] = True
 
-    # 2. 綁定按鈕 (使用 on_click)
     with col_go:
-        # 點擊按鈕時，觸發 start_scan_callback 把狀態鎖死為 True
         st.button("🔥 啟動戰略掃描", type="primary", use_container_width=True, on_click=start_scan_callback)
         
     with col_stop:
-        # 點擊停止時，觸發 stop_scan_callback
         st.button("🛑 強制停止", use_container_width=True, on_click=stop_scan_callback)
 
-    # 初始化狀態
     if 'is_scanning' not in st.session_state:
         st.session_state['is_scanning'] = False
 
     # ==========================================
-    # 3. 執行掃描 (依賴 is_scanning 狀態，而非按鈕狀態)
+    # 3. 執行掃描
     # ==========================================
     if st.session_state['is_scanning']:
         
-        # 取得使用者輸入的清單
-        # 注意：這裡直接讀取 session_state 確保手動輸入的內容不會消失
-        raw_list = st.session_state.get('scan_list_input', "")
+        # [關鍵] 直接讀取已經同步的 Session State
+        raw_list = st.session_state['scan_list_input']
+        
+        # 為了能在結果中顯示板塊名稱，嘗試讀取選單，若無則顯示自訂
+        current_sector = st.session_state.get('sector_selector', '自訂清單')
+        
         tickers = [t.strip().replace(',','') for t in raw_list.split('\n') if t.strip()]
         tickers = list(set(tickers)) 
         
