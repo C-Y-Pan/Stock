@@ -2081,219 +2081,246 @@ elif page == "📊 單股深度分析":
                         
                     else:
                         st.warning("數據不足 (少於 60 天)，無法進行統計驗證。")
-# --- 頁面 3 (修正版): 科技股/熱門股掃描 ---
+# --- 頁面 3: 戰略雷達 (含資金流向與擴充清單) ---
 elif page == "🚀 科技股掃描":
     st.markdown(f"### 🚀 戰略雷達：全市場機會掃描")
-    st.markdown("此功能將對指定清單進行 **AI 全檢測**，並自動排序出當前 **Alpha 評分最高** 的前十名潛力標的。")
+    st.caption("AI 全檢測與資金流向分析。系統將自動計算 Alpha Score 並排序潛力標的。")
 
-    # 定義熱門股清單
-    HOT_STOCKS = [
-        "2330", "2317", "2454", "2382", "2303", "2308", "3008", "3034", "3035", "3037", 
-        "3443", "3661", "2603", "2609", "2615", "2376", "3231", "2356", "2357", "3017",
-        "2059", "3324", "6669", "3529", "5269", "5274", "3045", "4966", "2344", "6274",
-        "8046", "3016", "2360", "6239", "6213", "3533", "3653", "8210", "3131", "9958",
-        "1513", "1519", "1503", "1504", "1605", "2881", "2882", "2891", "5871", "2886", "6781", "3211"
-    ]
-    HOT_STOCKS_STR = "\n".join(HOT_STOCKS)
+    # ==========================================
+    # 1. 定義擴充清單 (Sector Presets)
+    # ==========================================
+    PRESET_LISTS = {
+        "🔥 台股熱門 50 (權值)": [
+            "2330", "2317", "2454", "2382", "2303", "2308", "3008", "3034", "3035", "3037", 
+            "3443", "3661", "2603", "2609", "2615", "2376", "3231", "2356", "2357", "3017",
+            "2059", "3324", "6669", "3529", "5269", "5274", "3045", "4966", "2344", "6274",
+            "8046", "3016", "2360", "6239", "6213", "3533", "3653", "8210", "3131", "9958",
+            "1513", "1519", "1503", "1504", "1605", "2881", "2882", "2891", "5871", "2886", "6781", "3211"
+        ],
+        "🤖 AI 伺服器與散熱": [
+            "2382", "3231", "2356", "6669", "2376", "3017", "3324", "2421", "3013", "3483", 
+            "3653", "6213", "8996", "2486", "3533", "5274", "8210", "2059", "3694"
+        ],
+        "⚡ 重電綠能與軍工": [
+            "1513", "1519", "1503", "1504", "1605", "1609", "6806", "3708", "9958", "6219", 
+            "2634", "8033", "2618", "2610", "1514", "5284", "2204"
+        ],
+        "🚢 航運與原物料": [
+            "2603", "2609", "2615", "2637", "2605", "2606", "5608", "2002", "2014", "2027", 
+            "1101", "1102", "1301", "1303", "1326", "6505"
+        ],
+        "💰 金融存股觀察": [
+            "2881", "2882", "2891", "2886", "2884", "2885", "2892", "2890", "2880", "2883", 
+            "2887", "5880", "5876", "2834", "2801", "2809", "2897"
+        ],
+        "📊 高股息 ETF": [
+            "0050", "0056", "00878", "00919", "00929", "00939", "00940", "00713", "00918", "00915"
+        ]
+    }
 
-    col_btn1, col_btn2 = st.columns([1, 3])
-    with col_btn1:
-        if st.button("📥 載入台股熱門 50 檔"):
-            st.session_state['scan_list_input'] = HOT_STOCKS_STR
+    # ==========================================
+    # 2. 介面控制
+    # ==========================================
+    col_sel, col_btn = st.columns([3, 1])
     
+    with col_sel:
+        # 下拉選單選擇板塊
+        selected_sector = st.selectbox("📂 選擇掃描板塊", list(PRESET_LISTS.keys()))
+    
+    with col_btn:
+        st.write("") # Layout spacing
+        if st.button("📥 載入清單"):
+            # 將選單內容轉為字串填入
+            tickers_to_load = PRESET_LISTS[selected_sector]
+            st.session_state['scan_list_input'] = "\n".join(tickers_to_load)
+
     if 'scan_list_input' not in st.session_state:
-        st.session_state['scan_list_input'] = ALL_TECH_TICKERS
+        st.session_state['scan_list_input'] = "\n".join(PRESET_LISTS["🔥 台股熱門 50 (權值)"])
         
-    user_list = st.text_area("掃描清單 (每行一支代號)", value=st.session_state['scan_list_input'], height=150)
+    user_list = st.text_area("掃描清單 (可手動增減，每行一支)", value=st.session_state['scan_list_input'], height=150)
     
-    scan_btn = st.button("🔥 啟動戰略掃描", type="primary", use_container_width=True)
+# 掃描控制按鈕區
+    col_go, col_stop = st.columns([1, 1])
     
-    # [新增] 掃描中斷按鈕 (放在迴圈外，利用 session_state 控制)
-    if 'stop_scan' not in st.session_state:
-        st.session_state['stop_scan'] = False
-
-    if scan_btn:
+    # 1. 定義啟動與停止的 Callback 函式
+    def start_scan_callback():
         st.session_state['is_scanning'] = True
-        st.session_state['stop_scan'] = False # 重置停止旗標
+        st.session_state['stop_scan'] = False
+    
+    def stop_scan_callback():
+        st.session_state['is_scanning'] = False
+        st.session_state['stop_scan'] = True
+
+    # 2. 綁定按鈕 (使用 on_click)
+    with col_go:
+        # 點擊按鈕時，觸發 start_scan_callback 把狀態鎖死為 True
+        st.button("🔥 啟動戰略掃描", type="primary", use_container_width=True, on_click=start_scan_callback)
         
-        tickers = [t.strip().replace(',','') for t in user_list.split('\n') if t.strip()]
+    with col_stop:
+        # 點擊停止時，觸發 stop_scan_callback
+        st.button("🛑 強制停止", use_container_width=True, on_click=stop_scan_callback)
+
+    # 初始化狀態
+    if 'is_scanning' not in st.session_state:
+        st.session_state['is_scanning'] = False
+
+    # ==========================================
+    # 3. 執行掃描 (依賴 is_scanning 狀態，而非按鈕狀態)
+    # ==========================================
+    if st.session_state['is_scanning']:
+        
+        # 取得使用者輸入的清單
+        # 注意：這裡直接讀取 session_state 確保手動輸入的內容不會消失
+        raw_list = st.session_state.get('scan_list_input', "")
+        tickers = [t.strip().replace(',','') for t in raw_list.split('\n') if t.strip()]
         tickers = list(set(tickers)) 
         
-        # 警告：如果數量太大，提示使用者
-        if len(tickers) > 1000:
-            st.warning(f"⚠️ 您即將掃描 {len(tickers)} 檔股票，這可能需要很長時間並導致連線逾時。建議分批進行 (例如一次 50 檔)。")
-        
-        # 建立容器來動態顯示結果 (不用等全部跑完)
-        result_container = st.container()
-        progress_bar = st.progress(0)
-        status_text = st.empty()
-        stop_button_placeholder = st.empty()
-        
-        # 在運算時顯示「停止按鈕」
-        with stop_button_placeholder:
-            if st.button("🛑 強制停止掃描"):
-                st.session_state['stop_scan'] = True
-        
-        results = []
-        
-        import time # 引入時間模組
-        
-        for idx, ticker in enumerate(tickers):
-            # 1. 檢查是否被使用者中止
-            if st.session_state['stop_scan']:
-                status_text.warning(f"🛑 掃描已由使用者中止。目前已完成 {len(results)} 檔分析。")
-                break
-                
-            status_text.text(f"AI 正在運算 ({idx+1}/{len(tickers)}): {ticker} ...")
-            progress_bar.progress((idx + 1) / len(tickers))
-            
-            try:
-                # 2. 加入微小延遲，避免被 Yahoo API 封鎖 (Rate Limit)
-                time.sleep(0.1) 
-                
-                raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
-                
-                if raw_df.empty or len(raw_df) < 60: # 資料太少也跳過
-                    continue
-                    
-                # 執行運算
-                best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input)
-                
-                if final_df is not None and not final_df.empty:
-                    # ==========================================
-                    # 1. 計算基礎 Alpha Score 與 提取演算歷程
-                    # ==========================================
-                    # 傳入空 DataFrame 作為籌碼資料 (掃描模式下通常不逐一抓取資券以節省時間)
-                    stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
-                    base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-                    base_log = stock_alpha_df['Score_Log'].iloc[-1] # [新增] 獲取基礎評分細節
-
-                    # 取得技術訊號與基本資訊
-                    action, color, reason = analyze_signal(final_df)
-                    name = get_stock_name(fmt_ticker)
-                    
-                    # ==========================================
-                    # 2. 情境感知調整 (Context-Aware Adjustment)
-                    # ==========================================
-                    final_score = base_alpha_score
-                    adjustment_log = "" # [新增] 用於記錄調整原因
-                    
-                    # 準備數據
-                    current_price = final_df['Close'].iloc[-1]
-                    ma20 = final_df['MA20'].iloc[-1]
-                    ma60 = final_df['MA60'].iloc[-1]
-                    
-                    # 判斷最後一次買進訊號的理由，以識別是「反彈策略」還是「趨勢策略」
-                    last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
-                    is_rebound_strategy = False
-                    
-                    if last_trade is not None:
-                        buy_reason_str = str(last_trade['Reason'])
-                        if any(x in buy_reason_str for x in ["反彈", "超賣", "回測", "低檔"]):
-                            is_rebound_strategy = True
-                    
-                    # 針對「續抱」或「買進」狀態進行加分邏輯修正
-                    if action == "✊ 續抱" or action == "🚀 買進":
-                        if is_rebound_strategy:
-                            # --- 情境 A: 反彈策略 (抄底邏輯) ---
-                            # 補償 1: 反彈初期通常在季線下，基礎分會被扣分，這裡補回
-                            if current_price < ma60: 
-                                final_score += 15
-                                adjustment_log += "[反彈位階+15]"
-                            
-                            # 補償 2: 檢查是否站上 5 日線 (短線轉強訊號)
-                            ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
-                            if current_price > ma5: 
-                                final_score += 10
-                                adjustment_log += "[站穩MA5+10]"
-                            
-                            # 補償 3: RSI 動能翻揚
-                            if final_df['RSI'].iloc[-1] > final_df['RSI'].iloc[-2]: 
-                                final_score += 10
-                                adjustment_log += "[RSI翻揚+10]"
-                        else:
-                            # --- 情境 B: 順勢策略 (突破邏輯) ---
-                            # 獎勵多頭排列
-                            if current_price > ma20: 
-                                final_score += 5
-                                adjustment_log += "[多頭排列+5]"
-                            
-                            # 獎勵量能支撐
-                            if final_df['Volume'].iloc[-1] > final_df['Vol_MA20'].iloc[-1]:
-                                final_score += 5
-                                adjustment_log += "[量能支撐+5]"
-                    
-                    # 限制分數範圍 (-100 ~ 100)
-                    final_score = max(min(final_score, 100), -100)
-                    
-                    # ==========================================
-                    # 3. 資料彙整
-                    # ==========================================
-                    # 組合完整計算過程字串
-                    full_calc_process = f"{base_log} {adjustment_log}"
-                    if not full_calc_process.strip():
-                        full_calc_process = "無顯著訊號"
-
-                    # 計算勝率指標
-                    hit_rate, hits, total = calculate_target_hit_rate(final_df)
-                    
-                    # 存入結果 List
-                    res_item = {
-                        "代號": fmt_ticker.split('.')[0], 
-                        "名稱": name, 
-                        "建議": action,
-                        "收盤價": current_price,
-                        "Alpha_Score": int(final_score), 
-                        "計算過程": full_calc_process, # [關鍵新增] 顯示完整邏輯
-                        "理由": f"{reason} | Score:{int(final_score)}", # 舊版兼容
-                        "回測報酬": best_params['Return'],
-                        "達標率": hit_rate
-                    }
-                    results.append(res_item)
-
-            except Exception as e:
-                print(f"Error scanning {ticker}: {e}")
-                continue # 遇到錯誤直接跳過，不要崩潰
-
-        # 掃描結束或中斷後的處理
-        stop_button_placeholder.empty() # 隱藏停止按鈕
-        progress_bar.empty()
-        
-        if results:
-            full_df = pd.DataFrame(results)
-            # 排序
-            top_10_df = full_df.sort_values(by=['Alpha_Score', '回測報酬'], ascending=[False, False]).head(10)
-            top_10_df.index = range(1, len(top_10_df) + 1)
-            
-            # 存入 Session
-            st.session_state['scan_results_df'] = full_df
-            st.session_state['top_10_df'] = top_10_df
-            
-            st.success(f"✅ 掃描完成！共發現 {len(full_df)} 檔符合條件標的。")
+        if not tickers:
+            st.warning("⚠️ 清單為空，請輸入代號。")
+            st.session_state['is_scanning'] = False # 沒東西掃就關掉
         else:
-            st.warning("本次掃描未發現有效標的，或過程發生中斷。")
-
+            if len(tickers) > 1000:
+                st.warning(f"⚠️ 標的數量 ({len(tickers)}) 過多，建議分批執行。")
             
-    # === 顯示結果區域 ===
-    if 'top_10_df' in st.session_state and not st.session_state['top_10_df'].empty:
+            result_container = st.container()
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            
+            results = []
+            import time 
+            
+            # --- 迴圈開始 ---
+            for idx, ticker in enumerate(tickers):
+                # 檢查是否被強制中止
+                if st.session_state.get('stop_scan'):
+                    status_text.warning(f"🛑 掃描已由使用者中止。")
+                    st.session_state['is_scanning'] = False # 關閉掃描狀態
+                    break
+                    
+                status_text.text(f"AI 正在運算 ({idx+1}/{len(tickers)}): {ticker} ...")
+                progress_bar.progress((idx + 1) / len(tickers))
+                
+                try:
+                    time.sleep(0.05) 
+                    
+                    # 獲取資料
+                    raw_df, fmt_ticker = get_stock_data(ticker, start_date, end_date)
+                    
+                    if raw_df.empty or len(raw_df) < 60: continue
+                        
+                    # 策略運算
+                    best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input)
+                    
+                    if final_df is not None and not final_df.empty:
+                        # 計算指標 (Alpha / Signal...)
+                        stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
+                        final_score = stock_alpha_df['Alpha_Score'].iloc[-1]
+                        calc_log = stock_alpha_df['Score_Log'].iloc[-1]
+                        action, color, reason = analyze_signal(final_df)
+                        name = get_stock_name(fmt_ticker)
+                        
+                        current_price = final_df['Close'].iloc[-1]
+                        prev_price = final_df['Close'].iloc[-2]
+                        price_chg_pct = (current_price - prev_price) / prev_price
+                        volume = final_df['Volume'].iloc[-1]
+                        turnover = current_price * volume
+
+                        res_item = {
+                            "代號": fmt_ticker.split('.')[0], 
+                            "名稱": name, 
+                            "建議": action,
+                            "收盤價": current_price,
+                            "漲跌幅": price_chg_pct,
+                            "成交金額": turnover,
+                            "Alpha_Score": int(final_score), 
+                            "計算過程": calc_log,
+                            "回測報酬": best_params['Return'],
+                            "板塊": selected_sector
+                        }
+                        results.append(res_item)
+
+                except Exception as e:
+                    continue
+            # --- 迴圈結束 ---
+
+            status_text.empty()
+            progress_bar.empty()
+            
+            # 掃描完成後，關閉掃描狀態，避免頁面刷新後又自動重跑
+            st.session_state['is_scanning'] = False 
+            
+            if results:
+                full_df = pd.DataFrame(results)
+                top_10_df = full_df.sort_values(by=['Alpha_Score', '回測報酬'], ascending=[False, False]).head(10)
+                top_10_df.index = range(1, len(top_10_df) + 1)
+                
+                st.session_state['scan_results_df'] = full_df
+                st.session_state['top_10_df'] = top_10_df
+                
+                st.success(f"✅ 掃描完成！共分析 {len(full_df)} 檔標的。")
+                # 這裡不需要 rerun，因為資料已經寫入 session，下方會自動渲染
+            else:
+                if not st.session_state.get('stop_scan'):
+                    st.warning("未發現有效標的。")
+                    
+    # ==========================================
+    # 4. 結果顯示與資金流向圖
+    # ==========================================
+    if 'scan_results_df' in st.session_state and not st.session_state['scan_results_df'].empty:
+        df_res = st.session_state['scan_results_df']
         
+        # [新增功能] 資金流向 Treemap
+        st.markdown("### 💸 資金流向熱力圖 (Capital Flow Map)")
+        st.caption("區塊大小=成交金額 (資金熱度)，顏色=漲跌幅 (多空力道)。")
+        
+        if not df_res.empty:
+            import plotly.express as px
+            
+            # 處理數據供繪圖
+            df_map = df_res.copy()
+            # 避免成交金額為 0 導致繪圖錯誤
+            df_map = df_map[df_map['成交金額'] > 0]
+            # 漲跌幅轉為百分比顯示
+            df_map['漲跌%'] = df_map['漲跌幅'] * 100
+            # 建立一個統一的根節點
+            df_map['市場'] = '台股掃描'
+            
+            fig_tree = px.treemap(
+                df_map, 
+                path=['市場', '名稱'],  # 層級
+                values='成交金額',      # 區塊大小
+                color='漲跌%',         # 顏色依據
+                color_continuous_scale=['#00e676', '#121212', '#ff5252'], # 綠跌紅漲 (台股邏輯)
+                color_continuous_midpoint=0,
+                custom_data=['代號', 'Alpha_Score', '收盤價']
+            )
+            
+            fig_tree.update_traces(
+                textposition='middle center',
+                textfont=dict(size=14, color='white'),
+                hovertemplate='<b>%{label}</b> (%{customdata[0]})<br>現價: %{customdata[2]:.2f}<br>漲跌: %{color:.2f}%<br>Alpha: %{customdata[1]}分<br>成交: %{value:,.0f}'
+            )
+            fig_tree.update_layout(margin=dict(t=0, l=0, r=0, b=0), height=400)
+            st.plotly_chart(fig_tree, use_container_width=True)
+
         st.markdown("---")
-        st.markdown("### 🏆 AI 嚴選：最佳持有評分 Top 10")
         
+        # Top 10 顯示 (維持原本邏輯)
+        st.markdown("### 🏆 AI 嚴選：最佳持有評分 Top 10")
         top10 = st.session_state['top_10_df']
+        
+        # ... (Metrics 顯示邏輯與原本相同，略為精簡) ...
         c1, c2, c3 = st.columns(3)
         if len(top10) >= 1:
-            row = top10.iloc[0]
-            c1.metric(f"🥇 {row['名稱']} ({row['代號']})", f"{row['Alpha_Score']} 分", f"{row['建議']}", delta_color="normal")
+            r = top10.iloc[0]
+            c1.metric(f"🥇 {r['名稱']}", f"{r['Alpha_Score']}分", f"{r['建議']}", delta_color="normal")
         if len(top10) >= 2:
-            row = top10.iloc[1]
-            c2.metric(f"🥈 {row['名稱']} ({row['代號']})", f"{row['Alpha_Score']} 分", f"{row['建議']}", delta_color="normal")
+            r = top10.iloc[1]
+            c2.metric(f"🥈 {r['名稱']}", f"{r['Alpha_Score']}分", f"{r['建議']}", delta_color="normal")
         if len(top10) >= 3:
-            row = top10.iloc[2]
-            c3.metric(f"🥉 {row['名稱']} ({row['代號']})", f"{row['Alpha_Score']} 分", f"{row['建議']}", delta_color="normal")
-            
-        st.write("")
-        
+            r = top10.iloc[2]
+            c3.metric(f"🥉 {r['名稱']}", f"{r['Alpha_Score']}分", f"{r['建議']}", delta_color="normal")
+
         def highlight_top_score(val):
             if val >= 80: color = '#ffcdd2'
             elif val >= 50: color = '#fff9c4'
@@ -2302,23 +2329,23 @@ elif page == "🚀 科技股掃描":
 
         st.dataframe(
             top10.style
-            .format({"收盤價": "{:.1f}", "回測報酬": "{:.1%}"})
+            .format({"收盤價": "{:.1f}", "回測報酬": "{:.1%}", "漲跌幅": "{:.2%}"})
             .applymap(highlight_top_score, subset=['Alpha_Score']),
             use_container_width=True,
-            # [新增] 指定欄位順序，將 "計算過程" 加入顯示
-            column_order=["代號", "名稱", "Alpha_Score", "建議", "收盤價", "回測報酬", "計算過程", "達標率"]
+            column_order=["代號", "名稱", "Alpha_Score", "建議", "收盤價", "漲跌幅", "回測報酬", "計算過程"]
         )
         
-        st.markdown("---")
-        with st.expander("📄 查看完整掃描清單 (含觀望股)", expanded=True):
-            st.dataframe(
+        with st.expander("📄 查看完整掃描清單", expanded=False):
+             st.dataframe(
                 st.session_state['scan_results_df'].sort_values(by='Alpha_Score', ascending=False)
-                .style.format({"收盤價": "{:.1f}", "回測報酬": "{:.1%}"})
+                .style.format({"收盤價": "{:.1f}", "回測報酬": "{:.1%}", "漲跌幅": "{:.2%}"})
                 .background_gradient(subset=['Alpha_Score'], cmap='Reds'),
                 use_container_width=True
             )
+            
     elif 'scan_results_df' in st.session_state:
-         st.info("請點擊「啟動戰略掃描」開始分析。")
+         st.info("請選擇板塊並點擊「啟動戰略掃描」開始分析。")
+
 
 # --- 頁面 4: 全台股清單 ---
 elif page == "📋 全台股清單":
