@@ -1455,58 +1455,71 @@ if page == "🌍 市場總覽 (Macro)":
 # --- 頁面 2 (手機介面優化版): 單股深度分析 ---
 elif page == "📊 單股深度分析":
     # ==================================================
-    # 1. 資料準備與狀態初始化
+    # 1. 資料準備與搜尋清單建立
     # ==================================================
     if st.session_state['all_stock_list'] is None:
         st.session_state['all_stock_list'] = get_master_stock_data()
     
     df_all = st.session_state['all_stock_list']
     
-    # 建立搜尋清單
+    # 建立搜尋清單 (代號 + 名稱)
     search_list = [f"{row['代號']} {row['名稱']}" for idx, row in df_all.iterrows()]
     base_search_list = [f"{k} {v}" for k, v in TW_STOCK_NAMES_STATIC.items()]
+    # 排序並去重，確保順序固定
     full_search_options = sorted(list(set(search_list + base_search_list)))
 
-    # 確保 last_ticker 有值
+    # 確保核心變數 last_ticker 有值
     if 'last_ticker' not in st.session_state:
         st.session_state['last_ticker'] = "2330"
-        
-    # 確保 stock_selector 有初始值 (避免 key error)
-    if 'stock_selector' not in st.session_state:
-        # 根據目前的 last_ticker 找出對應的選單選項
-        current_opt = full_search_options[0]
-        for opt in full_search_options:
-            if opt.startswith(str(st.session_state['last_ticker'])):
-                current_opt = opt
-                break
-        st.session_state['stock_selector'] = current_opt
 
     # ==================================================
-    # 2. 定義雙向同步 Callback 函式
+    # 2. 定義 Callback (只負責處理邏輯變數)
     # ==================================================
     
-    # 情境 A: 使用者手動更改了下拉選單 -> 同步更新 last_ticker
-    def update_from_selector():
+    # 當使用者手動選取選單時
+    def on_selector_change():
         selection = st.session_state['stock_selector']
         st.session_state['last_ticker'] = selection.split(" ")[0]
 
-    # 情境 B: 使用者按了上下檔按鈕 -> 同步更新 stock_selector 與 last_ticker
-    def change_stock_selection(direction):
-        current_val = st.session_state.get('stock_selector', full_search_options[0])
-        try:
-            current_idx = full_search_options.index(current_val)
-        except:
-            current_idx = 0
-            
+    # 當使用者點擊按鈕時
+    def on_button_click(direction):
+        current_ticker = st.session_state['last_ticker']
+        
+        # 找出當前 ticker 在完整清單中的位置
+        current_idx = 0
+        for i, opt in enumerate(full_search_options):
+            if opt.startswith(str(current_ticker)):
+                current_idx = i
+                break
+        
+        # 計算新的 Index
         new_idx = (current_idx + direction) % len(full_search_options)
         new_option = full_search_options[new_idx]
         
-        # 同步寫入兩個狀態
-        st.session_state['stock_selector'] = new_option
+        # [關鍵] 只更新核心變數 last_ticker
+        # 我們不這在裡更新 stock_selector，而是交給下方的「強制同步」區塊處理
         st.session_state['last_ticker'] = new_option.split(" ")[0]
 
     # ==================================================
-    # 3. 介面佈局
+    # 3. [核心修正] 強制介面同步 (View <-> Model Sync)
+    # ==================================================
+    # 在畫出選單之前，強制將選單的 State 設定為 last_ticker 對應的選項
+    # 這確保了無論是按按鈕、還是外部更新，選單顯示永遠正確
+    
+    current_gui_option = full_search_options[0] # 預設值
+    target_ticker = st.session_state['last_ticker']
+    
+    # 在清單中找到對應的完整字串 (例如 "2330" -> "2330 台積電")
+    for opt in full_search_options:
+        if opt.startswith(str(target_ticker)):
+            current_gui_option = opt
+            break
+    
+    # 強制寫入 Session State，讓 Selectbox 乖乖聽話
+    st.session_state['stock_selector'] = current_gui_option
+
+    # ==================================================
+    # 4. 介面佈局
     # ==================================================
     
     # --- Row 1: 搜尋與 Go 按鈕 ---
@@ -1514,20 +1527,18 @@ elif page == "📊 單股深度分析":
         col_search, col_run = st.columns([3, 1])
         
         with col_search:
-            # [關鍵修正] 加入 on_change=update_from_selector
-            # 這樣一旦手動選了股票，就會立刻執行 update_from_selector 更新變數
+            # 這裡我們不設 index，而是依賴上方的 st.session_state['stock_selector'] 強制同步
             st.selectbox(
                 "搜尋股票 (支援代號或中文)",
                 options=full_search_options,
                 label_visibility="collapsed",
                 key="stock_selector",
-                on_change=update_from_selector  # 綁定手動變更事件
+                on_change=on_selector_change # 綁定手動變更
             )
             
         with col_run:
-            # Go 按鈕現在只是視覺輔助，因為 on_change 已經處理了更新
-            # 但保留它讓使用者習慣操作，或者強制刷新
             if st.button("Go", type="primary", use_container_width=True):
+                # 強制重跑
                 st.session_state['last_ticker'] = st.session_state['stock_selector'].split(" ")[0]
                 st.rerun()
 
@@ -1535,11 +1546,14 @@ elif page == "📊 單股深度分析":
     col_prev, col_next = st.columns([1, 1])
     
     with col_prev:
-        st.button("◀ 上一檔", use_container_width=True, on_click=change_stock_selection, args=(-1,))
+        st.button("◀ 上一檔", use_container_width=True, on_click=on_button_click, args=(-1,))
 
     with col_next:
-        st.button("下一檔 ▶", use_container_width=True, on_click=change_stock_selection, args=(1,))
+        st.button("下一檔 ▶", use_container_width=True, on_click=on_button_click, args=(1,))
 
+    # 取得最終要分析的代號
+    ticker_input = st.session_state['last_ticker']
+    
     # ==================================================
     # 3. 確保變數同步 (最後一道防線)
     # ==================================================
@@ -1686,7 +1700,7 @@ elif page == "📊 單股深度分析":
                 with log_col:
                     st.info(f"**🧮 演算歷程解析：**\n\n{full_log_text}")
 
-# ... (前段代碼保持不變) ...
+                # ... (前段代碼保持不變) ...
                 strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
                 strat_ret = best_params['Return'] * 100
                 
@@ -1763,7 +1777,7 @@ elif page == "📊 單股深度分析":
                     "目標達成率 (Target)", 
                     hit_rate, 
                     f"{hits}次達標 (+15%)", 
-                    is_good=(hits > 0)
+                    is_good=(hits > 50)
                 )
                 
                 # 4. 盈虧因子 PF (判斷標準: >1 為賺錢)
