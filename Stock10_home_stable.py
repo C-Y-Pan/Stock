@@ -2247,28 +2247,76 @@ elif page == "🚀 科技股掃描":
                             
                         best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input)
                         
+                        
                         if final_df is not None and not final_df.empty:
-                            # ... (指標計算邏輯，為節省篇幅省略，請保持原樣) ...
-                            # 為了確保完整性，我把這裡簡寫，您原本的邏輯是對的，請保留原本的 calculate_alpha_score 等部分
-                            
-                            # 以下為簡化的計算邏輯示意，請使用您原本完整的邏輯
+                            # 1. 取得基礎 Alpha Score
                             stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
                             base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
                             base_log = stock_alpha_df['Score_Log'].iloc[-1]
+                            
                             action, color, tech_reason = analyze_signal(final_df)
                             name = get_stock_name(fmt_ticker)
                             
-                            # Context Aware Adjustment (請確保這裡使用您之前修正過的完整版)
-                            # ... (請保留您之前的修正版邏輯) ...
-                            # 暫時使用基礎分數填充以確保程式運行
-                            final_score = base_alpha_score 
-                            display_reason = base_log
+                            # ==========================================
+                            # 2. [關鍵修正] 完整情境微調 (與 Page 2 完全同步)
+                            # ==========================================
+                            final_score = base_alpha_score
+                            adjustment_log = []
                             
-                            # 數據整理
+                            # 準備數據
                             current_price = final_df['Close'].iloc[-1]
+                            ma20 = final_df['MA20'].iloc[-1]
+                            ma60 = final_df['MA60'].iloc[-1]
+                            vol_now = final_df['Volume'].iloc[-1]
+                            vol_ma = final_df['Vol_MA20'].iloc[-1]
+                            
+                            # 判斷是否為反彈策略
+                            last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
+                            is_rebound = False
+                            if last_trade is not None:
+                                buy_reason = str(last_trade['Reason'])
+                                if any(x in buy_reason for x in ["反彈", "超賣", "回測", "籌碼"]): is_rebound = True
+                            
+                            # 針對「續抱」或「買進」狀態進行加分
+                            if action == "✊ 續抱" or action == "🚀 買進":
+                                if is_rebound:
+                                    # --- 情境 A: 反彈策略 (抄底) ---
+                                    if current_price < ma60: 
+                                        final_score += 15; adjustment_log.append("反彈位階+15")
+                                    
+                                    ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
+                                    if current_price > ma5: 
+                                        final_score += 10; adjustment_log.append("站穩MA5+10")
+                                    
+                                    rsi_now = final_df['RSI'].iloc[-1]
+                                    rsi_prev = final_df['RSI'].iloc[-2]
+                                    if rsi_now > rsi_prev: 
+                                        final_score += 10; adjustment_log.append("動能翻揚+10")
+                                    elif rsi_now < 30:
+                                        final_score += 5; adjustment_log.append("低檔鈍化+5")
+                                else:
+                                    # --- 情境 B: 順勢策略 (追價) ---
+                                    # [修正點] 補回 Page 2 有的加分項目
+                                    if current_price > ma20 and ma20 > ma60:
+                                        final_score += 10; adjustment_log.append("多頭排列+10")
+                                        
+                                    if vol_now > vol_ma:
+                                        final_score += 5; adjustment_log.append("量增+5")
+                                        
+                                    # 高檔爆量滯漲扣分 (風險提示)
+                                    if vol_now > vol_ma * 2.5 and final_df['Close'].pct_change().iloc[-1] < 0.005:
+                                        final_score -= 15; adjustment_log.append("高檔爆量滯漲-15")
+
+                            # 限制分數範圍
+                            final_score = max(min(final_score, 100), -100)
+                            
+                            display_reason = base_log
+                            if adjustment_log: display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
+                            
+                            # 3. 存入結果
                             prev_price = final_df['Close'].iloc[-2]
                             price_chg_pct = (current_price - prev_price) / prev_price
-                            turnover = current_price * final_df['Volume'].iloc[-1]
+                            turnover = current_price * vol_now
 
                             res_item = {
                                 "代號": fmt_ticker.split('.')[0], 
@@ -2387,7 +2435,7 @@ elif page == "🚀 科技股掃描":
                 * **左下象限 (💀 空頭修正區)**：分數低且股價在跌，建議**避開或放空**。
                 * **氣泡大小**：越大顆代表成交金額越大，流動性越好，但也可能代表短線過熱。
                 """)
-                
+
         st.markdown("---")
         
         st.markdown("### 🏆 AI 嚴選：最佳持有評分 Top 10")
