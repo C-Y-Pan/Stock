@@ -1549,7 +1549,7 @@ elif page == "📊 單股深度分析":
          st.session_state['last_ticker'] = st.session_state['stock_selector'].split(" ")[0]
 
     ticker_input = st.session_state['last_ticker']
-    
+
     
     if ticker_input: 
         with st.spinner(f'正在分析 {ticker_input} ...'):
@@ -1712,17 +1712,20 @@ elif page == "📊 單股深度分析":
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', 
                                             line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
-                    # 買賣點標記函式
+                    # 買賣點標記函式 (已修改為顯示 Alpha Score)
                     final_df['Buy_Y'] = final_df['Low'] * 0.92
                     final_df['Sell_Y'] = final_df['High'] * 1.08
 
                     def get_buy_text(sub_df):
-                        return [f"<b>{score}</b>" for score in sub_df['Confidence']]
+                        # [修改] 改為讀取 Alpha_Score，並轉為整數顯示
+                        return [f"<b>{int(score)}</b>" for score in sub_df['Alpha_Score']]
 
                     def get_sell_text(sub_df):
                         labels = []
                         for idx, row in sub_df.iterrows():
                             ret = row['Return_Label']
+                            # 也可以選擇顯示賣出當下的 Alpha Score
+                            # score = int(row['Alpha_Score'])
                             reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
                             labels.append(f"{ret}<br>({reason_str})")
                         return labels
