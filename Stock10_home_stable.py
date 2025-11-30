@@ -1851,27 +1851,115 @@ elif page == "📊 單股深度分析":
                         st.metric("潛在獲利 (95%)", f"+{(opt_p-last_p)/last_p*100:.1f}%")
                         st.metric("潛在風險 (5%)", f"-{(last_p-pes_p)/last_p*100:.1f}%")
 
-                # [Tab 4: 有效性驗證]
+# [Tab 4: 因子有效性驗證] (IC Analysis & Bucket Test)
                 with tab4:
-                    if validation_result:
-                        st.markdown(f"### 🧪 樣本外測試 (Walk-Forward Analysis)")
-                        tr_cagr = validation_result['train']['cagr'] * 100
-                        te_cagr = validation_result['test']['cagr'] * 100
+                    st.markdown("### 🧪 Alpha Score 預測力檢驗 (IC 分析)")
+                    st.caption("此頁面分析歷史數據中「Alpha Score」與「未來股價表現」的統計相關性，驗證 AI 評分的預測能力。")
+                    
+                    if final_df is not None and len(final_df) > 60:
+                        # 1. 數據準備
+                        val_df = final_df.copy()
                         
-                        vt1, vt2 = st.columns(2)
-                        vt1.metric("訓練集年化報酬", f"{tr_cagr:.1f}%")
-                        vt2.metric("測試集年化報酬", f"{te_cagr:.1f}%", f"差異: {(te_cagr-tr_cagr):.1f}%")
+                        # 計算未來 N 日的報酬率 (Future Return)
+                        val_df['Ret_1d'] = val_df['Close'].shift(-1) / val_df['Close'] - 1
+                        val_df['Ret_5d'] = val_df['Close'].shift(-5) / val_df['Close'] - 1
                         
-                        fig_val = go.Figure()
-                        fig_val.add_trace(go.Scatter(x=validation_result['train']['df']['Date'], y=validation_result['train']['df']['Cum_Strategy'], name='訓練', line=dict(color='gray', dash='dot')))
-                        scale_factor = validation_result['train']['df']['Cum_Strategy'].iloc[-1]
-                        fig_val.add_trace(go.Scatter(x=validation_result['test']['df']['Date'], y=validation_result['test']['df']['Cum_Strategy']*scale_factor, name='測試', line=dict(color='#00e676')))
-                        fig_val.add_vline(x=validation_result['split_date'].timestamp()*1000, line_dash="dash", line_color="white")
-                        fig_val.update_layout(template="plotly_dark", height=400, margin=dict(l=10, r=10, t=30, b=10))
-                        st.plotly_chart(fig_val, use_container_width=True)
+                        # 去除最後幾行 (因為沒有未來的資料)
+                        val_df = val_df.dropna(subset=['Ret_1d', 'Ret_5d'])
+                        
+                        # 2. 計算相關係數 (Information Coefficient, IC)
+                        # 正值代表分數越高，未來漲幅越大；0 代表無相關；負值代表反指標
+                        ic_1d = val_df['Alpha_Score'].corr(val_df['Ret_1d'])
+                        ic_5d = val_df['Alpha_Score'].corr(val_df['Ret_5d'])
+                        
+                        # 顯示 IC 儀表板
+                        c_ic1, c_ic2, c_desc = st.columns([1, 1, 2])
+                        
+                        def get_ic_color(val):
+                            if val > 0.05: return "normal" # 顯著正相關
+                            if val < -0.05: return "inverse" # 顯著負相關
+                            return "off" # 無相關
+                            
+                        c_ic1.metric("1日 IC (預測隔日)", f"{ic_1d:.3f}", 
+                                     "正值=有效", delta_color=get_ic_color(ic_1d))
+                        c_ic2.metric("5日 IC (預測一週)", f"{ic_5d:.3f}", 
+                                     "正值=有效", delta_color=get_ic_color(ic_5d))
+                        
+                        with c_desc:
+                            if ic_5d > 0.1:
+                                st.success("✅ **高顯著性**：Alpha Score 對未來一週股價有極強的預測力。")
+                            elif ic_5d > 0.02:
+                                st.info("👌 **有效**：分數越高，股價傾向於上漲，具參考價值。")
+                            else:
+                                st.warning("⚠️ **隨機漫步**：當前分數與未來漲跌相關性低 (可能是震盪盤)。")
+                        
+                        st.markdown("---")
+                        
+                        # 3. 分組績效分析 (Bucket Analysis)
+                        # 將分數分為 5 個區間，觀察每個區間的「平均漲幅」與「勝率」
+                        bins = [-110, -50, -10, 10, 50, 110]
+                        labels = ['極弱勢 (<-50)', '弱勢 (-50~-10)', '盤整 (-10~10)', '強勢 (10~50)', '極強勢 (>50)']
+                        val_df['Score_Group'] = pd.cut(val_df['Alpha_Score'], bins=bins, labels=labels)
+                        
+                        # 計算各組統計量
+                        group_stats = val_df.groupby('Score_Group', observed=True).agg({
+                            'Ret_5d': ['mean', 'count'],
+                            'Ret_1d': 'mean'
+                        })
+                        group_stats.columns = ['Avg_Ret_5d', 'Count', 'Avg_Ret_1d']
+                        
+                        # 計算勝率 (未來5日上漲的機率)
+                        win_rates = val_df.groupby('Score_Group', observed=True)['Ret_5d'].apply(lambda x: (x > 0).mean() * 100)
+                        
+                        # 繪圖
+                        st.markdown("#### 📊 分數區間 vs 未來一週表現")
+                        
+                        fig_bucket = make_subplots(specs=[[{"secondary_y": True}]])
+                        
+                        # Bar: 平均報酬率
+                        colors_bar = ['#ef5350' if v > 0 else '#00e676' for v in group_stats['Avg_Ret_5d']] # 台股紅漲綠跌
+                        fig_bucket.add_trace(go.Bar(
+                            x=group_stats.index, 
+                            y=group_stats['Avg_Ret_5d'] * 100,
+                            name='未來5日平均漲跌(%)',
+                            marker_color=colors_bar,
+                            opacity=0.7
+                        ), secondary_y=False)
+                        
+                        # Line: 上漲勝率
+                        fig_bucket.add_trace(go.Scatter(
+                            x=win_rates.index, 
+                            y=win_rates,
+                            name='上漲機率(%)',
+                            mode='lines+markers',
+                            line=dict(color='yellow', width=3),
+                            marker=dict(size=8)
+                        ), secondary_y=True)
+                        
+                        fig_bucket.update_yaxes(title_text="平均漲跌幅 (%)", secondary_y=False)
+                        fig_bucket.update_yaxes(title_text="上漲機率 (%)", range=[0, 100], secondary_y=True)
+                        fig_bucket.update_layout(
+                            template="plotly_dark", 
+                            height=400,
+                            legend=dict(orientation="h", y=1.1),
+                            margin=dict(l=20, r=20, t=40, b=20)
+                        )
+                        
+                        st.plotly_chart(fig_bucket, use_container_width=True)
+                        
+                        # 顯示詳細數據表
+                        st.markdown("#### 📋 詳細統計數據")
+                        display_table = pd.DataFrame({
+                            '樣本數': group_stats['Count'],
+                            '平均漲幅(5日)': (group_stats['Avg_Ret_5d']*100).map('{:+.2f}%'.format),
+                            '上漲機率': win_rates.map('{:.1f}%'.format),
+                            '期望值': (group_stats['Avg_Ret_5d'] * 100).map('{:+.2f}%'.format)
+                        })
+                        st.dataframe(display_table.T, use_container_width=True)
+                        
                     else:
-                        st.warning("數據不足，無法執行樣本外驗證。")
-
+                        st.warning("數據不足 (少於 60 天)，無法進行統計驗證。")
+                        
 # --- 頁面 3 (修正版): 科技股/熱門股掃描 ---
 elif page == "🚀 科技股掃描":
     st.markdown(f"### 🚀 戰略雷達：全市場機會掃描")
