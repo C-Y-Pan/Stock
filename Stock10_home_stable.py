@@ -1521,7 +1521,6 @@ elif page == "📊 單股深度分析":
             selected_opt = st.selectbox(
                 "搜尋股票 (支援代號或中文)",
                 options=full_search_options,
-                index=full_search_options.index(st.session_state['stock_selector']), # 確保 index 正確
                 label_visibility="collapsed",
                 key="stock_selector" 
             )
@@ -1959,7 +1958,7 @@ elif page == "📊 單股深度分析":
                         
                     else:
                         st.warning("數據不足 (少於 60 天)，無法進行統計驗證。")
-                        
+
 # --- 頁面 3 (修正版): 科技股/熱門股掃描 ---
 elif page == "🚀 科技股掃描":
     st.markdown(f"### 🚀 戰略雷達：全市場機會掃描")
