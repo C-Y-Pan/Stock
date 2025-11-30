@@ -2265,23 +2265,21 @@ elif page == "💼 持股健診與建議":
         if st.session_state.get('logged_in'):
             save_portfolio_to_db(st.session_state['username'], new_df)
 
-    # ==========================================
-    # 1. [自動股名版] 準備輸入資料 (回傳值偵測 + 強制刷新)
+# ==========================================
+    # 1. [優化版] 準備輸入資料 (表單批次處理)
     # ==========================================
 
     # 初始化資料 (只在第一次執行或資料異常時執行)
     if 'portfolio_data' not in st.session_state or not isinstance(st.session_state['portfolio_data'], pd.DataFrame):
         if st.session_state.get('logged_in'):
             db_df = load_portfolio_from_db(st.session_state['username'])
-            # 如果資料庫是空的，給預設值
             start_df = db_df if not db_df.empty else pd.DataFrame([{"代號": "2330", "持有股數": 1000}])
         else:
             start_df = pd.DataFrame([
                 {"代號": "2330", "持有股數": 1000}, {"代號": "2317", "持有股數": 2000}, {"代號": "2603", "持有股數": 5000}
             ])
             
-        # [新增邏輯] 初始化時，自動補上 "名稱" 欄位
-        # 使用 apply 搭配 get_stock_name 自動查詢
+        # 初始化時自動補上名稱
         if '代號' in start_df.columns:
             start_df['名稱'] = start_df['代號'].apply(lambda x: get_stock_name(str(x)))
         
@@ -2291,50 +2289,54 @@ elif page == "💼 持股健診與建議":
     
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
+        st.caption("📝 請直接編輯表格，輸入完畢後請務必點擊下方 **「💾 確認儲存」** 按鈕。")
         
-        # 使用 data_editor 顯示
-        edited_df = st.data_editor(
-            st.session_state['portfolio_data'], 
-            num_rows="dynamic", 
-            use_container_width=True, 
-            key="portfolio_editor_widget", 
-            # [設定顯示順序] 把名稱放在代號旁邊
-            column_order=["代號", "名稱", "持有股數"],
-            column_config={
-                "代號": st.column_config.TextColumn("股票代號", help="請輸入台股代號"),
-                # [關鍵設定] 名稱欄位設為唯讀 (disabled=True)
-                "名稱": st.column_config.TextColumn("股票名稱", disabled=True), 
-                "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, format="%d")
-            }
-        )
-
-        # [核心邏輯] 偵測變動並自動補全股名
-        if edited_df is not None and not edited_df.equals(st.session_state['portfolio_data']):
+        # [關鍵修正] 使用 st.form 將編輯器包起來
+        # 這樣輸入過程中的 Enter 或 Tab 都不會觸發 Rerun，直到按下 Submit 按鈕
+        with st.form("portfolio_input_form"):
+            edited_df = st.data_editor(
+                st.session_state['portfolio_data'], 
+                num_rows="dynamic", 
+                use_container_width=True, 
+                key="portfolio_editor_widget", 
+                column_order=["代號", "名稱", "持有股數"],
+                column_config={
+                    "代號": st.column_config.TextColumn("股票代號", help="輸入代號 (如 2330)"),
+                    "名稱": st.column_config.TextColumn("股票名稱", disabled=True, help="儲存後自動更新"), 
+                    "持有股數": st.column_config.NumberColumn("持有股數 (股)", min_value=1, step=1000, format="%d")
+                }
+            )
             
-            # 1. 資料清洗 (防呆轉型)
-            if '持有股數' in edited_df.columns:
-                edited_df['持有股數'] = pd.to_numeric(edited_df['持有股數'], errors='coerce').fillna(0).astype(int)
-            if '代號' in edited_df.columns:
-                edited_df['代號'] = edited_df['代號'].astype(str)
+            # 表單提交按鈕
+            submit_btn = st.form_submit_button("💾 確認儲存並分析", type="primary", use_container_width=True)
 
-            # 2. [新增邏輯] 自動更新股名
-            # 當使用者改了代號，這裡會重新查一次名稱並填入
-            if '代號' in edited_df.columns:
-                edited_df['名稱'] = edited_df['代號'].apply(lambda x: get_stock_name(str(x)) if x else "")
+        # [處理邏輯] 只有在按下按鈕後才執行資料處理與存檔
+        if submit_btn:
+            # 1. 資料清洗
+            if edited_df is not None:
+                # 確保股數是數字
+                if '持有股數' in edited_df.columns:
+                    edited_df['持有股數'] = pd.to_numeric(edited_df['持有股數'], errors='coerce').fillna(0).astype(int)
+                # 確保代號是字串
+                if '代號' in edited_df.columns:
+                    edited_df['代號'] = edited_df['代號'].astype(str)
 
-            # 3. 更新 Session State
-            st.session_state['portfolio_data'] = edited_df
-            
-            # 4. 更新時間戳記
-            st.session_state['data_version'] = datetime.now().timestamp()
-            
-            # 5. 同步寫入資料庫 (注意：資料庫通常只存 代號/股數，名稱是動態查的，所以存檔邏輯不用變)
-            if st.session_state.get('logged_in'):
-                save_portfolio_to_db(st.session_state['username'], edited_df)
-            
-            # 6. 強制重跑以顯示最新的股名
-            st.rerun()
+                # 2. 自動更新股名 (這是批次執行的，不會卡頓)
+                with st.spinner("正在更新股票名稱與存檔..."):
+                    if '代號' in edited_df.columns:
+                        edited_df['名稱'] = edited_df['代號'].apply(lambda x: get_stock_name(str(x)) if x else "")
 
+                # 3. 更新 Session State
+                st.session_state['portfolio_data'] = edited_df
+                st.session_state['data_version'] = datetime.now().timestamp()
+                
+                # 4. 同步寫入資料庫 (若已登入)
+                if st.session_state.get('logged_in'):
+                    save_portfolio_to_db(st.session_state['username'], edited_df)
+                
+                st.success("✅ 持股明細已更新！")
+                st.rerun()
+                
     with col_ctrl:
         st.markdown("#### 2. 監控設定")
         st.info("👇 點擊下方按鈕後，下方區域將進入實時監控模式，每 300 秒僅更新圖表數據，不會重載整頁。")
