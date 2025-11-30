@@ -1686,16 +1686,98 @@ elif page == "📊 單股深度分析":
                 with log_col:
                     st.info(f"**🧮 演算歷程解析：**\n\n{full_log_text}")
 
-                # ... (後續的 Tabs 繪圖部分完全不用動) ...
+# ... (前段代碼保持不變) ...
                 strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
                 strat_ret = best_params['Return'] * 100
-                m1, m2, m3, m4 = st.columns(4)
-                m1.metric("淨報酬 (含成本)", f"{strat_ret:.1f}%", f"MDD: {strat_mdd:.1f}%")
-                m2.metric("實際勝率 (Realized)", real_win_rate, f"{real_wins}勝 / {real_total}總")
-                m3.metric("目標達成率 (Target)", hit_rate, f"{hits}次達標 (+15%)")
-                m4.metric("盈虧因子 (PF)", f"{risk_metrics.get('Profit_Factor', 0):.2f}", f"夏普: {risk_metrics.get('Sharpe', 0):.2f}")
                 
-                # ... (請保留原本的 Tabs 繪圖代碼) ...
+                # ==========================================
+                # [優化] 自訂指標卡片 (符合台股紅漲綠跌邏輯)
+                # ==========================================
+                
+                # 定義卡片渲染函式 (CSS 內嵌)
+                def KPI_Card(col, title, value, sub_value, is_good):
+                    # 台股邏輯顏色
+                    color = "#ff5252" if is_good else "#00e676"  # 紅/綠
+                    arrow = "▲" if is_good else "▼"
+                    bg_color = "rgba(255, 82, 82, 0.1)" if is_good else "rgba(0, 230, 118, 0.1)"
+                    
+                    col.markdown(
+                        f"""
+                        <div style="
+                            border: 1px solid #333; 
+                            border-radius: 8px; 
+                            padding: 15px; 
+                            background-color: #262730;
+                            text-align: center;
+                            height: 100%;">
+                            <div style="color: #aaa; font-size: 14px; margin-bottom: 5px;">{title}</div>
+                            <div style="color: {color}; font-size: 26px; font-weight: bold; margin-bottom: 5px;">
+                                {value}
+                            </div>
+                            <div style="
+                                display: inline-block;
+                                background-color: {bg_color};
+                                color: {color};
+                                padding: 2px 8px;
+                                border-radius: 4px;
+                                font-size: 13px;">
+                                {arrow} {sub_value}
+                            </div>
+                        </div>
+                        """, 
+                        unsafe_allow_html=True
+                    )
+
+                # 準備數據
+                pf = risk_metrics.get('Profit_Factor', 0)
+                sharpe = risk_metrics.get('Sharpe', 0)
+                
+                # 解析勝率字串轉浮點數 (例如 "37.5%" -> 37.5)
+                try: win_rate_val = float(real_win_rate.strip('%'))
+                except: win_rate_val = 0
+                
+                # 建立四欄版面
+                m1, m2, m3, m4 = st.columns(4)
+                
+                # 1. 淨報酬 (判斷標準: >0 為好)
+                KPI_Card(
+                    m1, 
+                    "淨報酬 (含成本)", 
+                    f"{strat_ret:+.1f}%", 
+                    f"MDD: -{strat_mdd:.1f}%", 
+                    is_good=(strat_ret > 0)
+                )
+                
+                # 2. 實際勝率 (判斷標準: >=50% 為好)
+                KPI_Card(
+                    m2, 
+                    "實際勝率 (Realized)", 
+                    real_win_rate, 
+                    f"{real_wins}勝 / {real_total}總", 
+                    is_good=(win_rate_val >= 50)
+                )
+                
+                # 3. 目標達成率 (判斷標準: 有達標就是好)
+                KPI_Card(
+                    m3, 
+                    "目標達成率 (Target)", 
+                    hit_rate, 
+                    f"{hits}次達標 (+15%)", 
+                    is_good=(hits > 0)
+                )
+                
+                # 4. 盈虧因子 PF (判斷標準: >1 為賺錢)
+                KPI_Card(
+                    m4, 
+                    "盈虧因子 (PF)", 
+                    f"{pf:.2f}", 
+                    f"夏普: {sharpe:.2f}", 
+                    is_good=(pf > 1)
+                )
+                
+                st.write("") # 增加一點間距
+                
+                # ... (後續 tab1, tab2... 保持不變) ...
                 tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
                 
                 # [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
