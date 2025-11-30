@@ -812,106 +812,150 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.0 (Direct Strategy Mapping):
-    直接映射 run_simple_strategy 的回測結果 (Action/Position)。
-    確保評分與 K 線圖上的買賣標記完全一致。
-    
-    邏輯對照：
-    - Action='Buy'  -> +100 (強制滿分)
-    - Action='Sell' -> -100 (強制最低分)
-    - Position=1    -> +50 ~ +90 (依據趨勢強度加分)
-    - Position=0    -> -20 ~ -80 (依據空頭嚴重度扣分)
+    Alpha Score v5.1 (Analog/Organic):
+    在策略訊號的基礎上，加入技術指標的「類比浮動」，
+    讓分數具有呼吸感與強弱層次，而非死板的階梯狀數值。
     """
     df = df.copy()
 
     # ====================================================
-    # 1. 檢查是否有策略欄位 (相容性檢查)
+    # 1. 檢查與基礎數據準備
     # ====================================================
-    # 若傳入的 df 沒有跑過策略 (例如大盤分析頁面)，則回退使用 v4.1 的純技術計算
     if 'Action' not in df.columns or 'Position' not in df.columns:
         return calculate_alpha_score_technical_fallback(df)
 
+    # 確保技術指標存在 (若無則補算)
+    if 'RSI' not in df.columns: df['RSI'] = 50
+    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
+    if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
+    
+    # 轉為 numpy array
+    action = df['Action'].values
+    position = pd.Series(df['Position'].values).ffill().fillna(0).values
+    close = df['Close'].values
+    ma20 = df['MA20'].ffill().values
+    volume = df['Volume'].fillna(0).values
+    vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
+    rsi = df['RSI'].fillna(50).values
+    
     # ====================================================
-    # 2. 基礎分數初始化
+    # 2. 計算「類比調節因子」 (Analog Modulators)
+    # ====================================================
+    # 這些因子負責讓分數「波動」，範圍大約在 -20 ~ +20 之間
+    
+    # A. 乖離強度 (Bias Strength): 股價離月線越遠，動能越強
+    # 限制在 +/- 15 分
+    bias_val = (close - ma20) / ma20 * 100
+    score_bias = np.clip(bias_val * 2, -15, 15)
+    
+    # B. RSI 動能 (Momentum): 
+    # RSI > 50 加分，< 50 扣分。範圍 +/- 15 分
+    score_rsi = (rsi - 50) * 0.6
+    score_rsi = np.clip(score_rsi, -15, 15)
+    
+    # C. 量能爆發 (Volume Surge):
+    # 只加分不扣分 (有量代表活躍)，最多 +10 分
+    vol_ratio = volume / vol_ma20
+    score_vol = np.where(vol_ratio > 1, np.clip((vol_ratio - 1) * 5, 0, 10), 0)
+    
+    # 綜合調節值 (Total Modulation)
+    # 這會讓分數隨每日行情起伏
+    analog_modulation = score_bias + score_rsi + score_vol
+
+    # ====================================================
+    # 3. 狀態錨定評分 (State Anchoring)
     # ====================================================
     alpha_score = np.zeros(len(df))
     log_msg = np.full(len(df), "", dtype=object)
 
-    # 提取必要的 Numpy Array 加速運算
-    action = df['Action'].values
-    position = df['Position'].values
-    # 補救措施：若 Position 中間有斷裂 (NaN)，向前填充
-    # 注意：需先轉 Series fillna 再轉回 numpy
-    position = pd.Series(position).ffill().fillna(0).values
-    
-    close = df['Close'].values
-    ma20 = df['MA20'].values
-    ma60 = df['MA60'].values
-    trend = df['Trend'].values if 'Trend' in df.columns else np.zeros(len(df))
-
-    # ====================================================
-    # 3. 狀態評分 (State Scoring)
-    # ====================================================
-    
     # --- 情境 A: 持倉中 (Position == 1) ---
-    # 基礎分 +60
-    # 加分項：股價 > 月線 (+10), 月線 > 季線 (+10), 趨勢指標向上 (+10)
-    holding_score = 60 + \
-                    np.where(close > ma20, 10, 0) + \
-                    np.where(ma20 > ma60, 10, 0) + \
-                    np.where(trend == 1, 10, 0)
-    
-    # 扣分項：雖然持倉但跌破月線 (獲利回吐中) -> 扣分提醒
-    holding_score = np.where((close < ma20), holding_score - 15, holding_score)
+    # 基礎分 60，疊加調節值
+    # 結果範圍約 40 (弱勢盤整) ~ 90 (強勢噴出)
+    holding_score = 60 + analog_modulation
     
     # --- 情境 B: 空手中 (Position == 0) ---
-    # 基礎分 -20 (觀望)
-    # 扣分項：空頭排列 (-20), 股價 < 季線 (-20), 趨勢向下 (-20)
-    waiting_score = -20 + \
-                    np.where(ma20 < ma60, -20, 0) + \
-                    np.where(close < ma60, -20, 0) + \
-                    np.where(trend == -1, -20, 0)
-
+    # 基礎分 -30，疊加調節值
+    # 結果範圍約 -60 (空頭急殺) ~ 0 (止跌回穩)
+    waiting_score = -30 + analog_modulation
+    
     # 應用狀態分數
     alpha_score = np.where(position == 1, holding_score, waiting_score)
-    
-    # 記錄狀態日誌
-    log_msg = np.where(position == 1, "持倉續抱", "空手觀望")
+    log_msg = np.where(position == 1, "持倉監控", "空手觀望")
 
     # ====================================================
-    # 4. 訊號強制覆蓋 (Action Override)
+    # 4. 訊號事件 (Action Events) - 帶有強度的脈衝
     # ====================================================
-    # 這是解決「對應不準」的核心：只要當天有動作，分數強制鎖定
     
-    # --- Buy Signal ---
+    # --- Buy Event ---
+    # 基礎 85 分 + 技術強度
+    # 如果是超強勢突破 (量大+乖離大)，分數會逼近 99
+    # 如果是弱勢反彈，分數可能在 85 左右
     buy_mask = (action == 'Buy')
-    alpha_score = np.where(buy_mask, 100, alpha_score)
+    buy_pulse = 85 + (analog_modulation * 0.5) # 買進當下，技術指標權重減半，避免過熱導致分數溢出
+    buy_pulse = np.clip(buy_pulse, 85, 99) # 確保買訊至少有 85 分
     
-    # 從 Reason 欄位提取買進理由
+    alpha_score = np.where(buy_mask, buy_pulse, alpha_score)
+    
+    # 記錄買進理由
     if 'Reason' in df.columns:
         buy_reasons = df['Reason'].fillna("")
         log_msg = np.where(buy_mask, "買進: " + buy_reasons, log_msg)
-    else:
-        log_msg = np.where(buy_mask, "訊號買進", log_msg)
 
-    # --- Sell Signal ---
+    # --- Sell Event ---
+    # 基礎 -85 分 - 技術疲弱度
     sell_mask = (action == 'Sell')
-    alpha_score = np.where(sell_mask, -100, alpha_score)
+    sell_pulse = -85 + (analog_modulation * 0.5)
+    sell_pulse = np.clip(sell_pulse, -99, -85) # 確保賣訊至少有 -85 分
+    
+    alpha_score = np.where(sell_mask, sell_pulse, alpha_score)
     
     if 'Reason' in df.columns:
         sell_reasons = df['Reason'].fillna("")
         log_msg = np.where(sell_mask, "賣出: " + sell_reasons, log_msg)
-    else:
-        log_msg = np.where(sell_mask, "訊號賣出", log_msg)
 
     # ====================================================
-    # 5. 輸出處理
+    # 5. 平滑化處理 (Smoothing) - 增加 Analog 質感
     # ====================================================
-    df['Alpha_Score'] = alpha_score
-    df['Score_Log'] = log_msg
+    # 使用加權移動平均 (EWMA) 讓曲線更圓潤，消除微小的鋸齒
+    # 但為了保留買賣點的銳利度，我們先計算平滑版，再把買賣點「貼」回去
+    
+    final_series = pd.Series(alpha_score)
+    # alpha=0.5 代表新數據權重 50%，舊數據 50%，適度平滑
+    smoothed_score = final_series.ewm(alpha=0.5, adjust=False).mean().values
+    
+    # 強制保留買賣點的「尖刺感」(因為這是決策點，不能被磨平)
+    final_score = np.where(buy_mask | sell_mask, alpha_score, smoothed_score)
+    
+    # 限制範圍
+    df['Alpha_Score'] = np.clip(final_score, -100, 100)
+    
+    # ====================================================
+    # 6. 生成評語
+    # ====================================================
+    # 根據分數區間給予更細膩的評語
+    conditions = [
+        (df['Alpha_Score'] >= 80),
+        (df['Alpha_Score'] >= 50),
+        (df['Alpha_Score'] >= 0),
+        (df['Alpha_Score'] <= -80),
+        (df['Alpha_Score'] <= -50)
+    ]
+    choices = [
+        "🔥 極強勢",   # > 80
+        "📈 多頭攻勢", # 50~80
+        "⚖️ 偏多震盪", # 0~50
+        "⚡ 極弱勢",   # < -80
+        "📉 空頭修正"  # -50 ~ -80
+    ]
+    # 混合原有的 log_msg
+    base_log = np.select(conditions, choices, default="☁️ 盤整")
+    df['Score_Log'] = np.where(buy_mask | sell_mask, log_msg, base_log)
+    
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
+
+
 
 def calculate_alpha_score_technical_fallback(df):
     """
