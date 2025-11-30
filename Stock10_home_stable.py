@@ -2309,7 +2309,7 @@ elif page == "🚀 科技股掃描":
                             "Alpha_Score": int(final_score), 
                             "計算過程": display_reason, # 更新為完整的理由
                             "回測報酬": best_params['Return'],
-                            "板塊": selected_sector
+                            "板塊": current_sector
                         }
                         results.append(res_item)
 
