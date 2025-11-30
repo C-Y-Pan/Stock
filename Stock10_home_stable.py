@@ -1470,64 +1470,64 @@ elif page == "📊 單股深度分析":
     # 確保 last_ticker 有值
     if 'last_ticker' not in st.session_state:
         st.session_state['last_ticker'] = "2330"
-
-    # [關鍵修正 1]：定義 Callback 函式，同時更新「變數」與「選單 Key」
-    def change_stock_selection(direction):
-        # 1. 取得當前使用的 ticker
-        current_ticker = st.session_state['last_ticker']
         
-        # 2. 嘗試在清單中找到目前的位置
-        # (這裡用模糊比對，因為 last_ticker 只有代號，但選單有代號+名稱)
-        current_idx = 0
-        for idx, opt in enumerate(full_search_options):
-            if opt.startswith(str(current_ticker)):
-                current_idx = idx
+    # 確保 stock_selector 有初始值 (避免 key error)
+    if 'stock_selector' not in st.session_state:
+        # 根據目前的 last_ticker 找出對應的選單選項
+        current_opt = full_search_options[0]
+        for opt in full_search_options:
+            if opt.startswith(str(st.session_state['last_ticker'])):
+                current_opt = opt
                 break
-        
-        # 3. 計算新索引
+        st.session_state['stock_selector'] = current_opt
+
+    # ==================================================
+    # 2. 定義雙向同步 Callback 函式
+    # ==================================================
+    
+    # 情境 A: 使用者手動更改了下拉選單 -> 同步更新 last_ticker
+    def update_from_selector():
+        selection = st.session_state['stock_selector']
+        st.session_state['last_ticker'] = selection.split(" ")[0]
+
+    # 情境 B: 使用者按了上下檔按鈕 -> 同步更新 stock_selector 與 last_ticker
+    def change_stock_selection(direction):
+        current_val = st.session_state.get('stock_selector', full_search_options[0])
+        try:
+            current_idx = full_search_options.index(current_val)
+        except:
+            current_idx = 0
+            
         new_idx = (current_idx + direction) % len(full_search_options)
         new_option = full_search_options[new_idx]
         
-        # 4. [最重要的一步] 同步更新 session_state 中的兩個變數
+        # 同步寫入兩個狀態
+        st.session_state['stock_selector'] = new_option
         st.session_state['last_ticker'] = new_option.split(" ")[0]
-        st.session_state['stock_selector'] = new_option # 強制讓選單顯示新的值
 
     # ==================================================
-    # 2. 介面佈局
+    # 3. 介面佈局
     # ==================================================
     
-    # [關鍵修正 2]：在渲染 Selectbox 前，先確認 index 是否正確
-    # 這是為了防止「選單還停在舊股票」導致的跳回問題
-    current_gui_option = full_search_options[0]
-    for opt in full_search_options:
-        if opt.startswith(str(st.session_state['last_ticker'])):
-            current_gui_option = opt
-            break
-            
-    # 如果 session_state 的選單值跟實際 ticker 不同步，強制同步
-    if 'stock_selector' not in st.session_state:
-        st.session_state['stock_selector'] = current_gui_option
-    elif not st.session_state['stock_selector'].startswith(st.session_state['last_ticker']):
-        st.session_state['stock_selector'] = current_gui_option
-
     # --- Row 1: 搜尋與 Go 按鈕 ---
     with st.container():
         col_search, col_run = st.columns([3, 1])
         
         with col_search:
-            # Selectbox
-            # 使用 key="stock_selector" 讓 Streamlit 自動管理狀態
-            # 但因為我們上面已經做了「強制同步」，所以這裡不會再發生衝突
-            selected_opt = st.selectbox(
+            # [關鍵修正] 加入 on_change=update_from_selector
+            # 這樣一旦手動選了股票，就會立刻執行 update_from_selector 更新變數
+            st.selectbox(
                 "搜尋股票 (支援代號或中文)",
                 options=full_search_options,
                 label_visibility="collapsed",
-                key="stock_selector" 
+                key="stock_selector",
+                on_change=update_from_selector  # 綁定手動變更事件
             )
             
         with col_run:
+            # Go 按鈕現在只是視覺輔助，因為 on_change 已經處理了更新
+            # 但保留它讓使用者習慣操作，或者強制刷新
             if st.button("Go", type="primary", use_container_width=True):
-                # 按下 Go 時，將選單的值寫入 last_ticker
                 st.session_state['last_ticker'] = st.session_state['stock_selector'].split(" ")[0]
                 st.rerun()
 
@@ -1671,7 +1671,7 @@ elif page == "📊 單股深度分析":
                 # ... (請保留原本的 Tabs 繪圖代碼) ...
                 tab1, tab2, tab3, tab4 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🎲 蒙地卡羅模擬", "🧪 有效性驗證"])
                 
-# [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
+                # [Tab 1: K線圖] (進階版：新增 Alpha Slope 動能圖)
                 with tab1:
                     # 1. 準備數據
                     # 將 Alpha Score 寫入 final_df
@@ -1958,7 +1958,6 @@ elif page == "📊 單股深度分析":
                         
                     else:
                         st.warning("數據不足 (少於 60 天)，無法進行統計驗證。")
-
 # --- 頁面 3 (修正版): 科技股/熱門股掃描 ---
 elif page == "🚀 科技股掃描":
     st.markdown(f"### 🚀 戰略雷達：全市場機會掃描")
