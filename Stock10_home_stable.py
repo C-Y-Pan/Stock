@@ -1662,6 +1662,7 @@ elif page == "📊 單股深度分析":
                         label="最新現價", 
                         value=f"{last_close:.2f}", 
                         delta=f"{price_chg:.2f} ({price_pct:.2f}%)"
+                        delta_color="inverse"
                     )
 
                 st.markdown("---")
