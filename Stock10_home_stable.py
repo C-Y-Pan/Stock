@@ -300,13 +300,14 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [絕對還原版] 智慧獲取股價資料
-    策略：放棄 auto_adjust=True，一律抓取原始資料 (Raw Data)，
-    並強制使用 Adj Close 進行 OHLC 的校正計算。
+    [全功能還原版] 智慧獲取股價資料
+    特色：手動處理「股票分割 (Splits)」與「現金股利 (Dividends)」。
+    針對 0052 (1拆7) 這類 Yahoo 未自動還原的案例，
+    程式會讀取 'Stock Splits' 欄位並執行回溯除法運算。
     """
     ticker = str(ticker).strip().upper()
     
-    # 候選名單邏輯
+    # 定義搜尋候選清單
     candidates = []
     if '.' in ticker:
         candidates.append(ticker)
@@ -323,34 +324,149 @@ def get_stock_data(ticker, start_date, end_date):
         try:
             stock = yf.Ticker(t)
             
-            # [修正點] 
-            # 不再嘗試 auto_adjust=True，因為有時它會失效卻不報錯。
-            # 直接抓 auto_adjust=False (原始資料)
-            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
+            # 1. 抓取原始資料 (含分割與股利資訊)
+            # 必須 auto_adjust=False 以取得原始價格與事件
+            # 多抓 700 天是為了計算完整的累積因子
+            df = stock.history(start=start_date - timedelta(days=700), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
             
-            # 資料驗證
-            if not df.empty and len(df) > 5:
-                # [核心還原邏輯]
-                # 只要有 Adj Close，就無視 Close，強制進行還原運算
-                if 'Adj Close' in df.columns:
-                    # 計算還原係數 (Factor)
-                    # 避免分母為 0
-                    close_data = df['Close'].replace(0, np.nan).fillna(method='ffill')
-                    factor = df['Adj Close'] / close_data
-                    
-                    # 修正所有價格欄位
-                    df['Open'] = df['Open'] * factor
-                    df['High'] = df['High'] * factor
-                    df['Low'] = df['Low'] * factor
-                    df['Close'] = df['Adj Close'] # 收盤價直接用調整後價格覆蓋
-                    
-                    # 移除 Adj Close 以免混淆
-                    df = df.drop(columns=['Adj Close'])
+            if df.empty or len(df) < 5: continue
+
+            # ==========================================
+            # [核心演算法] 分割與股利 手動雙重還原
+            # ==========================================
+            # 檢查是否有需要還原的事件
+            has_splits = 'Stock Splits' in df.columns and df['Stock Splits'].sum() > 0
+            has_dividends = 'Dividends' in df.columns and df['Dividends'].sum() > 0
+            
+            if has_splits or has_dividends:
+                # 備份原始資料用於計算
+                # 為了運算正確，我們必須「倒序 (從新到舊)」來累積調整因子
+                # 因為今天的價格是基準 (Factor=1)，越往過去，因子變化越大
                 
-                # 格式整理
-                df = df.reset_index()
-                df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
+                df_rev = df.sort_index(ascending=False).copy()
                 
+                # 初始化調整後的陣列
+                adj_open = df_rev['Open'].values.copy()
+                adj_high = df_rev['High'].values.copy()
+                adj_low = df_rev['Low'].values.copy()
+                adj_close = df_rev['Close'].values.copy()
+                
+                # 取得事件序列
+                splits = df_rev['Stock Splits'].values if 'Stock Splits' in df.columns else np.zeros(len(df))
+                divs = df_rev['Dividends'].values if 'Dividends' in df.columns else np.zeros(len(df))
+                raw_closes = df_rev['Close'].values
+                
+                # 累積調整因子 (Cumulative Adjustment Factor)
+                # 邏輯：從現在往回看。
+                # 1. 遇到分割 (例如 1拆7, split=7.0)：過去的股價要除以 7 (乘以 1/7)。
+                # 2. 遇到除息：過去的股價要扣掉股利比例。
+                cum_factor = 1.0
+                
+                for i in range(len(df_rev)):
+                    # 套用目前的累積因子 (先調整，再計算新的因子，因為事件發生在當日開盤前)
+                    # 但 Yahoo 資料事件是記在當天，代表當天已經變了，所以我們要調整的是「前一天 (i+1)」
+                    # 這裡是倒序，i 是今天，i+1 是昨天
+                    
+                    # 在這裡，我們先把當天的價格不需要調整 (因為我們以最新價格為基準)
+                    # 我們要在遇到事件的「當下」，更新 cum_factor，然後應用到「更舊」的資料
+                    
+                    # 1. 處理分割 (Split)
+                    # 如果 split = 7.0 (1股變7股)，代表昨天股價是高價，今天變低價
+                    # 我們要把昨天的價格除以 7，使其與今天接軌
+                    # 所以 factor 需乘以 (1 / split)
+                    if splits[i] > 0:
+                        cum_factor *= (1.0 / splits[i])
+                    
+                    # 2. 處理除息 (Dividend)
+                    # 除息日當天(i)，股價已扣除股利。
+                    # 我們要調整的是除息前一日(i+1)的價格，讓它扣掉股利造成的跌幅
+                    # 調整公式：Factor *= (Close_prev - Div) / Close_prev
+                    # 但因為我們是倒序掃描，很難直接拿昨天的 Close。
+                    # 近似算法：Factor *= (1 - Div / (Close_today + Div)) 
+                    # 或者更精確：Factor *= 1 - (Div / Pre_Close)
+                    # 由於 Yahoo 除息日的 Close 已經是除息後的，
+                    # Pre_Close ~= Close_today + Div
+                    if divs[i] > 0:
+                        price_before_div = raw_closes[i] + divs[i]
+                        if price_before_div > 0:
+                            div_factor = (price_before_div - divs[i]) / price_before_div
+                            cum_factor *= div_factor
+                    
+                    # 將因子應用到「歷史資料」
+                    # 但因為我們是跑迴圈，這樣太慢。
+                    # 改良邏輯：我們建立一個 factor 陣列，最後一次性相乘
+                    
+                # --- 重寫：向量化邏輯 (Vectorized Logic) ---
+                # 這是更穩定的寫法
+                
+                # 1. 分割因子陣列
+                # 預設為 1.0
+                split_factors = np.ones(len(df))
+                if 'Stock Splits' in df.columns:
+                    # 處理 0 的情況避免除以零
+                    s_vals = df['Stock Splits'].replace(0, 1).values
+                    # 如果發生分割 (例如 7.0)，我們需要將之前的價格 * (1/7)
+                    # 也就是說，Adj_Close = Close * (1/Split)
+                    # 我們需要一個累積乘積 (cumprod)，但方向是從後往前
+                    
+                    # 找出非 1 的位置 (有分割的日子)
+                    # Yahoo 資料：分割日當天 Split=7.0
+                    # 我們希望從該日(含)之前的歷史資料都除以 7
+                    # 所以我們計算 1/Split
+                    inv_splits = np.where(s_vals > 0, 1.0 / s_vals, 1.0)
+                    
+                    # 從後往前累積乘積 (因為越舊的資料要除越多次)
+                    # shift(-1) 是因為分割日當天價格已經變了，是「前一天」才需要調整？
+                    # 不，Yahoo 的 Split 7.0 發生在 T日，代表 T日價格是 T-1日的 1/7。
+                    # 若要還原 T-1日為 T日水準，T-1 需 * (1/7)。
+                    # 所以從 T日開始往回，都要乘。
+                    split_factors = np.cumprod(inv_splits[::-1])[::-1]
+                    # 修正：cumprod 是從前往後，[::-1] 翻轉後變成從後往前累積，再翻轉回來
+                
+                # 2. 股利因子陣列
+                div_factors = np.ones(len(df))
+                if 'Dividends' in df.columns:
+                    # Div 發生在 T日。T-1日需調整。
+                    # Factor = (Close[T-1] - Div) / Close[T-1]
+                    # 近似： (Close[T] + Div - Div) / (Close[T] + Div) = Close[T] / (Close[T] + Div)
+                    # 這樣算出的 Factor < 1，乘以前面的股價，就會把它「壓下來」接上除息後的缺口
+                    closes = df['Close'].values
+                    divs = df['Dividends'].values
+                    # 避免除以 0
+                    denom = closes + divs
+                    ratios = np.where(denom > 0, closes / denom, 1.0)
+                    # 只在有股利的日子計算
+                    ratios = np.where(divs > 0, ratios, 1.0)
+                    
+                    # 同樣從後往前累積
+                    div_factors = np.cumprod(ratios[::-1])[::-1]
+                
+                # 3. 綜合因子
+                total_factors = split_factors * div_factors
+                
+                # 4. 應用修正 (這會把過去的高股價壓下來，與現在接軌)
+                # 針對 0052 案例：
+                # Split=7.0, factor=0.1428. 過去的 140 元 * 0.1428 = 20 元。
+                # 這樣就跟現在的股價接上了。
+                df['Open'] = df['Open'] * total_factors
+                df['High'] = df['High'] * total_factors
+                df['Low'] = df['Low'] * total_factors
+                df['Close'] = df['Close'] * total_factors
+
+            # ==========================================
+            # 格式整理
+            # ==========================================
+            mask = (df.index >= pd.to_datetime(start_date - timedelta(days=100)).tz_localize(df.index.tz))
+            df = df.loc[mask]
+
+            df = df.reset_index()
+            df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
+            
+            # 清理
+            cols_to_drop = ['Dividends', 'Stock Splits']
+            df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
+            
+            if 'Close' in df.columns and not df.empty:
                 return df, t
                 
         except Exception:
