@@ -667,7 +667,7 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
     # 20日平均差距 (糾結指數)
     # 利用 pandas rolling 計算後轉回 numpy
-    congestion_index = pd.Series(raw_gap_ratio).rolling(20, min_periods=1).mean().fillna(1.0).values
+    congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
 
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
@@ -1060,7 +1060,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
     gap_series = pd.Series(raw_gap_ratio)
     # 20日平均差距 (糾結指數)
-    congestion_index = gap_series.rolling(20, min_periods=1).mean().fillna(1.0).values
+    congestion_index = gap_series.rolling(60, min_periods=1).mean().fillna(1.0).values
     
     # [新增] 計算糾結度斜率 (Slope)
     # 使用 pandas diff 計算變化
@@ -2154,7 +2154,7 @@ elif page == "📊 單股深度分析":
                         elif v < 15: colors_gap.append('#ffd740')
                         else: colors_gap.append('#00e676') # 綠色 (發散)
                     
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Congestion_Index'], name='均線差距%', marker_color=colors_gap), row=7, col=1)
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Congestion_Index'], name='均線糾結指數(60日)', marker_color=colors_gap), row=7, col=1)
                     fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(5%)", row=7, col=1)
 
                     # --- [新增] Row 8: 糾結度斜率 (Slope) ---
