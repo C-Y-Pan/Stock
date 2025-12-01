@@ -946,10 +946,10 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.5 (Panic Safety):
-    - 加分1: 收盤 > MA30 且乖離 > 4% (+5分)
-    - 加分2: 收盤創100日新高 且 週漲幅 < 27% (+15分)
-    - [新增] 扣分: 若年線下彎且執行「恐慌抄底」策略 -> 扣 15 分 (風險警示)
+    Alpha Score v5.6 (Long-Term MA Filter):
+    - 加分條件維持不變。
+    - [新增] 趨勢買入濾網: 若買進訊號發生時，收盤價未同時站上 MA120 與 MA240，大幅扣分 (-20)。
+      這能確保只有在長線架構轉強(或至少克服壓力)時，才給予高分。
     """
     df = df.copy()
 
@@ -960,6 +960,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean() # 確保有 MA120
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240, min_periods=60).mean()
     if 'MA30' not in df.columns: df['MA30'] = df['Close'].rolling(30).mean()
     if 'High_100d' not in df.columns: df['High_100d'] = df['Close'].rolling(100).max()
@@ -972,6 +973,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     close = df['Close'].values
     ma20 = df['MA20'].ffill().values
     ma60 = df['MA60'].ffill().values
+    ma120 = df['MA120'].fillna(method='bfill').values
     ma240 = df['MA240'].fillna(method='bfill').values
     ma30 = df['MA30'].ffill().values
     
@@ -990,7 +992,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     vol_ratio = volume / vol_ma20
     score_vol = np.where(vol_ratio > 1, np.clip((vol_ratio - 1) * 5, 0, 10), 0)
     
-    # 趨勢判定
+    # 趨勢判定 (年線下彎且季線無力)
     ma240_slope_neg = np.zeros(len(df), dtype=bool)
     ma60_slope_pos = np.zeros(len(df), dtype=bool)
     if len(ma240) > 1:
@@ -1034,31 +1036,40 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 4. 訊號事件
     buy_mask = (action == 'Buy')
     
-    # [新增邏輯] 判斷是否為「恐慌抄底」策略
-    # 我們需要從 df['Reason'] 判斷，因為它是逐行紀錄的
+    # [抄底策略檢查]
     reason_series = df['Reason'].fillna("").astype(str)
-    # 檢查理由中是否包含 '反彈' 或 '超賣'
     is_panic_strat = reason_series.str.contains('反彈|超賣').values
-    
-    # [扣分條件] 買進 + 抄底策略 + 年線下彎
-    # 這代表在長空趨勢中接刀，風險極高，必須扣分
     panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
     
+    # [新增] 長均線濾網 (Long MA Filter)
+    # 條件：未同時站上 MA120 與 MA240
+    # 注意：若是抄底策略(is_panic_strat)，因為本來就是逆勢，所以不受此限制(否則永遠抄不到底)
+    # 此濾網主要針對「趨勢突破」類型的策略
+    not_above_long_ma = (close < ma120) | (close < ma240)
+    trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
+
     # 基礎買進脈衝
     buy_pulse = 85 + (analog_modulation * 0.5)
     
-    # 執行扣分 (-15)
+    # 執行扣分
+    # 1. 逆勢抄底扣分 (-15)
     buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
+    # 2. 趨勢買入但未站上長均扣分 (-20)
+    buy_pulse = np.where(trend_buy_penalty_mask, buy_pulse - 20, buy_pulse)
     
     # 限制範圍
-    buy_pulse = np.clip(buy_pulse, 85 if not np.any(panic_bear_penalty_mask) else 60, 99)
+    # 如果觸發任一扣分，最高分限制在 65 (偏弱勢買點)
+    any_penalty = panic_bear_penalty_mask | trend_buy_penalty_mask
+    buy_pulse = np.clip(buy_pulse, 85 if not np.any(any_penalty) else 60, 99)
+    
     alpha_score = np.where(buy_mask, buy_pulse, alpha_score)
     
     if 'Reason' in df.columns:
         buy_reasons = df['Reason'].fillna("")
         log_msg = np.where(buy_mask, "買進: " + buy_reasons, log_msg)
-        # 若觸發扣分，在評語中加入警示
+        # 評語警示
         log_msg = np.where(panic_bear_penalty_mask, log_msg + " [⚠️逆勢抄底]", log_msg)
+        log_msg = np.where(trend_buy_penalty_mask, log_msg + " [⚠️未站上長均]", log_msg)
 
     sell_mask = (action == 'Sell')
     sell_pulse = -85 + (analog_modulation * 0.5)
