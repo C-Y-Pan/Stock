@@ -2155,6 +2155,11 @@ elif page == "📊 單股深度分析":
                     # 5% 警戒線
                     fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(<5%)", row=7, col=1)
 
+                    # Layout
+                    fig.update_layout(height=1400, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
+                                                    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
+                    fig.update_yaxes(side='right')
+                    st.plotly_chart(fig, use_container_width=True)
 
 
                 # [Tab 2: 權益曲線] (保持不變)
