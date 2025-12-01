@@ -625,27 +625,36 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v7 (Total Return & MA Entanglement Logic):
-    1. 修正報酬率計算：納入配息還原 (Total Return)。
+    執行策略回測 v8 (Dividend-Adjusted Stop Loss):
+    1. [關鍵修正] 在計算停損 (Drawdown) 時，將持倉期間領到的股利加回，避免除息日誤觸停損。
     """
     df = data.copy()
     
-    # [修正] 確保有 Dividends 欄位
+    # 確保有 Dividends 欄位
     if 'Dividends' not in df.columns:
         df['Dividends'] = 0.0
+    
+    # 填補 NaN 為 0，方便計算
+    df['Dividends'] = df['Dividends'].fillna(0.0)
         
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
     
     position = 0; days_held = 0; entry_price = 0.0; trade_type = 0
     
-    # 轉為 numpy array
+    # [新增] 累計股利變數 (追蹤單筆交易期間領到的股息)
+    cum_div = 0.0 
+    
+    # 轉為 numpy array 加速
     close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
     bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
     ma240 = df['MA240'].fillna(method='bfill').values
     ma30 = df['MA30'].ffill().values
     high_100d = df['High_100d'].fillna(0).values
     close_lag5 = df['Close_Lag5'].fillna(close[0]).values
+    
+    # 為了在迴圈中快速讀取股利，轉為 numpy
+    dividends = df['Dividends'].values
     
     volume = df['Volume'].values; vol_ma20 = df['Vol_MA20'].values
     obv = df['OBV'].values; obv_ma20 = df['OBV_MA20'].values
@@ -672,21 +681,24 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             is_buy = False
             rsi_threshold_A = 60 if is_strict_bear else 55
             
-            # 策略 A: 動能突破
+            # 策略 A
             if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                 is_buy=True; trade_type=1; reason_str="動能突破"
-            # 策略 B: 均線回測
+            # 策略 B
             elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                 is_buy=True; trade_type=1; reason_str="均線回測"
-            # 策略 C: 籌碼佈局
+            # 策略 C
             elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                 is_buy=True; trade_type=3; reason_str="籌碼佈局"
-            # 策略 D: 超賣反彈
+            # 策略 D
             elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                 is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
                 signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
+                
+                # [重置] 買進時，累計股利歸零
+                cum_div = 0.0
                 
                 # 計算信心值
                 base_score = 60
@@ -708,7 +720,15 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
         # --- 出場邏輯 ---
         elif position == 1:
             days_held+=1
-            drawdown=(close[i]-entry_price)/entry_price
+            
+            # [修正] 累積股利
+            if dividends[i] > 0:
+                cum_div += dividends[i]
+            
+            # [修正] 計算 Drawdown 時，將股利加回現價 (還原權值概念)
+            # 這樣除息日的價格下跌就不會觸發停損
+            adjusted_current_value = close[i] + cum_div
+            drawdown = (adjusted_current_value - entry_price) / entry_price
             
             if trade_type==2 and trend[i]==1: trade_type=1; reason_str="反彈轉波段"
             if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1; reason_str="佈局完成發動"
@@ -726,14 +746,18 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                         is_sell=True; reason_str="趨勢轉弱且破月線"
                     else:
                         action_code="Hold"; reason_str="轉弱(守月線)"
+                
                 elif use_strict_bear_exit and is_strict_bear and close[i] < ma20[i]:
                     is_sell=True; reason_str="長空破月線"
+                    
                 elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
                 elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
                 
             if is_sell:
                 signal=0; action_code="Sell"
-                pnl = (close[i] - entry_price) / entry_price * 100
+                # 計算最終損益也包含股利
+                final_pnl_value = (close[i] + cum_div) - entry_price
+                pnl = final_pnl_value / entry_price * 100
                 sign = "+" if pnl > 0 else ""
                 ret_label = f"{sign}{pnl:.1f}%"
 
@@ -746,14 +770,11 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     df['Target_Price']=target_prices; df['Return_Label']=return_labels
     df['Confidence'] = confidences
     
-    # === [關鍵修正] 計算含息報酬 (Total Return) ===
+    # === 計算報酬 ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     
-    # 原始報酬率 (只看價差)
-    # df['Market_Return'] = df['Close'].pct_change().fillna(0)  <-- 舊邏輯
-    
-    # 新邏輯: (今日收盤 + 今日配息 - 昨日收盤) / 昨日收盤
-    # 注意: Dividends 為 0 的日子，這公式就等於 pct_change
+    # 修正：含息報酬率公式
+    # (今日收盤 + 今日股息 - 昨日收盤) / 昨日收盤
     df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
     df['Market_Return'] = df['Market_Return'].fillna(0)
     
