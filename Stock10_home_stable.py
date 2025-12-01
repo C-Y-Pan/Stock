@@ -945,16 +945,17 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.4 (New Bonus Conditions):
+    Alpha Score v5.5 (Panic Safety):
     - 加分1: 收盤 > MA30 且乖離 > 4% (+5分)
     - 加分2: 收盤創100日新高 且 週漲幅 < 27% (+15分)
+    - [新增] 扣分: 若年線下彎且執行「恐慌抄底」策略 -> 扣 15 分 (風險警示)
     """
     df = df.copy()
 
     if 'Action' not in df.columns or 'Position' not in df.columns:
         return calculate_alpha_score_technical_fallback(df)
 
-    # 補全指標 (若上游沒算到)
+    # 補全指標
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
@@ -973,7 +974,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     ma240 = df['MA240'].fillna(method='bfill').values
     ma30 = df['MA30'].ffill().values
     
-    # 新增指標 array
     high_100d = df['High_100d'].fillna(0).values
     close_lag5 = df['Close_Lag5'].fillna(close[0]).values
     
@@ -999,16 +999,13 @@ def calculate_alpha_score(df, margin_df, short_df):
     penalty_mask = ma240_slope_neg & (~ma60_slope_pos)
     score_trend_penalty = np.where(penalty_mask, -15, 0)
     
-    # [新增] 加分條件計算
-    # 1. 強勢乖離 (Close > MA30 * 1.04)
+    # 加分條件
     cond_ma30_gap = (close > ma30 * 1.04)
     score_ma30 = np.where(cond_ma30_gap, 5, 0)
     
-    # 2. 優質突破 (創新高且未過熱)
     weekly_ratio = np.divide(close, close_lag5, out=np.ones_like(close), where=close_lag5!=0)
     cond_not_overheated = weekly_ratio < 1.27
     cond_breakout = (close >= high_100d)
-    
     score_breakout = np.where(cond_breakout & cond_not_overheated, 15, 0)
     
     # 綜合調節值
@@ -1023,14 +1020,11 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     alpha_score = np.where(position == 1, holding_score, waiting_score)
     
-    # 基礎 Log
     base_log_msg = np.where(position == 1, "持倉監控", "空手觀望")
     base_log_msg = np.where(penalty_mask, base_log_msg + " [⚠️年線蓋頭]", base_log_msg)
     
     rescue_mask = ma240_slope_neg & ma60_slope_pos
     base_log_msg = np.where(rescue_mask, base_log_msg + " [季線救援]", base_log_msg)
-    
-    # 新增評語提示
     base_log_msg = np.where(cond_ma30_gap, base_log_msg + " [📈強勢乖離]", base_log_msg)
     base_log_msg = np.where(cond_breakout & cond_not_overheated, base_log_msg + " [🚀百日突破]", base_log_msg)
 
@@ -1038,13 +1032,32 @@ def calculate_alpha_score(df, margin_df, short_df):
 
     # 4. 訊號事件
     buy_mask = (action == 'Buy')
+    
+    # [新增邏輯] 判斷是否為「恐慌抄底」策略
+    # 我們需要從 df['Reason'] 判斷，因為它是逐行紀錄的
+    reason_series = df['Reason'].fillna("").astype(str)
+    # 檢查理由中是否包含 '反彈' 或 '超賣'
+    is_panic_strat = reason_series.str.contains('反彈|超賣').values
+    
+    # [扣分條件] 買進 + 抄底策略 + 年線下彎
+    # 這代表在長空趨勢中接刀，風險極高，必須扣分
+    panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
+    
+    # 基礎買進脈衝
     buy_pulse = 85 + (analog_modulation * 0.5)
-    buy_pulse = np.clip(buy_pulse, 85, 99)
+    
+    # 執行扣分 (-15)
+    buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
+    
+    # 限制範圍
+    buy_pulse = np.clip(buy_pulse, 85 if not np.any(panic_bear_penalty_mask) else 60, 99)
     alpha_score = np.where(buy_mask, buy_pulse, alpha_score)
     
     if 'Reason' in df.columns:
         buy_reasons = df['Reason'].fillna("")
         log_msg = np.where(buy_mask, "買進: " + buy_reasons, log_msg)
+        # 若觸發扣分，在評語中加入警示
+        log_msg = np.where(panic_bear_penalty_mask, log_msg + " [⚠️逆勢抄底]", log_msg)
 
     sell_mask = (action == 'Sell')
     sell_pulse = -85 + (analog_modulation * 0.5)
