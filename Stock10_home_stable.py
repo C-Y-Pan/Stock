@@ -300,139 +300,43 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [型態安全修正版]
-    修正重點：
-    1. 在處理成交量運算前，強制將 Volume 轉為 float，避免 Numpy 型態錯誤。
-    2. 強化 Error Handling：若運算崩潰，回退至原始資料 (df_safe)，確保不會顯示「無法獲取資料」。
+    [修復版] 獲取股價資料
+    1. 修正順序：優先嘗試 .TW (上市)，再嘗試 .TWO (上櫃)
+    2. 增加 ETF 相容性
     """
     ticker = str(ticker).strip().upper()
     
-    candidates = []
-    if '.' in ticker:
-        candidates.append(ticker)
-        base_code = ticker.split('.')[0]
-        candidates.extend([f"{base_code}.TW", f"{base_code}.TWO"])
+    # 如果使用者已經輸入完整代號 (e.g., 2330.TW)，直接使用
+    if ticker.endswith('.TW') or ticker.endswith('.TWO'):
+        candidates = [ticker]
     else:
-        import re
-        if ticker.startswith('00') and re.search('[A-Z]', ticker):
-            candidates = [f"{ticker}.TWO", f"{ticker}.TW", ticker]
-        else:
-            candidates = [f"{ticker}.TW", f"{ticker}.TWO", ticker]
-
+        # [關鍵修正] 0050 等上市股票需優先使用 .TW
+        # 大多數熱門股都是上市，將 .TW 放前面可大幅減少錯誤與等待時間
+        candidates = [f"{ticker}.TW", f"{ticker}.TWO", ticker] 
+        
     for t in candidates:
         try:
             stock = yf.Ticker(t)
+            # auto_adjust=True 對某些 ETF (如 0050) 有時會導致資料缺失，若失敗可改 False
+            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=True)
             
-            # 1. 抓取原始資料
-            df = stock.history(start=start_date - timedelta(days=700), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
-            
-            if df.empty or len(df) < 5: continue
+            # 如果 auto_adjust 抓不到資料，嘗試關閉自動調整 (針對部分 ETF)
+            if df.empty:
+                df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False)
 
-            # 備份原始資料 (安全網)
-            df_safe = df.copy()
-            
-            # 確保正序
-            df = df.sort_index(ascending=True)
-
-            try:
-                # ==========================================
-                # A. 基礎事件還原 (Metadata Based)
-                # ==========================================
-                if 'Stock Splits' in df.columns or 'Dividends' in df.columns:
-                    df_rev = df.sort_index(ascending=False).copy()
-                    
-                    opens, highs, lows, closes = df_rev['Open'].values, df_rev['High'].values, df_rev['Low'].values, df_rev['Close'].values
-                    # [修正] 強制轉為 float，避免 *= float 時報錯
-                    vols = df_rev['Volume'].values.astype(float)
-                    
-                    splits = df_rev['Stock Splits'].values if 'Stock Splits' in df.columns else np.zeros(len(df))
-                    divs = df_rev['Dividends'].values if 'Dividends' in df.columns else np.zeros(len(df))
-                    
-                    p_cum = 1.0 
-                    v_cum = 1.0 
-                    
-                    for i in range(len(df_rev)):
-                        # 1. 分割
-                        if splits[i] > 0:
-                            split_ratio = splits[i]
-                            p_cum *= (1.0 / split_ratio)
-                            v_cum *= split_ratio 
-                        
-                        # 2. 股利
-                        if divs[i] > 0:
-                            price_before = closes[i] + divs[i]
-                            if price_before > 0:
-                                p_cum *= (1 - divs[i] / price_before)
-                        
-                        # 應用因子
-                        opens[i] *= p_cum; highs[i] *= p_cum
-                        lows[i] *= p_cum; closes[i] *= p_cum
-                        vols[i] *= v_cum 
-                    
-                    df['Open'], df['High'], df['Low'], df['Close'], df['Volume'] = opens[::-1], highs[::-1], lows[::-1], closes[::-1], vols[::-1]
-
-                # ==========================================
-                # B. 斷崖偵測 (Gap Detection)
-                # ==========================================
-                p_open = df['Open'].values
-                p_close = df['Close'].values
-                p_high, p_low = df['High'].values, df['Low'].values
-                # [修正] 強制轉為 float
-                p_vol = df['Volume'].values.astype(float)
+            if not df.empty and len(df) > 10: # 確保至少有 10 天資料
+                df = df.reset_index()
+                # 處理時區問題，統一轉為無時區格式
+                df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
                 
-                # 處理 NaN
-                p_close = np.nan_to_num(p_close, nan=0.0)
-                
-                for i in range(1, len(df)):
-                    prev_close = p_close[i-1]
-                    curr_open = p_open[i]
-                    
-                    if prev_close > 5:
-                        ratio = curr_open / prev_close
-                        
-                        # 偵測到斷崖 (跌幅 > 40%)
-                        if ratio < 0.6:
-                            curr_close = p_close[i]
-                            gap_factor = curr_close / prev_close
-                            
-                            if gap_factor > 0:
-                                vol_gap_factor = 1.0 / gap_factor
-                            else:
-                                vol_gap_factor = 1.0
-                            
-                            # 修正歷史價格
-                            p_open[:i] *= gap_factor; p_high[:i] *= gap_factor
-                            p_low[:i] *= gap_factor; p_close[:i] *= gap_factor
-                            
-                            # 修正歷史成交量
-                            p_vol[:i] *= vol_gap_factor
-                
-                df['Open'], df['High'], df['Low'], df['Close'], df['Volume'] = p_open, p_high, p_low, p_close, p_vol
-
-            except Exception as e:
-                # [安全網] 若運算失敗，回退至原始資料，至少讓使用者看到東西
-                # print(f"Calculation Error for {ticker}: {e}") # Debug用
-                df = df_safe
-
-            # ==========================================
-            # C. 格式整理
-            # ==========================================
-            mask = (df.index >= pd.to_datetime(start_date - timedelta(days=100)).tz_localize(df.index.tz))
-            df = df.loc[mask]
-            df = df.reset_index()
-            df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
-            
-            cols_drop = ['Dividends', 'Stock Splits']
-            df = df.drop(columns=[c for c in cols_drop if c in df.columns], errors='ignore')
-            
-            if not df.empty:
-                return df, t
-                
-        except Exception:
+                # 檢查是否有收盤價
+                if 'Close' in df.columns:
+                    return df, t
+        except Exception as e:
             continue
             
+    # 若全數失敗，回傳空表
     return pd.DataFrame(), ticker
-
 
 
 @st.cache_data(ttl=5, show_spinner=False)
