@@ -625,10 +625,9 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v10 (Expansion Breakout):
-    - [新增] 策略 E: 三線發散 (Expansion Breakout)。
-      條件: 股價站上三條長均線 且 糾結度斜率 > 0 (發散中)。
-      此為強力趨勢訊號，給予高信心分數。
+    執行策略回測 v11 (No Knife Catching):
+    - [新增] 抄底風控: 策略 D (超賣反彈) 僅在年線(MA240)未下彎時執行。
+      若年線下彎 (長空)，禁止抄底，避免接刀。
     """
     df = data.copy()
     
@@ -666,7 +665,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
     
     congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
-    # [新增] 計算斜率 (Slope)
     congestion_slope = pd.Series(congestion_index).diff().fillna(0).values
 
     for i in range(len(df)):
@@ -697,11 +695,8 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                 if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                     is_buy=True; trade_type=1; reason_str="動能突破"
                 
-                # [新增] 策略 E: 三線發散 (Expansion Breakout)
-                # 條件: 站穩三線 + 糾結度斜率為正 (正在張開)
-                # 這是主升段訊號，優先級高
+                # 策略 E: 三線發散 (Expansion Breakout)
                 elif (close[i] > ma60[i] and close[i] > ma120[i] and close[i] > ma240[i]) and congestion_slope[i] > 0:
-                    # 簡單濾網: 避免已經漲太多的末升段 (如乖離過大)
                     if close[i] < ma60[i] * 1.3: 
                         is_buy=True; trade_type=4; reason_str="三線發散"
 
@@ -711,8 +706,11 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                 # 策略 C: 籌碼佈局
                 elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                     is_buy=True; trade_type=3; reason_str="籌碼佈局"
+                
                 # 策略 D: 超賣反彈
-                elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
+                # [修正] 加入 not is_ma240_down 條件
+                # 若年線下彎 (is_ma240_down 為 True)，則不執行抄底，直接跳過
+                elif not is_ma240_down and rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                     is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
@@ -721,9 +719,8 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                 
                 base_score = 60
                 
-                # [加分] 若是三線發散策略，基礎分大力加碼
                 if trade_type == 4:
-                    base_score += 20 # 從 60 變 80，起步即高分
+                    base_score += 20 
                 
                 if is_strict_bear: base_score -= 10
                 if is_ma240_down and is_ma60_up: base_score += 5
@@ -747,7 +744,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             adjusted_current_value = close[i] + cum_div
             drawdown = (adjusted_current_value - entry_price) / entry_price
             
-            # 如果是三線發散進場的，視為波段操作，轉為趨勢單處理
             if trade_type==4: trade_type=1 
             if trade_type==2 and trend[i]==1: trade_type=1
             if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1
