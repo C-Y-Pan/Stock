@@ -300,11 +300,11 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [價量雙還原終極版]
-    特色：
-    1. 價格還原：處理分割與股利 (Price adjusted for Splits & Dividends)。
-    2. 成交量還原：僅處理分割 (Volume adjusted for Splits only)。
-       -> 確保 OBV 指標在股票分割前後不會失真。
+    [防崩潰安全版]
+    優先順序：
+    1. 嘗試「暴力還原」 (處理 0052 分割斷崖)。
+    2. 若運算發生錯誤 (如除以零)，觸發安全網，回退至「原始資料」。
+    3. 確保至少能顯示 K 線，不會因為數學錯誤而報錯「無資料」。
     """
     ticker = str(ticker).strip().upper()
     
@@ -324,129 +324,98 @@ def get_stock_data(ticker, start_date, end_date):
         try:
             stock = yf.Ticker(t)
             
-            # 抓取原始資料 (Raw Data)
+            # 1. 基礎抓取 (抓多一點天數以利計算)
             df = stock.history(start=start_date - timedelta(days=700), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
             
             if df.empty or len(df) < 5: continue
 
-            # 確保按時間正序
+            # 備份一份原始資料 (安全網)
+            df_safe = df.copy()
+            
+            # 確保正序
             df = df.sort_index(ascending=True)
 
             # ==========================================
-            # A. 基礎事件還原 (Metadata Based)
+            # 嘗試執行複雜還原運算
             # ==========================================
-            if 'Stock Splits' in df.columns or 'Dividends' in df.columns:
-                # 倒序處理
-                df_rev = df.sort_index(ascending=False).copy()
-                
-                # 價格陣列
-                opens = df_rev['Open'].values
-                highs = df_rev['High'].values
-                lows = df_rev['Low'].values
-                closes = df_rev['Close'].values
-                # 成交量陣列
-                vols = df_rev['Volume'].values
-                
-                splits = df_rev['Stock Splits'].values if 'Stock Splits' in df.columns else np.zeros(len(df))
-                divs = df_rev['Dividends'].values if 'Dividends' in df.columns else np.zeros(len(df))
-                
-                # 兩個不同的累積因子
-                price_cum_factor = 1.0  # 價格因子 (受分割 & 股利影響)
-                vol_cum_factor = 1.0    # 量能因子 (只受分割影響)
-                
-                for i in range(len(df_rev)):
-                    # 1. 處理分割 (Split)
-                    # 例如 1拆7 (Split=7.0): 
-                    # 歷史價格需 * (1/7)
-                    # 歷史成交量需 * 7
-                    if splits[i] > 0:
-                        split_ratio = splits[i]
-                        price_cum_factor *= (1.0 / split_ratio)
-                        vol_cum_factor *= split_ratio 
+            try:
+                # --- A. 基礎事件還原 (Metadata) ---
+                if 'Stock Splits' in df.columns or 'Dividends' in df.columns:
+                    df_rev = df.sort_index(ascending=False).copy()
+                    opens, highs, lows, closes = df_rev['Open'].values, df_rev['High'].values, df_rev['Low'].values, df_rev['Close'].values
+                    vols = df_rev['Volume'].values
                     
-                    # 2. 處理股利 (Dividend)
-                    # 僅影響價格，不影響成交量
-                    if divs[i] > 0:
-                        price_before = closes[i] + divs[i]
-                        if price_before > 0:
-                            price_cum_factor *= (1 - divs[i] / price_before)
+                    splits = df_rev['Stock Splits'].values if 'Stock Splits' in df.columns else np.zeros(len(df))
+                    divs = df_rev['Dividends'].values if 'Dividends' in df.columns else np.zeros(len(df))
                     
-                    # 應用因子
-                    opens[i] *= price_cum_factor
-                    highs[i] *= price_cum_factor
-                    lows[i] *= price_cum_factor
-                    closes[i] *= price_cum_factor
+                    p_factor, v_factor = 1.0, 1.0
                     
-                    # [關鍵] 還原成交量
-                    vols[i] *= vol_cum_factor
+                    for i in range(len(df_rev)):
+                        if splits[i] > 0:
+                            p_factor *= (1.0 / splits[i])
+                            v_factor *= splits[i]
+                        if divs[i] > 0:
+                            price_before = closes[i] + divs[i]
+                            if price_before > 0: p_factor *= (1 - divs[i] / price_before)
+                        
+                        opens[i] *= p_factor; highs[i] *= p_factor; lows[i] *= p_factor; closes[i] *= p_factor
+                        vols[i] *= v_factor
+                    
+                    df['Open'], df['High'], df['Low'], df['Close'], df['Volume'] = opens[::-1], highs[::-1], lows[::-1], closes[::-1], vols[::-1]
+
+                # --- B. 斷崖偵測 (Gap Detection for 0052) ---
+                p_open = df['Open'].values
+                p_close = df['Close'].values
+                p_high, p_low = df['High'].values, df['Low'].values
+                p_vol = df['Volume'].values
                 
-                # 寫回 DataFrame (轉回正序)
-                df['Open'] = opens[::-1]
-                df['High'] = highs[::-1]
-                df['Low'] = lows[::-1]
-                df['Close'] = closes[::-1]
-                df['Volume'] = vols[::-1]
+                # 這裡加入 NaN 處理，避免 dirty data 導致當機
+                p_close = np.nan_to_num(p_close, nan=0.0) 
+                
+                for i in range(1, len(df)):
+                    prev_c = p_close[i-1]
+                    curr_o = p_open[i]
+                    
+                    # 嚴格檢查分母不為 0
+                    if prev_c > 5: # 股價太低的不處理，避免誤判
+                        ratio = curr_o / prev_c
+                        # 偵測到斷崖 (跌幅 > 40%)
+                        if ratio < 0.6:
+                            curr_c = p_close[i]
+                            gap_factor = curr_c / prev_c
+                            vol_gap_factor = 1.0 / gap_factor if gap_factor > 0 else 1.0
+                            
+                            # 修正歷史數據
+                            p_open[:i] *= gap_factor; p_high[:i] *= gap_factor
+                            p_low[:i] *= gap_factor; p_close[:i] *= gap_factor
+                            p_vol[:i] *= vol_gap_factor
+                
+                df['Open'], df['High'], df['Low'], df['Close'], df['Volume'] = p_open, p_high, p_low, p_close, p_vol
+
+            except Exception as e:
+                # [安全網觸發] 如果上述數學運算崩潰 (例如除以0)，回退使用原始資料
+                print(f"Warning: 還原運算失敗 ({t})，使用原始資料。Error: {e}")
+                df = df_safe # 還原
 
             # ==========================================
-            # B. 統計學斷崖偵測 (Gap Detection)
-            # ==========================================
-            p_open = df['Open'].values
-            p_close = df['Close'].values
-            p_high = df['High'].values
-            p_low = df['Low'].values
-            p_vol = df['Volume'].values # 取得成交量
-            
-            for i in range(1, len(df)):
-                prev_close = p_close[i-1]
-                curr_open = p_open[i]
-                
-                if prev_close > 0:
-                    ratio = curr_open / prev_close
-                    
-                    # 偵測到疑似分割 (跌幅 > 40%)
-                    if ratio < 0.6 and prev_close > 5:
-                        curr_close = p_close[i]
-                        gap_factor = curr_close / prev_close # 價格縮小因子 (例如 0.14)
-                        
-                        # [關鍵] 成交量放大因子 = 1 / 價格縮小因子
-                        # 價格變 1/7，成交量就要變 7倍
-                        vol_gap_factor = 1.0 / gap_factor 
-                        
-                        # 修正歷史價格 (變小)
-                        p_open[:i] *= gap_factor
-                        p_high[:i] *= gap_factor
-                        p_low[:i] *= gap_factor
-                        p_close[:i] *= gap_factor
-                        
-                        # 修正歷史成交量 (變大)
-                        p_vol[:i] *= vol_gap_factor
-            
-            # 寫回
-            df['Open'] = p_open
-            df['High'] = p_high
-            df['Low'] = p_low
-            df['Close'] = p_close
-            df['Volume'] = p_vol
-
-            # ==========================================
-            # C. 格式整理
+            # C. 格式整理與輸出
             # ==========================================
             mask = (df.index >= pd.to_datetime(start_date - timedelta(days=100)).tz_localize(df.index.tz))
             df = df.loc[mask]
             df = df.reset_index()
             df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
             
-            cols_drop = ['Dividends', 'Stock Splits']
-            df = df.drop(columns=[c for c in cols_drop if c in df.columns], errors='ignore')
+            # 清理
+            cols = ['Dividends', 'Stock Splits']
+            df = df.drop(columns=[c for c in cols if c in df.columns], errors='ignore')
             
-            if not df.empty:
+            if not df.empty and 'Close' in df.columns:
                 return df, t
                 
         except Exception:
             continue
             
     return pd.DataFrame(), ticker
-
 
 
 @st.cache_data(ttl=5, show_spinner=False)
