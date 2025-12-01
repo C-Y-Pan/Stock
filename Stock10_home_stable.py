@@ -520,7 +520,7 @@ def get_margin_data(start_date_str):
 def calculate_indicators(df, atr_period, multiplier, market_df):
     data = df.copy()
     
-    # [關鍵修正] 合併大盤數據並處理空值
+    # 合併大盤數據
     if not market_df.empty:
         data['Date'] = pd.to_datetime(data['Date']).dt.normalize()
         market_df['Date'] = pd.to_datetime(market_df['Date']).dt.normalize()
@@ -545,12 +545,15 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['Vol_MA20'] = data['Volume'].rolling(20).mean().replace(0, 1).fillna(1)
     
     data['MA20'] = data['Close'].rolling(20).mean()
+    # [新增] MA30 用於乖離判斷
+    data['MA30'] = data['Close'].rolling(30).mean()
     data['MA60'] = data['Close'].rolling(60).mean() 
-    
-    # [新增] 計算 MA240 (年線)
-    # 使用 min_periods=1 避免新股全變 NaN，但為了判斷斜率，至少需要近期數據
     data['MA240'] = data['Close'].rolling(240, min_periods=60).mean()
     
+    # [新增] 100日新高 與 週漲幅參考價
+    data['High_100d'] = data['Close'].rolling(100).max()
+    data['Close_Lag5'] = data['Close'].shift(5) # 5天前價格，計算週漲幅用
+
     high = data['High']; low = data['Low']; close = data['Close']
     
     # ATR Calculation
@@ -619,10 +622,11 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003):
     """
-    執行策略回測 v3 (Relaxed & Filtered):
-    1. 停損放寬至 -12% (正常) / -10% (嚴格)。
-    2. 出場增加濾網：SuperTrend 轉弱且跌破月線才賣。
-    3. 嚴格空頭定義加嚴：需同時跌破季線與月線。
+    執行策略回測 v4 (Bonus Factors):
+    新增信心加分條件:
+    1. 收盤 > MA30 * 1.04 (乖離 > 4%)
+    2. 週漲幅 < 27% (未過熱)
+    3. 收盤創 100 日新高 (突破)
     """
     df = data.copy()
     positions = []; reasons = []; actions = []; target_prices = []
@@ -634,6 +638,11 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
     bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
     ma240 = df['MA240'].fillna(method='bfill').values
+    
+    # [新增] 讀取新指標
+    ma30 = df['MA30'].ffill().values
+    high_100d = df['High_100d'].fillna(0).values
+    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
     
     volume = df['Volume'].values; vol_ma20 = df['Vol_MA20'].values
     obv = df['OBV'].values; obv_ma20 = df['OBV_MA20'].values
@@ -653,40 +662,34 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
             if ma240[i] < ma240[i-1]: is_ma240_down = True
             if ma60[i] > ma60[i-1]: is_ma60_up = True
             
-        # [放寬 1] 定義「嚴格空頭」：需同時跌破季線與月線才算數
-        # 如果還守在月線之上，代表短線仍強，不應進入嚴格模式
         is_price_weak = (close[i] < ma60[i]) and (close[i] < ma20[i])
-        
         is_strict_bear = is_ma240_down and (not is_ma60_up) and is_price_weak
 
         # --- 進場邏輯 ---
         if position == 0:
             is_buy = False
-            
-            # 若是嚴格空頭，RSI 門檻維持 60；正常則 55
             rsi_threshold_A = 60 if is_strict_bear else 55
             
-            # 策略 A: 動能突破
+            # 策略 A
             if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                 is_buy=True; trade_type=1; reason_str="動能突破"
-            
-            # 策略 B: 均線回測 (非嚴格空頭即可做)
+            # 策略 B
             elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                 is_buy=True; trade_type=1; reason_str="均線回測"
-            
-            # 策略 C: 籌碼佈局
+            # 策略 C
             elif not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                 is_buy=True; trade_type=3; reason_str="籌碼佈局"
-            
-            # 策略 D: 超賣反彈
+            # 策略 D
             elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                 is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
                 signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
                 
-                # 計算信心值
+                # === 計算信心值 (AI Confidence Score) ===
                 base_score = 60
+                
+                # 既有因子
                 if is_strict_bear: base_score -= 10
                 if is_ma240_down and is_ma60_up: base_score += 5
                 if volume[i] > vol_ma20[i] * 1.5: base_score += 15
@@ -695,6 +698,21 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
                 if trade_type == 1 and 60 <= rsi[i] <= 75: base_score += 10
                 elif trade_type == 2 and rsi[i] <= 25: base_score += 10
                 if i > 3 and bb_width_vals[i-1] < 0.15: base_score += 5
+                
+                # [新增] 額外加分條件
+                # 1. 強勢動能：收盤 > MA30 * 1.04 (+5分)
+                if close[i] > ma30[i] * 1.04:
+                    base_score += 5
+                
+                # 2. 優質突破：創新高 且 週漲幅未過熱 (+15分)
+                # 週漲幅 = current / 5_days_ago
+                weekly_ratio = close[i] / close_lag5[i] if close_lag5[i] > 0 else 1.0
+                is_not_overheated = weekly_ratio < 1.27
+                is_breakout = close[i] >= high_100d[i]
+                
+                if is_breakout and is_not_overheated:
+                    base_score += 15
+                
                 conf_score = min(base_score, 99)
         
         # --- 出場邏輯 ---
@@ -706,35 +724,20 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
             if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1; reason_str="佈局完成發動"
             
             is_sell = False
-            
-            # [放寬 2] 停損幅度再加大
-            # 嚴格空頭: -10% (原本 -8%)
-            # 正常狀況: -12% (原本 -10%)
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
             
             if drawdown < stop_loss_limit:
                 is_sell=True; reason_str=f"觸發停損({stop_loss_limit*100:.0f}%)"; action_code="Sell"
-            
-            # 鎖倉期
             elif days_held <= (2 if is_strict_bear else 3):
                 action_code="Hold"; reason_str="鎖倉觀察"
-            
-            # 條件出場
             else:
-                # [放寬 3] 趨勢轉弱濾網
-                # 原本: trend[i]==-1 就賣
-                # 現在: trend[i]==-1 且 跌破月線 才賣 (防止假跌破)
                 if trade_type==1 and trend[i]==-1: 
                     if close[i] < ma20[i]:
                         is_sell=True; reason_str="趨勢轉弱且破月線"
                     else:
-                        # 雖然 SuperTrend 轉空，但還守住月線，給予機會續抱
                         action_code="Hold"; reason_str="轉弱(守月線)"
-                
-                # 只有在「嚴格空頭」且「破月線」時才強制離場
                 elif is_strict_bear and close[i] < ma20[i]:
                     is_sell=True; reason_str="長空破月線"
-                    
                 elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
                 elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
                 
@@ -753,17 +756,14 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     df['Target_Price']=target_prices; df['Return_Label']=return_labels
     df['Confidence'] = confidences
     
-    # === 計算含成本報酬 ===
+    # 計算報酬
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
-    
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
-    
     df['Strategy_Return'] = df['Strategy_Return'] - cost_series
-    
     df['Cum_Strategy']=(1+df['Strategy_Return']).cumprod()
     df['Cum_Market']=(1+df['Market_Return']).cumprod()
     return df
@@ -960,19 +960,23 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.3 (Trend Aware + MA60 Rescue):
-    - 年線下彎且季線無力：扣分 (空頭格局)。
-    - 年線下彎但季線上彎：不扣分 (視為中期轉強/救援)。
+    Alpha Score v5.4 (New Bonus Conditions):
+    - 加分1: 收盤 > MA30 且乖離 > 4% (+5分)
+    - 加分2: 收盤創100日新高 且 週漲幅 < 27% (+15分)
     """
     df = df.copy()
 
     if 'Action' not in df.columns or 'Position' not in df.columns:
         return calculate_alpha_score_technical_fallback(df)
 
+    # 補全指標 (若上游沒算到)
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240, min_periods=60).mean()
+    if 'MA30' not in df.columns: df['MA30'] = df['Close'].rolling(30).mean()
+    if 'High_100d' not in df.columns: df['High_100d'] = df['Close'].rolling(100).max()
+    if 'Close_Lag5' not in df.columns: df['Close_Lag5'] = df['Close'].shift(5)
     
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     
@@ -982,6 +986,11 @@ def calculate_alpha_score(df, margin_df, short_df):
     ma20 = df['MA20'].ffill().values
     ma60 = df['MA60'].ffill().values
     ma240 = df['MA240'].fillna(method='bfill').values
+    ma30 = df['MA30'].ffill().values
+    
+    # 新增指標 array
+    high_100d = df['High_100d'].fillna(0).values
+    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
     
     volume = df['Volume'].fillna(0).values
     vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
@@ -990,27 +999,35 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 2. 計算「類比調節因子」
     bias_val = (close - ma20) / ma20 * 100
     score_bias = np.clip(bias_val * 2, -15, 15)
-    
-    score_rsi = (rsi - 50) * 0.6
-    score_rsi = np.clip(score_rsi, -15, 15)
+    score_rsi = np.clip((rsi - 50) * 0.6, -15, 15)
     
     vol_ratio = volume / vol_ma20
     score_vol = np.where(vol_ratio > 1, np.clip((vol_ratio - 1) * 5, 0, 10), 0)
     
-    # [修正] 年線趨勢判定 (含季線救援邏輯)
+    # 趨勢判定
     ma240_slope_neg = np.zeros(len(df), dtype=bool)
     ma60_slope_pos = np.zeros(len(df), dtype=bool)
-    
     if len(ma240) > 1:
         ma240_slope_neg[1:] = ma240[1:] < ma240[:-1]
         ma60_slope_pos[1:] = ma60[1:] > ma60[:-1]
     
-    # 扣分條件：年線下彎 且 季線沒有上彎 (沒有救援)
     penalty_mask = ma240_slope_neg & (~ma60_slope_pos)
     score_trend_penalty = np.where(penalty_mask, -15, 0)
     
+    # [新增] 加分條件計算
+    # 1. 強勢乖離 (Close > MA30 * 1.04)
+    cond_ma30_gap = (close > ma30 * 1.04)
+    score_ma30 = np.where(cond_ma30_gap, 5, 0)
+    
+    # 2. 優質突破 (創新高且未過熱)
+    weekly_ratio = np.divide(close, close_lag5, out=np.ones_like(close), where=close_lag5!=0)
+    cond_not_overheated = weekly_ratio < 1.27
+    cond_breakout = (close >= high_100d)
+    
+    score_breakout = np.where(cond_breakout & cond_not_overheated, 15, 0)
+    
     # 綜合調節值
-    analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty
+    analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout
 
     # 3. 狀態錨定評分
     alpha_score = np.zeros(len(df))
@@ -1023,14 +1040,15 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     # 基礎 Log
     base_log_msg = np.where(position == 1, "持倉監控", "空手觀望")
-    
-    # 若被扣分 => 顯示警告
     base_log_msg = np.where(penalty_mask, base_log_msg + " [⚠️年線蓋頭]", base_log_msg)
     
-    # 若年線下彎但季線救援 => 顯示提示
     rescue_mask = ma240_slope_neg & ma60_slope_pos
-    base_log_msg = np.where(rescue_mask, base_log_msg + " [季線救援中]", base_log_msg)
+    base_log_msg = np.where(rescue_mask, base_log_msg + " [季線救援]", base_log_msg)
     
+    # 新增評語提示
+    base_log_msg = np.where(cond_ma30_gap, base_log_msg + " [📈強勢乖離]", base_log_msg)
+    base_log_msg = np.where(cond_breakout & cond_not_overheated, base_log_msg + " [🚀百日突破]", base_log_msg)
+
     log_msg = base_log_msg
 
     # 4. 訊號事件
@@ -1071,7 +1089,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     base_log = np.select(conditions, choices, default="☁️ 盤整")
     df['Score_Log'] = np.where(buy_mask | sell_mask, log_msg, base_log)
     
-    # 在評語中補充趨勢狀態
     df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & penalty_mask, df['Score_Log'] + " (長空)", df['Score_Log'])
     df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & rescue_mask, df['Score_Log'] + " (轉強)", df['Score_Log'])
     
