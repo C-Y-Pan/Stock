@@ -294,6 +294,37 @@ def get_stock_name(ticker):
 
 ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 
+
+PRESET_LISTS = {
+    "🔥 台股熱門 50 (權值)": [
+        "2330", "2317", "2454", "2382", "2303", "2308", "3008", "3034", "3035", "3037", 
+        "3443", "3661", "2603", "2609", "2615", "2376", "3231", "2356", "2357", "3017",
+        "2059", "3324", "6669", "3529", "5269", "5274", "3045", "4966", "2344", "6274",
+        "8046", "3016", "2360", "6239", "6213", "3533", "3653", "8210", "3131", "9958",
+        "1513", "1519", "1503", "1504", "1605", "2881", "2882", "2891", "5871", "2886", "6781", "3211"
+    ],
+    "🤖 AI 伺服器與散熱": [
+        "2382", "3231", "2356", "6669", "2376", "3017", "3324", "2421", "3013", "3483", 
+        "3653", "6213", "8996", "2486", "3533", "5274", "8210", "2059", "3694"
+    ],
+    "⚡ 重電綠能與軍工": [
+        "1513", "1519", "1503", "1504", "1605", "1609", "6806", "3708", "9958", "6219", 
+        "2634", "8033", "2618", "2610", "1514", "5284", "2204"
+    ],
+    "🚢 航運與原物料": [
+        "2603", "2609", "2615", "2637", "2605", "2606", "5608", "2002", "2014", "2027", 
+        "1101", "1102", "1301", "1303", "1326", "6505"
+    ],
+    "💰 金融存股觀察": [
+        "2881", "2882", "2891", "2886", "2884", "2885", "2892", "2890", "2880", "2883", 
+        "2887", "5880", "5876", "2834", "2801", "2809", "2897"
+    ],
+    "📊 高股息 ETF": [
+        "0050", "0056", "00878", "00919", "00929", "00939", "00940", "00713", "00918", "00915"
+    ]
+}
+
+
 # ==========================================
 # 1. 數據獲取 (Updated)
 # ==========================================
@@ -1508,7 +1539,7 @@ with st.sidebar:
         st.markdown("---")
         
     # [修改] 加入 "💼 持股健診與建議"
-    page = st.radio("導航", ["🌍 市場總覽 (Macro)", "📊 單股深度分析", "🚀 科技股掃描", "💼 持股健診與建議", "📋 全台股清單"])
+    page = st.radio("導航", ["🌍 市場總覽 (Macro)", "📊 單股深度分析", "🚀 科技股掃描", "💼 持股健診與建議", "📋 全台股清單", "🧪 策略實驗室"])
 
     today = datetime.today()
     # 設定台北時區
@@ -2096,34 +2127,6 @@ elif page == "🚀 科技股掃描":
     # ==========================================
     # 1. 定義擴充清單 (Sector Presets)
     # ==========================================
-    PRESET_LISTS = {
-        "🔥 台股熱門 50 (權值)": [
-            "2330", "2317", "2454", "2382", "2303", "2308", "3008", "3034", "3035", "3037", 
-            "3443", "3661", "2603", "2609", "2615", "2376", "3231", "2356", "2357", "3017",
-            "2059", "3324", "6669", "3529", "5269", "5274", "3045", "4966", "2344", "6274",
-            "8046", "3016", "2360", "6239", "6213", "3533", "3653", "8210", "3131", "9958",
-            "1513", "1519", "1503", "1504", "1605", "2881", "2882", "2891", "5871", "2886", "6781", "3211"
-        ],
-        "🤖 AI 伺服器與散熱": [
-            "2382", "3231", "2356", "6669", "2376", "3017", "3324", "2421", "3013", "3483", 
-            "3653", "6213", "8996", "2486", "3533", "5274", "8210", "2059", "3694"
-        ],
-        "⚡ 重電綠能與軍工": [
-            "1513", "1519", "1503", "1504", "1605", "1609", "6806", "3708", "9958", "6219", 
-            "2634", "8033", "2618", "2610", "1514", "5284", "2204"
-        ],
-        "🚢 航運與原物料": [
-            "2603", "2609", "2615", "2637", "2605", "2606", "5608", "2002", "2014", "2027", 
-            "1101", "1102", "1301", "1303", "1326", "6505"
-        ],
-        "💰 金融存股觀察": [
-            "2881", "2882", "2891", "2886", "2884", "2885", "2892", "2890", "2880", "2883", 
-            "2887", "5880", "5876", "2834", "2801", "2809", "2897"
-        ],
-        "📊 高股息 ETF": [
-            "0050", "0056", "00878", "00919", "00929", "00939", "00940", "00713", "00918", "00915"
-        ]
-    }
 
     # ==========================================
     # 2. 介面控制 (修正版：雙向綁定)
@@ -2528,7 +2531,7 @@ elif page == "💼 持股健診與建議":
     else:
         st.caption("⚠️ 訪客模式")
 
-# ==========================================
+    # ==========================================
     # 1. [修正-防呆版] 準備輸入資料 (使用 Callback 鎖定狀態)
     # ==========================================
     
@@ -2567,7 +2570,7 @@ elif page == "💼 持股健診與建議":
         if st.session_state.get('logged_in'):
             save_portfolio_to_db(st.session_state['username'], new_df)
 
-# ==========================================
+    # ==========================================
     # 1. [優化版] 準備輸入資料 (表單批次處理)
     # ==========================================
 
@@ -2778,7 +2781,7 @@ elif page == "💼 持股健診與建議":
             
             status.update(label="AI 分析完成！", state="complete", expanded=False)
 
-# ==========================================
+        # ==========================================
         # [優化] 自動寄信邏輯：智慧訊號過濾
         # ==========================================
         if enable_monitor and portfolio_results:
@@ -2914,3 +2917,238 @@ elif page == "💼 持股健診與建議":
     # ==========================================
     st.markdown("---")
     render_live_dashboard(st.session_state['portfolio_data'])
+
+# --- 頁面 5: 策略實驗室 (Strategy Lab) ---
+elif page == "🧪 策略實驗室":
+    st.markdown("### 🧪 全市場策略驗證實驗室 (Strategy Lab)")
+    st.caption("此模組用於遍歷大量標的，驗證策略在不同市場環境下的普適性、抗跌性與獲利能力。")
+
+    # ==========================================
+    # 1. 實驗參數設定
+    # ==========================================
+    with st.expander("⚙️ 實驗參數設定", expanded=True):
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            target_universe = st.selectbox("樣本範圍", ["🔥 台股熱門 50", "🤖 AI 伺服器概念", "🚢 航運股", "📋 全上市櫃 (耗時)", "🎲 隨機抽樣 30 檔"])
+        with c2:
+            test_start_date = st.date_input("回測開始", value=datetime.today() - timedelta(days=365*3))
+        with c3:
+            test_end_date = st.date_input("回測結束", value=datetime.today())
+            
+    # 準備清單
+    target_tickers = []
+    if target_universe == "🔥 台股熱門 50":
+        target_tickers = PRESET_LISTS["🔥 台股熱門 50 (權值)"]
+    elif target_universe == "🤖 AI 伺服器概念":
+        target_tickers = PRESET_LISTS["🤖 AI 伺服器與散熱"]
+    elif target_universe == "🚢 航運股":
+        target_tickers = PRESET_LISTS["🚢 航運與原物料"]
+    elif target_universe == "🎲 隨機抽樣 30 檔":
+        if st.session_state['all_stock_list'] is None:
+            st.session_state['all_stock_list'] = get_master_stock_data()
+        all_codes = st.session_state['all_stock_list']['代號'].tolist()
+        import random
+        target_tickers = random.sample(all_codes, 30) if len(all_codes) > 30 else all_codes
+    elif target_universe == "📋 全上市櫃 (耗時)":
+        if st.session_state['all_stock_list'] is None:
+            st.session_state['all_stock_list'] = get_master_stock_data()
+        target_tickers = st.session_state['all_stock_list']['代號'].tolist()
+
+    # Session State 初始化
+    if 'lab_running' not in st.session_state: st.session_state['lab_running'] = False
+    if 'lab_results' not in st.session_state: st.session_state['lab_results'] = []
+    if 'lab_stop' not in st.session_state: st.session_state['lab_stop'] = False
+
+    # 控制按鈕
+    c_run, c_stop, c_clear = st.columns([1, 1, 1])
+    with c_run:
+        if st.button("🚀 開始全遍歷驗證", type="primary", use_container_width=True):
+            st.session_state['lab_running'] = True
+            st.session_state['lab_stop'] = False
+            st.session_state['lab_results'] = [] # 重置
+    with c_stop:
+        if st.button("🛑 強制停止", use_container_width=True):
+            st.session_state['lab_running'] = False
+            st.session_state['lab_stop'] = True
+    with c_clear:
+        if st.button("🗑️ 清除結果", use_container_width=True):
+            st.session_state['lab_results'] = []
+
+    # ==========================================
+    # 2. 核心遍歷迴圈
+    # ==========================================
+    if st.session_state['lab_running']:
+        progress_bar = st.progress(0)
+        status_text = st.empty()
+        result_area = st.container()
+        
+        total = len(target_tickers)
+        results = []
+
+        for i, ticker in enumerate(target_tickers):
+            if st.session_state['lab_stop']:
+                st.warning("使用者中止測試")
+                break
+                
+            status_text.text(f"正在驗證 ({i+1}/{total}): {ticker} ...")
+            progress_bar.progress((i + 1) / total)
+
+            try:
+                # A. 獲取數據
+                raw_df, fmt_ticker = get_stock_data(ticker, test_start_date, test_end_date)
+                if raw_df.empty or len(raw_df) < 100: continue
+
+                # B. 執行策略 (使用最佳參數搜尋)
+                # 注意：這裡假設 run_optimization 內部已經計算了 Buy & Hold (Cum_Market)
+                best_params, strat_df = run_optimization(raw_df, market_df, test_start_date, fee_input, tax_input)
+                
+                if strat_df is None or strat_df.empty: continue
+
+                # C. 計算關鍵指標
+                # 1. 報酬率比較
+                strat_ret = strat_df['Cum_Strategy'].iloc[-1] - 1
+                bh_ret = strat_df['Cum_Market'].iloc[-1] - 1
+                alpha = strat_ret - bh_ret
+
+                # 2. 策略執行細節
+                total_days = len(strat_df)
+                market_bull_days = strat_df[strat_df['Close'] > strat_df['MA60']]
+                market_bear_days = strat_df[strat_df['Close'] < strat_df['MA60']]
+                
+                # 多頭捕捉率：市場在多頭時，策略持有的時間比例
+                bull_held_days = market_bull_days[market_bull_days['Position'] == 1]
+                bull_capture = len(bull_held_days) / len(market_bull_days) if len(market_bull_days) > 0 else 0
+                
+                # 空頭曝險率：市場在空頭時，策略持有的時間比例 (越低越好)
+                bear_held_days = market_bear_days[market_bear_days['Position'] == 1]
+                bear_exposure = len(bear_held_days) / len(market_bear_days) if len(market_bear_days) > 0 else 0
+
+                # 3. 恐慌抄底驗證
+                # 篩選出 Reason 包含 "反彈" 或 "超賣" 的交易
+                panic_buys = strat_df[(strat_df['Action'] == 'Buy') & (strat_df['Reason'].str.contains('反彈|超賣'))]
+                panic_wins = 0
+                panic_count = len(panic_buys)
+                
+                if panic_count > 0:
+                    # 簡單驗證：買進後持有期間是否有獲利出場
+                    for idx in panic_buys.index:
+                        # 找到下一次賣出
+                        future = strat_df.loc[idx:]
+                        sells = future[future['Action'] == 'Sell']
+                        if not sells.empty:
+                            sell_idx = sells.index[0]
+                            pnl = (strat_df.loc[sell_idx, 'Close'] - strat_df.loc[idx, 'Close']) / strat_df.loc[idx, 'Close']
+                            if pnl > 0: panic_wins += 1
+                
+                panic_win_rate = (panic_wins / panic_count) if panic_count > 0 else np.nan
+
+                # D. 存入結果
+                res_item = {
+                    "代號": ticker,
+                    "策略報酬": strat_ret,
+                    "買持報酬": bh_ret,
+                    "Alpha": alpha,
+                    "勝率": float(best_params.get('WinRate', 0)) if 'WinRate' in best_params else calculate_realized_win_rate(strat_df)[3], # 若無則由 calculate_realized_win_rate 補
+                    "MDD": calculate_mdd(strat_df['Cum_Strategy']),
+                    "多頭捕捉率": bull_capture,
+                    "空頭曝險率": bear_exposure,
+                    "抄底次數": panic_count,
+                    "抄底勝率": panic_win_rate
+                }
+                
+                # 補充實際勝率 (如果 run_optimization 沒回傳)
+                if '勝率' not in res_item or res_item['勝率'] == 0:
+                     wr_str, wins, totals, avg_p = calculate_realized_win_rate(strat_df)
+                     res_item['勝率'] = float(wr_str.strip('%')) / 100
+
+                results.append(res_item)
+                st.session_state['lab_results'] = results # 即時存檔
+
+            except Exception as e:
+                print(f"Error analyzing {ticker}: {e}")
+                continue
+        
+        st.session_state['lab_running'] = False
+        st.success("✅ 驗證完成！")
+
+    # ==========================================
+    # 3. 結果分析與視覺化
+    # ==========================================
+    if st.session_state['lab_results']:
+        df_res = pd.DataFrame(st.session_state['lab_results'])
+        
+        st.markdown("---")
+        st.markdown("### 📊 實驗報告摘要")
+
+        # A. 核心統計卡片
+        avg_strat = df_res['策略報酬'].mean()
+        avg_bh = df_res['買持報酬'].mean()
+        avg_alpha = df_res['Alpha'].mean()
+        median_alpha = df_res['Alpha'].median()
+        win_rate_avg = df_res['勝率'].mean()
+        
+        k1, k2, k3, k4 = st.columns(4)
+        k1.metric("平均策略報酬", f"{avg_strat:.1%}", f"vs 買持 {avg_bh:.1%}")
+        k2.metric("平均 Alpha (超額)", f"{avg_alpha:.1%}", f"中位數 {median_alpha:.1%}", delta_color="normal")
+        k3.metric("平均勝率", f"{win_rate_avg:.1%}", "目標 > 50%")
+        k4.metric("正 Alpha 佔比", f"{(df_res['Alpha'] > 0).mean():.1%}", "打敗大盤機率")
+
+        # B. 圖表分析
+        tab_v1, tab_v2, tab_v3 = st.tabs(["📈 報酬分佈", "🛡️ 多空執行力", "📉 抄底有效性"])
+
+        with tab_v1:
+            st.markdown("#### 策略 vs 買進持有 (Buy & Hold) 報酬分佈")
+            fig_dist = go.Figure()
+            fig_dist.add_trace(go.Histogram(x=df_res['策略報酬'], name='策略報酬', opacity=0.75, marker_color='#ef5350'))
+            fig_dist.add_trace(go.Histogram(x=df_res['買持報酬'], name='買持報酬', opacity=0.75, marker_color='gray'))
+            fig_dist.update_layout(barmode='overlay', template="plotly_dark", xaxis_tickformat='.0%')
+            st.plotly_chart(fig_dist, use_container_width=True)
+            
+            st.caption("說明：紅色分佈若整體位於灰色右側，代表策略具有普遍的正期望值。")
+
+        with tab_v2:
+            st.markdown("#### 市場體制適應性分析")
+            # 散佈圖：X軸=空頭曝險率，Y軸=多頭捕捉率
+            fig_regime = px.scatter(
+                df_res, x="空頭曝險率", y="多頭捕捉率", 
+                color="Alpha", hover_data=["代號"],
+                color_continuous_scale=['#00e676', '#26a69a', 'gray', '#ef5350', '#ff1744'],
+                color_continuous_midpoint=0,
+                title="避險 vs 進攻 能力分佈"
+            )
+            # 劃分理想區域
+            fig_regime.add_hline(y=0.5, line_dash="dash", line_color="gray")
+            fig_regime.add_vline(x=0.3, line_dash="dash", line_color="gray")
+            fig_regime.add_annotation(x=0.1, y=0.9, text="🏆 聖杯區 (避開空頭+吃到多頭)", showarrow=False, font=dict(color="#ff5252"))
+            fig_regime.add_annotation(x=0.8, y=0.1, text="💀 韭菜區 (空頭滿倉+多頭空手)", showarrow=False, font=dict(color="#00e676"))
+            
+            fig_regime.update_layout(template="plotly_dark", xaxis_tickformat='.0%', yaxis_tickformat='.0%')
+            st.plotly_chart(fig_regime, use_container_width=True)
+
+        with tab_v3:
+            st.markdown("#### 恐慌抄底 (Panic Rebound) 有效性驗證")
+            df_panic = df_res[df_res['抄底次數'] > 0].copy()
+            if not df_panic.empty:
+                fig_panic = px.box(df_panic, y="抄底勝率", points="all", title="抄底策略勝率分佈")
+                fig_panic.update_layout(template="plotly_dark", yaxis_tickformat='.0%', yaxis_range=[0, 1.1])
+                st.plotly_chart(fig_panic, use_container_width=True)
+                st.metric("平均抄底勝率", f"{df_panic['抄底勝率'].mean():.1%}", f"樣本數: {len(df_panic)} 檔")
+            else:
+                st.info("選定樣本中無觸發抄底訊號。")
+
+        # C. 詳細數據表
+        st.markdown("### 📋 詳細驗證數據")
+        
+        # 格式化顯示
+        def color_alpha(val):
+            color = '#ffcdd2' if val > 0 else '#c8e6c9'
+            return f'background-color: {color}; color: black'
+
+        st.dataframe(
+            df_res.style.format({
+                "策略報酬": "{:.1%}", "買持報酬": "{:.1%}", "Alpha": "{:.1%}", 
+                "勝率": "{:.1%}", "MDD": "{:.1f}%", 
+                "多頭捕捉率": "{:.1%}", "空頭曝險率": "{:.1%}", "抄底勝率": "{:.1%}"
+            }).applymap(color_alpha, subset=['Alpha']),
+            use_container_width=True
+        )
