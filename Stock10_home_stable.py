@@ -1089,10 +1089,10 @@ def calculate_alpha_score(df, margin_df, short_df):
     congestion_index = gap_series.rolling(20, min_periods=1).mean().fillna(1.0).values
     
     # [修正] 分級定義糾結
-    # 極度糾結: 平均差距 < 2.5%
-    is_extremely_congested = congestion_index < 0.025
-    # 一般糾結: 2.5% <= 平均差距 < 5%
-    is_congested = (congestion_index >= 0.025) & (congestion_index < 0.05)
+    # 極度糾結: 平均差距 < 4%
+    is_extremely_congested = congestion_index < 0.04
+    # 一般糾結: 4% <= 平均差距 < 7%
+    is_congested = (congestion_index >= 0.04) & (congestion_index < 0.07)
     
     # 只有趨勢策略才受糾結懲罰 (抄底策略不受影響)
     extreme_congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_extremely_congested
