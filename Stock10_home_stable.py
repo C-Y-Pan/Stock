@@ -1070,7 +1070,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 條件：三線全上 (趨勢強) 且 糾結度在變大 (正在發散)
     # 這代表行情正在加速，而非死魚盤
     cond_expansion = (ma_support_count == 3) & (congestion_slope > 0)
-    score_expansion = np.where(cond_expansion, 25, 0)
+    score_expansion = np.where(cond_expansion, 50, 0)
     
     # 綜合調節值 (加入 score_expansion)
     analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout + score_ma_support + score_expansion
