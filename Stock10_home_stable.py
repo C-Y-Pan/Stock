@@ -1709,7 +1709,10 @@ elif page == "📊 單股深度分析":
                 st.error(f"❌ 無法獲取 {ticker_input} 資料。原因可能是：\n1. 代號錯誤\n2. 該 ETF/股票剛上市，Yahoo Finance 尚未收錄\n3. 該商品無近期交易量")
             else:
                 # 3. 若成功，才執行策略運算
-                best_params, final_df = run_optimization(raw_df, market_df, start_date, current_fee, current_tax)
+                best_params, final_df = run_optimization(
+                    raw_df, market_df, start_date, current_fee, current_tax, 
+                    use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                )
                 validation_result = validate_strategy_robust(raw_df, market_df, 0.7, current_fee, current_tax)
 
             # 4. 顯示結果 (檢查 final_df 是否存在且不為空)
@@ -2278,7 +2281,10 @@ elif page == "🚀 科技股掃描":
                             st.session_state['scan_current_index'] = current_real_idx + 1
                             continue
                             
-                        best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input)
+                        best_params, final_df = run_optimization(
+                            raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input,
+                            use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                        )
                         
                         
                         if final_df is not None and not final_df.empty:
@@ -2709,7 +2715,10 @@ elif page == "💼 持股健診與建議":
                 if raw_df.empty or len(raw_df) < 60: continue 
                     
                 # 2. 執行策略回測
-                best_params, final_df = run_optimization(raw_df, market_df, start_date, fee_input, tax_input)
+                best_params, final_df = run_optimization(
+                    raw_df, market_df, start_date, fee_input, tax_input,
+                    use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                )
                 
                 if final_df is None or final_df.empty: continue
 
@@ -3019,7 +3028,10 @@ elif page == "🧪 策略實驗室":
                 display_label = f"{ticker} {stock_name}"
 
                 # B. 執行策略
-                best_params, strat_df = run_optimization(raw_df, lab_market_df, test_start_date, fee_input, tax_input)
+                best_params, strat_df = run_optimization(
+                    raw_df, lab_market_df, test_start_date, fee_input, tax_input,
+                    use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                )
                 
                 if strat_df is None or strat_df.empty: continue
 
