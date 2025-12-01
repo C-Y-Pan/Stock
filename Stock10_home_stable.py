@@ -1005,9 +1005,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v7.2.1 (Fix NameError):
-    - [修復] 補回 total_pen 變數定義，解決 NameError。
-    - [既有] Triple Bear Penalty: 三線下彎且未滿足反轉條件，視為絕對空頭，給予嚴重扣分。
+    Alpha Score v7.2.2 (Fix ValueError: NaN):
+    - [修復] 加入 NaN 防呆檢查，防止 int(NaN) 導致程式崩潰。
+    - [既有] 包含 Triple Bear Penalty 與 Crash Penalty。
     """
     df = df.copy()
 
@@ -1027,7 +1027,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     
-    # 準備 Raw Data Arrays
+    # 準備 Raw Data Arrays (使用 ffill/bfill 盡量填補，但仍可能有 NaN)
     action = df['Action'].values
     position = pd.Series(df['Position'].values).ffill().fillna(0).values
     close = df['Close'].values
@@ -1109,7 +1109,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     ma120_slope = pd.Series(ma120).pct_change().fillna(0).values
     ma240_slope = pd.Series(ma240).pct_change().fillna(0).values
     
-    # [新增] 三線下彎且無效反轉 Mask
+    # 三線下彎且無效反轉 Mask
     is_triple_bear = (ma60_slope < 0) & (ma120_slope < 0) & (ma240_slope < 0)
     is_price_above_all = (close > ma60) & (close > ma120) & (close > ma240)
     is_valid_reversal = (congestion_slope > 0) & is_price_above_all
@@ -1168,7 +1168,6 @@ def calculate_alpha_score(df, margin_df, short_df):
         if crash_penalty_mask[i]:
             event_penalty -= 40; ep_list.append("主跌崩盤 (-40)")
             
-        # [新增] 三線下彎扣分
         if triple_bear_penalty_mask[i]:
             event_penalty -= 35; ep_list.append("均線空頭排列 (-35)")
             
@@ -1179,7 +1178,7 @@ def calculate_alpha_score(df, margin_df, short_df):
         penalties = score_trend_penalty[i]
         fluctuation = score_bias[i] + score_rsi[i] + score_vol[i]
         
-        # [關鍵修正] 計算總扣分 (定義變數)
+        # 定義 total_pen 變數
         total_pen = penalties + event_penalty
 
         total_mod = (fluctuation + bonuses + penalties) * mod_factor
@@ -1195,9 +1194,14 @@ def calculate_alpha_score(df, margin_df, short_df):
             raw_score = min(raw_score, 99)
             
         final_val = np.clip(raw_score, -100, cap)
+        
+        # [關鍵修正] NaN 防呆：如果 final_val 是 NaN，強制歸零
+        if np.isnan(final_val):
+            final_val = 0.0
+            
         alpha_score[i] = final_val
 
-        # HTML String
+        # HTML String (使用已防呆的 final_val)
         c_val = "#ef5350" if final_val > 0 else "#00e676"
         c_pos = "#ff8a80"
         c_neg = "#b9f6ca"
@@ -1206,11 +1210,12 @@ def calculate_alpha_score(df, margin_df, short_df):
         txt += f"<span style='color:#888'>──────────</span><br>"
         txt += f"<b>[{state_str}] 基分: {base_val}</b><br>"
         
-        if fluctuation != 0:
+        # 顯示技術浮動 (若為 NaN 則不顯示或顯示0)
+        if not np.isnan(fluctuation) and fluctuation != 0:
             txt += f"<b>技術浮動: {fluctuation:.1f}</b><br>"
-            if score_bias[i] != 0: txt += f" • 乖離: {score_bias[i]:+.1f}<br>"
-            if score_rsi[i] != 0: txt += f" • RSI: {score_rsi[i]:+.1f}<br>"
-            if score_vol[i] > 0: txt += f" • 量能: {score_vol[i]:+.1f}<br>"
+            if not np.isnan(score_bias[i]) and score_bias[i] != 0: txt += f" • 乖離: {score_bias[i]:+.1f}<br>"
+            if not np.isnan(score_rsi[i]) and score_rsi[i] != 0: txt += f" • RSI: {score_rsi[i]:+.1f}<br>"
+            if not np.isnan(score_vol[i]) and score_vol[i] > 0: txt += f" • 量能: {score_vol[i]:+.1f}<br>"
             
         if bonuses > 0:
             txt += f"<b><span style='color:{c_pos}'>加分項目: +{int(bonuses)}</span></b><br>"
@@ -1219,7 +1224,6 @@ def calculate_alpha_score(df, margin_df, short_df):
             if score_breakout[i] > 0: txt += f" • 百日突破: +{int(score_breakout[i])}<br>"
             if score_ma30[i] > 0: txt += f" • 強勢乖離: +{int(score_ma30[i])}<br>"
             
-        # [關鍵修正] 使用正確定義的 total_pen
         if total_pen < 0:
             txt += f"<b><span style='color:{c_neg}'>扣分項目: {int(total_pen)}</span></b><br>"
             if penalties < 0: txt += f" • 年線蓋頭: {int(penalties)}<br>"
@@ -1253,7 +1257,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
-
 
 def calculate_alpha_score_technical_fallback(df):
     """
