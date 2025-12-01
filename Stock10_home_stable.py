@@ -2660,7 +2660,7 @@ elif page == "💼 持股健診與建議":
         
         st.session_state['portfolio_data'] = start_df
 
-    col_input, col_ctrl = st.columns([1, 1])
+    col_input, col_ctrl = st.columns([3, 1])
     
     with col_input:
         st.markdown("#### 1. 輸入持股明細")
