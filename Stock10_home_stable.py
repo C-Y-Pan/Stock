@@ -1841,7 +1841,7 @@ elif page == "📊 單股深度分析":
                     m1, 
                     "策略淨報酬 (Active)", 
                     f"{strat_ret:+.1f}%", 
-                    f"MDD: -{strat_mdd:.1f}%", 
+                    f"MDD: {strat_mdd:.1f}%", 
                     is_good=(strat_ret > 0)
                 )
                 
@@ -1851,7 +1851,7 @@ elif page == "📊 單股深度分析":
                     m2, 
                     "買進持有 (Buy & Hold)", 
                     f"{bh_ret:+.1f}%", 
-                    f"MDD: -{bh_mdd:.1f}%", 
+                    f"MDD: {bh_mdd:.1f}%", 
                     is_good=(bh_ret > 0)
                 )
                 
