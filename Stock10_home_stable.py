@@ -978,11 +978,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.1 (MA Support Bonus):
-    - [新增] 均線支撐加分:
-      * 站上 1 條長均線 (季/半/年): +5 分
-      * 站上 2 條長均線: +10 分
-      * 站上 3 條長均線 (三線多排): +20 分 (大幅獎勵趨勢確立)
+    Alpha Score v6.2 (Expansion Bonus):
+    - [新增] 發散噴出加分: 若股價站上三條長均線 (趨勢多頭) 且 均線糾結度斜率為正 (正在發散加速)，額外 +15 分。
+      這能獎勵策略抓住「盤整後噴出」的甜蜜點。
     """
     df = df.copy()
 
@@ -1009,6 +1007,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     ma120 = df['MA120'].fillna(method='bfill').values
     ma240 = df['MA240'].fillna(method='bfill').values
     ma30 = df['MA30'].ffill().values
+    
     high_100d = df['High_100d'].fillna(0).values
     close_lag5 = df['Close_Lag5'].fillna(close[0]).values
     volume = df['Volume'].fillna(0).values
@@ -1033,15 +1032,12 @@ def calculate_alpha_score(df, margin_df, short_df):
     penalty_mask = ma240_slope_neg & (~ma60_slope_pos)
     score_trend_penalty = np.where(penalty_mask, -15, 0)
     
-    # [新增] 均線支撐加分 (MA Support Bonus)
-    # 邏輯：站上的長均線越多，分數加越多
+    # [MA Support Bonus] 站上均線獎勵
     above_ma60 = (close > ma60).astype(int)
     above_ma120 = (close > ma120).astype(int)
     above_ma240 = (close > ma240).astype(int)
-    
     ma_support_count = above_ma60 + above_ma120 + above_ma240
     
-    # 3條全上: +20, 2條: +10, 1條: +5
     score_ma_support = np.select(
         [ma_support_count == 3, ma_support_count == 2, ma_support_count == 1],
         [20, 10, 5],
@@ -1057,8 +1053,27 @@ def calculate_alpha_score(df, margin_df, short_df):
     cond_breakout = (close >= high_100d)
     score_breakout = np.where(cond_breakout & cond_not_overheated, 15, 0)
     
-    # 綜合調節值 (加入 score_ma_support)
-    analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout + score_ma_support
+    # --- 均線糾結與發散計算 ---
+    ma_stack = np.vstack([ma60, ma120, ma240])
+    ma_max = np.max(ma_stack, axis=0)
+    ma_min = np.min(ma_stack, axis=0)
+    raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
+    gap_series = pd.Series(raw_gap_ratio)
+    # 20日平均差距 (糾結指數)
+    congestion_index = gap_series.rolling(20, min_periods=1).mean().fillna(1.0).values
+    
+    # [新增] 計算糾結度斜率 (Slope)
+    # 使用 pandas diff 計算變化
+    congestion_slope = pd.Series(congestion_index).diff().fillna(0).values
+    
+    # [新增] 發散噴出加分 (Expansion Bonus)
+    # 條件：三線全上 (趨勢強) 且 糾結度在變大 (正在發散)
+    # 這代表行情正在加速，而非死魚盤
+    cond_expansion = (ma_support_count == 3) & (congestion_slope > 0)
+    score_expansion = np.where(cond_expansion, 15, 0)
+    
+    # 綜合調節值 (加入 score_expansion)
+    analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout + score_ma_support + score_expansion
 
     # 3. 狀態錨定評分
     alpha_score = np.zeros(len(df))
@@ -1072,8 +1087,9 @@ def calculate_alpha_score(df, margin_df, short_df):
     base_log_msg = np.where(position == 1, "持倉監控", "空手觀望")
     base_log_msg = np.where(penalty_mask, base_log_msg + " [⚠️年線蓋頭]", base_log_msg)
     
-    # 新增評語：若是三線全上，顯示多頭排列
+    # 評語邏輯
     base_log_msg = np.where(ma_support_count == 3, base_log_msg + " [☀️三線多排]", base_log_msg)
+    base_log_msg = np.where(cond_expansion, base_log_msg + " [🚀發散噴出]", base_log_msg) # 新增評語
     
     rescue_mask = ma240_slope_neg & ma60_slope_pos
     base_log_msg = np.where(rescue_mask, base_log_msg + " [季線救援]", base_log_msg)
@@ -1082,10 +1098,10 @@ def calculate_alpha_score(df, margin_df, short_df):
 
     log_msg = base_log_msg
 
-    # 4. 訊號事件
+    # 4. 訊號事件 (買賣點強制加扣分)
     buy_mask = (action == 'Buy')
     
-    # [檢查]
+    # 風控檢查
     reason_series = df['Reason'].fillna("").astype(str)
     is_panic_strat = reason_series.str.contains('反彈|超賣').values
     panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
@@ -1093,14 +1109,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     not_above_long_ma = (close < ma120) | (close < ma240)
     trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
     
-    # [糾結檢查]
-    ma_stack = np.vstack([ma60, ma120, ma240])
-    ma_max = np.max(ma_stack, axis=0)
-    ma_min = np.min(ma_stack, axis=0)
-    raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
-    gap_series = pd.Series(raw_gap_ratio)
-    congestion_index = gap_series.rolling(20, min_periods=1).mean().fillna(1.0).values
-    
+    # 極度糾結檢查 (<3%)
     is_extremely_congested = congestion_index < 0.03
     is_congested = (congestion_index >= 0.03) & (congestion_index < 0.05)
     
@@ -1109,7 +1118,7 @@ def calculate_alpha_score(df, margin_df, short_df):
 
     buy_pulse = 85 + (analog_modulation * 0.5)
     
-    # 扣分
+    # 執行扣分
     buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
     buy_pulse = np.where(trend_buy_penalty_mask, buy_pulse - 20, buy_pulse)
     buy_pulse = np.where(extreme_congestion_penalty_mask, buy_pulse - 30, buy_pulse)
@@ -1163,7 +1172,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
-
 
 
 def calculate_alpha_score_technical_fallback(df):
