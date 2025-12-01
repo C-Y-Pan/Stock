@@ -1995,6 +1995,15 @@ elif page == "📊 單股深度分析":
                             line=dict(color='#e040fb', width=1.5), 
                             name='年線 (MA240)'
                         ), row=1, col=1)
+                    
+                    if 'MA120' in final_df.columns:
+                        fig.add_trace(go.Scatter(
+                            x=final_df['Date'], 
+                            y=final_df['MA120'], 
+                            mode='lines', 
+                            line=dict(color="#40fbaa", width=1), 
+                            name='半年線 (MA120)'
+                        ), row=1, col=1)
 
                     # 買賣點標記
                     final_df['Buy_Y'] = final_df['Low'] * 0.92
