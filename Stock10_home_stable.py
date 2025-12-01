@@ -666,7 +666,7 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     ma240_slope = ma240_series.pct_change().fillna(0).values
     
     # 產生一個陣列，標記每天是否處於崩盤趨勢
-    is_crash_trend_array = ma240_slope <= -0.001
+    is_crash_trend_array = ma240_slope <= -0.0005
 
     # 預先計算「均線糾結指數」
     ma_stack = np.vstack([ma60, ma120, ma240])
@@ -1104,7 +1104,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     # =========================================================================
     ma240_series = pd.Series(ma240)
     ma240_slope_val = ma240_series.pct_change().fillna(0).values # 變數名稱改為 slope_val 避免混淆
-    is_crash_trend = ma240_slope_val <= -0.001
+    is_crash_trend = ma240_slope_val <= -0.0005
     
     # 定義：若買進或持倉時遇到崩盤趨勢，給予扣分
     crash_penalty_mask = (buy_mask | (position == 1)) & is_crash_trend
