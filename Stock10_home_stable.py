@@ -1110,8 +1110,8 @@ def calculate_alpha_score(df, margin_df, short_df):
     trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
     
     # 極度糾結檢查 (<3%)
-    is_extremely_congested = congestion_index < 0.03
-    is_congested = (congestion_index >= 0.03) & (congestion_index < 0.05)
+    is_extremely_congested = congestion_index < 0.015
+    is_congested = (congestion_index >= 0.015) & (congestion_index < 0.025)
     
     extreme_congestion_penalty_mask = buy_mask & is_extremely_congested
     congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
