@@ -300,44 +300,65 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [修復版] 獲取股價資料
-    1. 修正順序：優先嘗試 .TW (上市)，再嘗試 .TWO (上櫃)
-    2. 增加 ETF 相容性
+    [全方位還原版] 智慧獲取股價資料
+    涵蓋：除權息 (Dividends)、股票分割 (Splits)、逆分割 (Reverse Splits)。
+    邏輯：
+    1. 優先使用 auto_adjust=True (Yahoo 自動處理所有還原)。
+    2. 若失敗，抓取原始資料並透過 Adj Close 反推還原係數，強制修正 OHLC。
     """
     ticker = str(ticker).strip().upper()
     
-    # 如果使用者已經輸入完整代號 (e.g., 2330.TW)，直接使用
-    if ticker.endswith('.TW') or ticker.endswith('.TWO'):
-        candidates = [ticker]
+    # 定義搜尋候選清單
+    candidates = []
+    if '.' in ticker:
+        candidates.append(ticker)
+        base_code = ticker.split('.')[0]
+        candidates.extend([f"{base_code}.TW", f"{base_code}.TWO"])
     else:
-        # [關鍵修正] 0050 等上市股票需優先使用 .TW
-        # 大多數熱門股都是上市，將 .TW 放前面可大幅減少錯誤與等待時間
-        candidates = [f"{ticker}.TW", f"{ticker}.TWO", ticker] 
-        
+        import re
+        if ticker.startswith('00') and re.search('[A-Z]', ticker):
+            candidates = [f"{ticker}.TWO", f"{ticker}.TW", ticker]
+        else:
+            candidates = [f"{ticker}.TW", f"{ticker}.TWO", ticker]
+
     for t in candidates:
         try:
             stock = yf.Ticker(t)
-            # auto_adjust=True 對某些 ETF (如 0050) 有時會導致資料缺失，若失敗可改 False
-            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=True)
             
-            # 如果 auto_adjust 抓不到資料，嘗試關閉自動調整 (針對部分 ETF)
+            # --- 嘗試 1: 要求 API 自動處理分割與股利 ---
+            # actions=True 確保內部有下載分割事件表，計算更準確
+            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=True, actions=True)
+            
+            # --- 嘗試 2: 手動還原 (防禦機制) ---
             if df.empty:
-                df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False)
+                # 抓取原始資料 (Raw Data)
+                df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
+                
+                if not df.empty and 'Adj Close' in df.columns:
+                    # 計算還原係數 (此係數同時包含 分割因子 與 股利因子)
+                    # 例如 1拆2，Adj Close 會是 Close 的 0.5 倍，Factor = 0.5
+                    factor = df['Adj Close'] / df['Close'].replace(0, 1)
+                    
+                    # 修正 OHLC
+                    df['Open'] = df['Open'] * factor
+                    df['High'] = df['High'] * factor
+                    df['Low'] = df['Low'] * factor
+                    df['Close'] = df['Adj Close'] # 將收盤價替換為還原值
+                    
+                    # 清理欄位
+                    if 'Adj Close' in df.columns: df = df.drop(columns=['Adj Close'])
 
-            if not df.empty and len(df) > 10: # 確保至少有 10 天資料
+            # 驗證資料有效性
+            if not df.empty and len(df) > 5:
                 df = df.reset_index()
-                # 處理時區問題，統一轉為無時區格式
                 df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
                 
-                # 檢查是否有收盤價
                 if 'Close' in df.columns:
                     return df, t
-        except Exception as e:
+        except Exception:
             continue
             
-    # 若全數失敗，回傳空表
     return pd.DataFrame(), ticker
-
 
 @st.cache_data(ttl=5, show_spinner=False)
 def get_market_data(start_date, end_date):
