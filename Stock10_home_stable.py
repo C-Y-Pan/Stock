@@ -625,8 +625,10 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v9 (Squeeze Ban):
-    - [新增] 禁買令: 若均線糾結度 < 3% (極度壓縮)，強制禁止買入，防止遇到盤整後崩盤。
+    執行策略回測 v10 (Expansion Breakout):
+    - [新增] 策略 E: 三線發散 (Expansion Breakout)。
+      條件: 股價站上三條長均線 且 糾結度斜率 > 0 (發散中)。
+      此為強力趨勢訊號，給予高信心分數。
     """
     df = data.copy()
     
@@ -643,7 +645,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
     bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
     
-    # 確保有 MA120 (若上游沒算，這裡需防呆)
     if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
     
     ma120 = df['MA120'].fillna(method='bfill').values
@@ -658,16 +659,15 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     market_panic = df['Is_Market_Panic'].values
     bb_width_vals = ((df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']).values
 
-    # [新增] 預先計算「均線糾結指數」 (Rolling Congestion Index)
-    # 使用 numpy 向量化計算加速
+    # [均線糾結指數] (60日)
     ma_stack = np.vstack([ma60, ma120, ma240])
     ma_max = np.max(ma_stack, axis=0)
     ma_min = np.min(ma_stack, axis=0)
-    # 瞬時差距
     raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
-    # 20日平均差距 (糾結指數)
-    # 利用 pandas rolling 計算後轉回 numpy
+    
     congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
+    # [新增] 計算斜率 (Slope)
+    congestion_slope = pd.Series(congestion_index).diff().fillna(0).values
 
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
@@ -684,8 +684,7 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
         is_price_weak = (close[i] < ma60[i]) and (close[i] < ma20[i])
         is_strict_bear = is_ma240_down and (not is_ma60_up) and is_price_weak
 
-        # [新增] 糾結禁買判定
-        # 若糾結指數 < 3% (0.03)，禁止買入
+        # 禁買令 (極度壓縮)
         is_squeeze_ban = congestion_index[i] < 0.03
 
         # --- 進場邏輯 ---
@@ -693,18 +692,26 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             is_buy = False
             rsi_threshold_A = 60 if is_strict_bear else 55
             
-            # 只有在「非禁買」狀態下才檢查策略
             if not is_squeeze_ban:
-                # 策略 A
+                # 策略 A: 動能突破
                 if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                     is_buy=True; trade_type=1; reason_str="動能突破"
-                # 策略 B
+                
+                # [新增] 策略 E: 三線發散 (Expansion Breakout)
+                # 條件: 站穩三線 + 糾結度斜率為正 (正在張開)
+                # 這是主升段訊號，優先級高
+                elif (close[i] > ma60[i] and close[i] > ma120[i] and close[i] > ma240[i]) and congestion_slope[i] > 0:
+                    # 簡單濾網: 避免已經漲太多的末升段 (如乖離過大)
+                    if close[i] < ma60[i] * 1.3: 
+                        is_buy=True; trade_type=4; reason_str="三線發散"
+
+                # 策略 B: 均線回測
                 elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                     is_buy=True; trade_type=1; reason_str="均線回測"
-                # 策略 C
+                # 策略 C: 籌碼佈局
                 elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                     is_buy=True; trade_type=3; reason_str="籌碼佈局"
-                # 策略 D (超賣反彈也需避開極度壓縮後的崩盤)
+                # 策略 D: 超賣反彈
                 elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                     is_buy=True; trade_type=2; reason_str="超賣反彈"
             
@@ -713,6 +720,11 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                 cum_div = 0.0
                 
                 base_score = 60
+                
+                # [加分] 若是三線發散策略，基礎分大力加碼
+                if trade_type == 4:
+                    base_score += 20 # 從 60 變 80，起步即高分
+                
                 if is_strict_bear: base_score -= 10
                 if is_ma240_down and is_ma60_up: base_score += 5
                 if volume[i] > vol_ma20[i] * 1.5: base_score += 15
@@ -735,8 +747,10 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             adjusted_current_value = close[i] + cum_div
             drawdown = (adjusted_current_value - entry_price) / entry_price
             
-            if trade_type==2 and trend[i]==1: trade_type=1; reason_str="反彈轉波段"
-            if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1; reason_str="佈局完成發動"
+            # 如果是三線發散進場的，視為波段操作，轉為趨勢單處理
+            if trade_type==4: trade_type=1 
+            if trade_type==2 and trend[i]==1: trade_type=1
+            if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1
             
             is_sell = False
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
@@ -2075,7 +2089,7 @@ elif page == "📊 單股深度分析":
                 with tab1:
                     # 1. 準備數據
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    
+
                     if 'Score_Detail' in stock_alpha_df.columns:
                         final_df['Score_Detail'] = stock_alpha_df['Score_Detail']
                     else:
