@@ -3039,23 +3039,28 @@ elif page == "🧪 策略實驗室":
                 
                 panic_win_rate = (panic_wins / panic_count) if panic_count > 0 else np.nan
 
-                # D. 存入結果 (修改這裡：將 '代號' 的值改成 display_label)
+                # [修正] 先正確獲取勝率數據
+                wr_str, wins, totals, avg_pnl = calculate_realized_win_rate(strat_df)
+                
+                # 將 "65.5%" 轉為 0.655
+                try:
+                    final_win_rate = float(wr_str.strip('%')) / 100
+                except:
+                    final_win_rate = 0.0
+
+                # D. 存入結果
                 res_item = {
-                    "代號": display_label,  # <--- 修改這行，顯示 "2330 台積電"
+                    "代號": display_label,
                     "策略報酬": strat_ret,
                     "買持報酬": bh_ret,
                     "Alpha": alpha,
-                    "勝率": float(best_params.get('WinRate', 0)) if 'WinRate' in best_params else calculate_realized_win_rate(strat_df)[3],
+                    "勝率": final_win_rate,  # <--- 修正這裡，使用正確轉換後的勝率
                     "MDD": calculate_mdd(strat_df['Cum_Strategy']),
                     "多頭捕捉率": bull_capture,
                     "空頭曝險率": bear_exposure,
                     "抄底次數": panic_count,
                     "抄底勝率": panic_win_rate
                 }
-                
-                if '勝率' not in res_item or res_item['勝率'] == 0:
-                     wr_str, wins, totals, avg_p = calculate_realized_win_rate(strat_df)
-                     res_item['勝率'] = float(wr_str.strip('%')) / 100
 
                 results.append(res_item)
                 st.session_state['lab_results'] = results 
@@ -3085,9 +3090,9 @@ elif page == "🧪 策略實驗室":
         
         k1, k2, k3, k4 = st.columns(4)
         k1.metric("平均策略報酬", f"{avg_strat:.1%}", f"vs 買持 {avg_bh:.1%}")
-        k2.metric("平均超額報酬", f"{avg_alpha:.1%}", f"中位數 {median_alpha:.1%}", delta_color="normal")
+        k2.metric("平均 Alpha (超額)", f"{avg_alpha:.1%}", f"中位數 {median_alpha:.1%}", delta_color="normal")
         k3.metric("平均勝率", f"{win_rate_avg:.1%}", "目標 > 50%")
-        k4.metric("正超額報酬佔比", f"{(df_res['Alpha'] > 0).mean():.1%}", "打敗大盤機率")
+        k4.metric("正 Alpha 佔比", f"{(df_res['Alpha'] > 0).mean():.1%}", "打敗大盤機率")
 
         # B. 圖表分析
         tab_v1, tab_v2, tab_v3 = st.tabs(["📈 報酬分佈", "🛡️ 多空執行力", "📉 抄底有效性"])
@@ -3140,7 +3145,7 @@ elif page == "🧪 策略實驗室":
 
         st.dataframe(
             df_res.style.format({
-                "策略報酬": "{:.1%}", "買持報酬": "{:.1%}", "超額報酬": "{:.1%}", 
+                "策略報酬": "{:.1%}", "買持報酬": "{:.1%}", "Alpha": "{:.1%}", 
                 "勝率": "{:.1%}", "MDD": "{:.1f}%", 
                 "多頭捕捉率": "{:.1%}", "空頭曝險率": "{:.1%}", "抄底勝率": "{:.1%}"
             }).applymap(color_alpha, subset=['Alpha']),
