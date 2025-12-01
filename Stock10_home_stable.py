@@ -982,8 +982,10 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.7 (MA Congestion Penalty):
-    - [新增] 均線糾結扣分: 若 MA60/120/240 差距 < 5% (糾結)，則趨勢買入扣分 (容易被洗)。
+    Alpha Score v5.8 (Rolling Congestion Index):
+    - [升級] 均線糾結扣分: 改用「20日平均糾結度」。
+      只有當過去20天均線持續黏合 (平均差距 < 5%)，才視為結構性糾結並扣分。
+      避免將「黃金交叉」瞬間的靠近誤判為糾結。
     """
     df = df.copy()
 
@@ -1075,32 +1077,34 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_panic_strat = reason_series.str.contains('反彈|超賣').values
     panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
     
-    # [長均線濾網] (未站上)
+    # [長均線濾網]
     not_above_long_ma = (close < ma120) | (close < ma240)
     trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
     
-    # [新增] 均線糾結濾網 (MA Congestion)
-    # 計算季、半、年三線的散開程度
+    # [升級版] 均線糾結濾網 (Rolling Congestion Index)
     ma_stack = np.vstack([ma60, ma120, ma240])
     ma_max = np.max(ma_stack, axis=0)
     ma_min = np.min(ma_stack, axis=0)
-    # 糾結率 = (最高均線 - 最低均線) / 收盤價
-    congestion_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
+    # 1. 瞬時差距
+    raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
     
-    # 若糾結率 < 5% (0.05) 代表均線很黏，容易盤整
-    is_congested = congestion_ratio < 0.05
-    # 若是趨勢買盤且遇到糾結，扣分 (因為趨勢尚未發散)
+    # 2. 轉換為 Series 計算 20日均值 (這裡需要 pandas 協助)
+    # 將 numpy 轉回 pandas series 進行 rolling
+    gap_series = pd.Series(raw_gap_ratio)
+    # 填補空值為 1.0 (非糾結)，避免初期資料被誤判
+    congestion_index = gap_series.rolling(20, min_periods=1).mean().fillna(1.0).values
+    
+    # 3. 判斷糾結：平均差距 < 5%
+    is_congested = congestion_index < 0.05
+    
     congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
 
     # 基礎買進脈衝
     buy_pulse = 85 + (analog_modulation * 0.5)
     
     # 執行扣分
-    # 1. 逆勢抄底扣分 (-15)
     buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
-    # 2. 趨勢買入但未站上長均扣分 (-20)
     buy_pulse = np.where(trend_buy_penalty_mask, buy_pulse - 20, buy_pulse)
-    # 3. [新增] 均線糾結扣分 (-15)
     buy_pulse = np.where(congestion_penalty_mask, buy_pulse - 15, buy_pulse)
     
     # 限制範圍
@@ -1112,7 +1116,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'Reason' in df.columns:
         buy_reasons = df['Reason'].fillna("")
         log_msg = np.where(buy_mask, "買進: " + buy_reasons, log_msg)
-        # 評語警示
         log_msg = np.where(panic_bear_penalty_mask, log_msg + " [⚠️逆勢抄底]", log_msg)
         log_msg = np.where(trend_buy_penalty_mask, log_msg + " [⚠️未站上長均]", log_msg)
         log_msg = np.where(congestion_penalty_mask, log_msg + " [⚠️均線糾結]", log_msg)
@@ -2123,32 +2126,35 @@ elif page == "📊 單股深度分析":
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=6, col=1)
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
                     
-                    # --- [新增] Row 7: 均線糾結度 (MA Congestion) ---
-                    # 邏輯：
-                    # - 紅色 (Danger/Focus): 糾結率 < 5% (可能變盤)
+                    # --- [升級] Row 7: 均線糾結指數 (Congestion Index) ---
+                    # 1. 瞬時 GAP
+                    raw_gap = (ma_max - ma_min) / final_df['Close'] * 100
+                    
+                    # 2. 20日平均 GAP (糾結指數)
+                    # 這裡使用 rolling mean 平滑化，顯示一段時間的糾結感
+                    congestion_idx = raw_gap.rolling(20, min_periods=1).mean().fillna(100)
+                    final_df['Congestion_Index'] = congestion_idx
+                    
+                    # 顏色邏輯：
+                    # - 紅色 (Entangled): 指數 < 5% (長期黏合)
                     # - 黃色 (Neutral): 5% - 15%
-                    # - 綠色 (Safe/Trend): > 15% (趨勢拉開)
+                    # - 綠色 (Trending): > 15% (趨勢發散)
                     colors_gap = []
-                    for v in final_df['MA_Gap']:
-                        if v < 5: colors_gap.append('#ef5350') # 紅色警戒
-                        elif v < 15: colors_gap.append('#ffd740') # 黃色中性
-                        else: colors_gap.append('#00e676') # 綠色發散
+                    for v in congestion_idx:
+                        if v < 5: colors_gap.append('#ef5350') 
+                        elif v < 15: colors_gap.append('#ffd740')
+                        else: colors_gap.append('#00e676')
                     
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], 
-                        y=final_df['MA_Gap'], 
-                        name='均線差距%', 
+                        y=final_df['Congestion_Index'], 
+                        name='均線糾結指數(20日)', 
                         marker_color=colors_gap
                     ), row=7, col=1)
                     
-                    # 加入 5% 警戒線
-                    fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(5%)", row=7, col=1)
+                    # 5% 警戒線
+                    fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(<5%)", row=7, col=1)
 
-                    # Layout
-                    fig.update_layout(height=1400, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
-                                                    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
-                    fig.update_yaxes(side='right')
-                    st.plotly_chart(fig, use_container_width=True)
 
 
                 # [Tab 2: 權益曲線] (保持不變)
