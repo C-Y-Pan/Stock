@@ -620,10 +620,10 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True):
+def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v5 (Chip Strategy Toggle):
-    新增 use_chip_strategy 參數，控制是否啟用「籌碼佈局」策略。
+    執行策略回測 v6 (Strict Bear Exit Toggle):
+    新增 use_strict_bear_exit 參數，控制是否在「嚴格空頭且破月線」時強制賣出。
     """
     df = data.copy()
     positions = []; reasons = []; actions = []; target_prices = []
@@ -665,26 +665,23 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             is_buy = False
             rsi_threshold_A = 60 if is_strict_bear else 55
             
-            # 策略 A: 動能突破
+            # 策略 A
             if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                 is_buy=True; trade_type=1; reason_str="動能突破"
-            
-            # 策略 B: 均線回測
+            # 策略 B
             elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                 is_buy=True; trade_type=1; reason_str="均線回測"
-            
-            # 策略 C: 籌碼佈局 (新增 use_chip_strategy 開關)
+            # 策略 C
             elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                 is_buy=True; trade_type=3; reason_str="籌碼佈局"
-            
-            # 策略 D: 超賣反彈
+            # 策略 D
             elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                 is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
                 signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
                 
-                # === 計算信心值 ===
+                # 計算信心值
                 base_score = 60
                 if is_strict_bear: base_score -= 10
                 if is_ma240_down and is_ma60_up: base_score += 5
@@ -694,14 +691,10 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                 if trade_type == 1 and 60 <= rsi[i] <= 75: base_score += 10
                 elif trade_type == 2 and rsi[i] <= 25: base_score += 10
                 if i > 3 and bb_width_vals[i-1] < 0.15: base_score += 5
-                
                 if close[i] > ma30[i] * 1.04: base_score += 5
                 
                 weekly_ratio = close[i] / close_lag5[i] if close_lag5[i] > 0 else 1.0
-                is_not_overheated = weekly_ratio < 1.27
-                is_breakout = close[i] >= high_100d[i]
-                
-                if is_breakout and is_not_overheated: base_score += 15
+                if close[i] >= high_100d[i] and weekly_ratio < 1.27: base_score += 15
                 
                 conf_score = min(base_score, 99)
         
@@ -726,8 +719,11 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                         is_sell=True; reason_str="趨勢轉弱且破月線"
                     else:
                         action_code="Hold"; reason_str="轉弱(守月線)"
-                elif is_strict_bear and close[i] < ma20[i]:
+                
+                # [修改] 只有在開關開啟(True) 時，才執行「長空破月線」強制出場
+                elif use_strict_bear_exit and is_strict_bear and close[i] < ma20[i]:
                     is_sell=True; reason_str="長空破月線"
+                    
                 elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
                 elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
                 
@@ -758,20 +754,18 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     return df
 
 
-
 # 修改後：傳遞成本參數
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True):
+def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
     
-    # 這裡只展示部分參數組合
     for m in [3.0, 3.5]:
         for r in [25, 30]:
             df_ind = calculate_indicators(raw_df, 10, m, market_df)
             df_slice = df_ind[df_ind['Date'] >= target_start].copy()
             if df_slice.empty: continue
             
-            # [修改] 傳遞 use_chip_strategy
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy)
+            # [修改] 傳遞 use_strict_bear_exit
+            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy, use_strict_bear_exit)
             
             ret = df_res['Cum_Strategy'].iloc[-1] - 1
             if ret > best_ret:
@@ -779,6 +773,8 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
                 best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
                 best_df = df_res
     return best_params, best_df
+
+
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
@@ -1568,7 +1564,12 @@ with st.expander("⚙️ 參數與日期設定", expanded=False):
             
             # [新增] 策略開關
             st.caption("策略組態")
+# ... (原本的籌碼開關)
             enable_chip_strategy = st.toggle("啟用籌碼佈局策略 (Strategy C)", value=True)
+            
+            # [新增] 強制出場開關
+            enable_strict_bear_exit = st.toggle("啟用「長空破月線」強制出場", value=True)
+            st.caption("若關閉，則長空時僅依賴停損或趨勢轉弱出場。")
 
 market_df = get_market_data(start_date, end_date)
 
@@ -1711,7 +1712,8 @@ elif page == "📊 單股深度分析":
                 # 3. 若成功，才執行策略運算
                 best_params, final_df = run_optimization(
                     raw_df, market_df, start_date, current_fee, current_tax, 
-                    use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                    use_chip_strategy=enable_chip_strategy,
+                    use_strict_bear_exit=enable_strict_bear_exit  # <--- 加入參數
                 )
                 validation_result = validate_strategy_robust(raw_df, market_df, 0.7, current_fee, current_tax)
 
@@ -2283,7 +2285,8 @@ elif page == "🚀 科技股掃描":
                             
                         best_params, final_df = run_optimization(
                             raw_df, market_df, start_date, fee_rate=fee_input, tax_rate=tax_input,
-                            use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                            use_chip_strategy=enable_chip_strategy,
+                            use_strict_bear_exit=enable_strict_bear_exit  # <--- 加入參數
                         )
                         
                         
@@ -2717,7 +2720,8 @@ elif page == "💼 持股健診與建議":
                 # 2. 執行策略回測
                 best_params, final_df = run_optimization(
                     raw_df, market_df, start_date, fee_input, tax_input,
-                    use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                    use_chip_strategy=enable_chip_strategy,
+                    use_strict_bear_exit=enable_strict_bear_exit  # <--- 加入參數
                 )
                 
                 if final_df is None or final_df.empty: continue
@@ -3030,7 +3034,8 @@ elif page == "🧪 策略實驗室":
                 # B. 執行策略
                 best_params, strat_df = run_optimization(
                     raw_df, lab_market_df, test_start_date, fee_input, tax_input,
-                    use_chip_strategy=enable_chip_strategy  # <--- 加入參數
+                    use_chip_strategy=enable_chip_strategy,
+                    use_strict_bear_exit=enable_strict_bear_exit  # <--- 加入參數
                 )
                 
                 if strat_df is None or strat_df.empty: continue
