@@ -332,11 +332,7 @@ PRESET_LISTS = {
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [智慧偵測修正版]
-    修正成交量怪異問題：
-    在執行「斷崖偵測」時，同步檢查成交量是否出現對應的暴增。
-    只有當「股價崩跌」且「成交量暴增」同時發生時，才執行成交量還原。
-    避免對 Yahoo 已經還原過的成交量進行二次放大。
+    [修正版] 保留 Dividends 欄位以計算含息報酬。
     """
     ticker = str(ticker).strip().upper()
     
@@ -363,9 +359,7 @@ def get_stock_data(ticker, start_date, end_date):
             df = df.sort_index(ascending=True)
 
             try:
-                # ==========================================
                 # A. 基礎事件還原 (Metadata)
-                # ==========================================
                 if 'Stock Splits' in df.columns or 'Dividends' in df.columns:
                     df_rev = df.sort_index(ascending=False).copy()
                     opens, highs, lows, closes = df_rev['Open'].values, df_rev['High'].values, df_rev['Low'].values, df_rev['Close'].values
@@ -378,6 +372,7 @@ def get_stock_data(ticker, start_date, end_date):
                         if splits[i] > 0:
                             p_cum *= (1.0 / splits[i])
                             v_cum *= splits[i]
+                        # 這裡的還原邏輯主要是為了讓 K 線連續，但我們保留原始 Dividends 欄位供回測計算
                         if divs[i] > 0:
                             price_before = closes[i] + divs[i]
                             if price_before > 0: p_cum *= (1 - divs[i] / price_before)
@@ -446,8 +441,15 @@ def get_stock_data(ticker, start_date, end_date):
             df = df.loc[mask].reset_index()
             df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
             
-            cols = ['Dividends', 'Stock Splits']
-            df = df.drop(columns=[c for c in cols if c in df.columns], errors='ignore')
+            # [修正] 移除 'Stock Splits'，但保留 'Dividends'
+            cols_to_drop = ['Stock Splits']
+            df = df.drop(columns=[c for c in cols_to_drop if c in df.columns], errors='ignore')
+            
+            # 確保 Dividends 欄位存在且無 NaN
+            if 'Dividends' not in df.columns:
+                df['Dividends'] = 0.0
+            else:
+                df['Dividends'] = df['Dividends'].fillna(0.0)
             
             if not df.empty and 'Close' in df.columns:
                 return df, t
@@ -623,16 +625,21 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v6 (Strict Bear Exit Toggle):
-    新增 use_strict_bear_exit 參數，控制是否在「嚴格空頭且破月線」時強制賣出。
+    執行策略回測 v7 (Total Return & MA Entanglement Logic):
+    1. 修正報酬率計算：納入配息還原 (Total Return)。
     """
     df = data.copy()
+    
+    # [修正] 確保有 Dividends 欄位
+    if 'Dividends' not in df.columns:
+        df['Dividends'] = 0.0
+        
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
     
     position = 0; days_held = 0; entry_price = 0.0; trade_type = 0
     
-    # 轉為 numpy array 加速迭代
+    # 轉為 numpy array
     close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
     bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
     ma240 = df['MA240'].fillna(method='bfill').values
@@ -653,7 +660,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
         # [核心判斷] 趨勢狀態
         is_ma240_down = False
         is_ma60_up = False
-        
         if i > 0:
             if ma240[i] < ma240[i-1]: is_ma240_down = True
             if ma60[i] > ma60[i-1]: is_ma60_up = True
@@ -666,16 +672,16 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             is_buy = False
             rsi_threshold_A = 60 if is_strict_bear else 55
             
-            # 策略 A
+            # 策略 A: 動能突破
             if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                 is_buy=True; trade_type=1; reason_str="動能突破"
-            # 策略 B
+            # 策略 B: 均線回測
             elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                 is_buy=True; trade_type=1; reason_str="均線回測"
-            # 策略 C
+            # 策略 C: 籌碼佈局
             elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                 is_buy=True; trade_type=3; reason_str="籌碼佈局"
-            # 策略 D
+            # 策略 D: 超賣反彈
             elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                 is_buy=True; trade_type=2; reason_str="超賣反彈"
             
@@ -720,11 +726,8 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                         is_sell=True; reason_str="趨勢轉弱且破月線"
                     else:
                         action_code="Hold"; reason_str="轉弱(守月線)"
-                
-                # [修改] 只有在開關開啟(True) 時，才執行「長空破月線」強制出場
                 elif use_strict_bear_exit and is_strict_bear and close[i] < ma20[i]:
                     is_sell=True; reason_str="長空破月線"
-                    
                 elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
                 elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
                 
@@ -743,13 +746,25 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     df['Target_Price']=target_prices; df['Return_Label']=return_labels
     df['Confidence'] = confidences
     
+    # === [關鍵修正] 計算含息報酬 (Total Return) ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
-    df['Market_Return'] = df['Close'].pct_change().fillna(0)
+    
+    # 原始報酬率 (只看價差)
+    # df['Market_Return'] = df['Close'].pct_change().fillna(0)  <-- 舊邏輯
+    
+    # 新邏輯: (今日收盤 + 今日配息 - 昨日收盤) / 昨日收盤
+    # 注意: Dividends 為 0 的日子，這公式就等於 pct_change
+    df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
+    df['Market_Return'] = df['Market_Return'].fillna(0)
+    
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
+    
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
+    
     df['Strategy_Return'] = df['Strategy_Return'] - cost_series
+    
     df['Cum_Strategy']=(1+df['Strategy_Return']).cumprod()
     df['Cum_Market']=(1+df['Market_Return']).cumprod()
     return df
@@ -946,10 +961,8 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.6 (Long-Term MA Filter):
-    - 加分條件維持不變。
-    - [新增] 趨勢買入濾網: 若買進訊號發生時，收盤價未同時站上 MA120 與 MA240，大幅扣分 (-20)。
-      這能確保只有在長線架構轉強(或至少克服壓力)時，才給予高分。
+    Alpha Score v5.7 (MA Congestion Penalty):
+    - [新增] 均線糾結扣分: 若 MA60/120/240 差距 < 5% (糾結)，則趨勢買入扣分 (容易被洗)。
     """
     df = df.copy()
 
@@ -960,7 +973,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
-    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean() # 確保有 MA120
+    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240, min_periods=60).mean()
     if 'MA30' not in df.columns: df['MA30'] = df['Close'].rolling(30).mean()
     if 'High_100d' not in df.columns: df['High_100d'] = df['Close'].rolling(100).max()
@@ -992,7 +1005,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     vol_ratio = volume / vol_ma20
     score_vol = np.where(vol_ratio > 1, np.clip((vol_ratio - 1) * 5, 0, 10), 0)
     
-    # 趨勢判定 (年線下彎且季線無力)
+    # 趨勢判定
     ma240_slope_neg = np.zeros(len(df), dtype=bool)
     ma60_slope_pos = np.zeros(len(df), dtype=bool)
     if len(ma240) > 1:
@@ -1041,12 +1054,22 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_panic_strat = reason_series.str.contains('反彈|超賣').values
     panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
     
-    # [新增] 長均線濾網 (Long MA Filter)
-    # 條件：未同時站上 MA120 與 MA240
-    # 注意：若是抄底策略(is_panic_strat)，因為本來就是逆勢，所以不受此限制(否則永遠抄不到底)
-    # 此濾網主要針對「趨勢突破」類型的策略
+    # [長均線濾網] (未站上)
     not_above_long_ma = (close < ma120) | (close < ma240)
     trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
+    
+    # [新增] 均線糾結濾網 (MA Congestion)
+    # 計算季、半、年三線的散開程度
+    ma_stack = np.vstack([ma60, ma120, ma240])
+    ma_max = np.max(ma_stack, axis=0)
+    ma_min = np.min(ma_stack, axis=0)
+    # 糾結率 = (最高均線 - 最低均線) / 收盤價
+    congestion_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
+    
+    # 若糾結率 < 5% (0.05) 代表均線很黏，容易盤整
+    is_congested = congestion_ratio < 0.05
+    # 若是趨勢買盤且遇到糾結，扣分 (因為趨勢尚未發散)
+    congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
 
     # 基礎買進脈衝
     buy_pulse = 85 + (analog_modulation * 0.5)
@@ -1056,10 +1079,11 @@ def calculate_alpha_score(df, margin_df, short_df):
     buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
     # 2. 趨勢買入但未站上長均扣分 (-20)
     buy_pulse = np.where(trend_buy_penalty_mask, buy_pulse - 20, buy_pulse)
+    # 3. [新增] 均線糾結扣分 (-15)
+    buy_pulse = np.where(congestion_penalty_mask, buy_pulse - 15, buy_pulse)
     
     # 限制範圍
-    # 如果觸發任一扣分，最高分限制在 65 (偏弱勢買點)
-    any_penalty = panic_bear_penalty_mask | trend_buy_penalty_mask
+    any_penalty = panic_bear_penalty_mask | trend_buy_penalty_mask | congestion_penalty_mask
     buy_pulse = np.clip(buy_pulse, 85 if not np.any(any_penalty) else 60, 99)
     
     alpha_score = np.where(buy_mask, buy_pulse, alpha_score)
@@ -1070,6 +1094,7 @@ def calculate_alpha_score(df, margin_df, short_df):
         # 評語警示
         log_msg = np.where(panic_bear_penalty_mask, log_msg + " [⚠️逆勢抄底]", log_msg)
         log_msg = np.where(trend_buy_penalty_mask, log_msg + " [⚠️未站上長均]", log_msg)
+        log_msg = np.where(congestion_penalty_mask, log_msg + " [⚠️均線糾結]", log_msg)
 
     sell_mask = (action == 'Sell')
     sell_pulse = -85 + (analog_modulation * 0.5)
