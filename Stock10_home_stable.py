@@ -982,10 +982,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.8 (Rolling Congestion Index):
-    - [升級] 均線糾結扣分: 改用「20日平均糾結度」。
-      只有當過去20天均線持續黏合 (平均差距 < 5%)，才視為結構性糾結並扣分。
-      避免將「黃金交叉」瞬間的靠近誤判為糾結。
+    Alpha Score v5.9 (Extreme Congestion Penalty):
+    - [新增] 極度糾結扣分: 若 20日平均糾結度 < 2.5%，代表變盤在即但方向未明，大幅扣分 (-25)。
+    - 一般糾結 (2.5%~5%): 維持扣分 (-15)。
     """
     df = df.copy()
 
@@ -1081,44 +1080,55 @@ def calculate_alpha_score(df, margin_df, short_df):
     not_above_long_ma = (close < ma120) | (close < ma240)
     trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
     
-    # [升級版] 均線糾結濾網 (Rolling Congestion Index)
+    # [均線糾結濾網]
     ma_stack = np.vstack([ma60, ma120, ma240])
     ma_max = np.max(ma_stack, axis=0)
     ma_min = np.min(ma_stack, axis=0)
-    # 1. 瞬時差距
     raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
-    
-    # 2. 轉換為 Series 計算 20日均值 (這裡需要 pandas 協助)
-    # 將 numpy 轉回 pandas series 進行 rolling
     gap_series = pd.Series(raw_gap_ratio)
-    # 填補空值為 1.0 (非糾結)，避免初期資料被誤判
     congestion_index = gap_series.rolling(20, min_periods=1).mean().fillna(1.0).values
     
-    # 3. 判斷糾結：平均差距 < 5%
-    is_congested = congestion_index < 0.05
+    # [修正] 分級定義糾結
+    # 極度糾結: 平均差距 < 2.5%
+    is_extremely_congested = congestion_index < 0.025
+    # 一般糾結: 2.5% <= 平均差距 < 5%
+    is_congested = (congestion_index >= 0.025) & (congestion_index < 0.05)
     
+    # 只有趨勢策略才受糾結懲罰 (抄底策略不受影響)
+    extreme_congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_extremely_congested
     congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
 
     # 基礎買進脈衝
     buy_pulse = 85 + (analog_modulation * 0.5)
     
     # 執行扣分
+    # 1. 逆勢抄底扣分 (-15)
     buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
+    # 2. 未站上長均扣分 (-20)
     buy_pulse = np.where(trend_buy_penalty_mask, buy_pulse - 20, buy_pulse)
+    # 3. 均線糾結扣分
+    # 若極度糾結 -> 扣 25 分
+    buy_pulse = np.where(extreme_congestion_penalty_mask, buy_pulse - 25, buy_pulse)
+    # 若一般糾結 -> 扣 15 分
     buy_pulse = np.where(congestion_penalty_mask, buy_pulse - 15, buy_pulse)
     
     # 限制範圍
-    any_penalty = panic_bear_penalty_mask | trend_buy_penalty_mask | congestion_penalty_mask
-    buy_pulse = np.clip(buy_pulse, 85 if not np.any(any_penalty) else 60, 99)
+    # 只要觸發任何一種 Penalty，分數上限鎖在 65 (不建議追價)
+    any_penalty = panic_bear_penalty_mask | trend_buy_penalty_mask | extreme_congestion_penalty_mask | congestion_penalty_mask
+    buy_pulse = np.clip(buy_pulse, 85 if not np.any(any_penalty) else 65, 99)
     
     alpha_score = np.where(buy_mask, buy_pulse, alpha_score)
     
     if 'Reason' in df.columns:
         buy_reasons = df['Reason'].fillna("")
         log_msg = np.where(buy_mask, "買進: " + buy_reasons, log_msg)
+        
+        # 評語警示
         log_msg = np.where(panic_bear_penalty_mask, log_msg + " [⚠️逆勢抄底]", log_msg)
         log_msg = np.where(trend_buy_penalty_mask, log_msg + " [⚠️未站上長均]", log_msg)
         log_msg = np.where(congestion_penalty_mask, log_msg + " [⚠️均線糾結]", log_msg)
+        # 極度糾結使用不同警示
+        log_msg = np.where(extreme_congestion_penalty_mask, log_msg + " [⛔極度糾結]", log_msg)
 
     sell_mask = (action == 'Sell')
     sell_pulse = -85 + (analog_modulation * 0.5)
