@@ -978,233 +978,152 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v7.0 (Detail Breakdown):
-    - 功能: 除了計算分數，還產生詳細的 HTML 格式評分報告 (Score_Detail)，供圖表 Hover 使用。
+    Alpha Score v8.0 (Analog & Signal-Synced):
+    - 買賣點精確對齊策略回測結果 (Buy=+95, Sell=-95)。
+    - 非交易日採用連續性技術指標評分，呈現類比 (Analog) 波動。
     """
     df = df.copy()
 
-    # 防呆
+    # 防呆：若無策略結果，回傳備用版
     if 'Action' not in df.columns or 'Position' not in df.columns:
         return calculate_alpha_score_technical_fallback(df)
 
-    # 1. 補全指標
+    # 1. 補全基礎指標 (若上游未計算)
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
-    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
-    if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240, min_periods=60).mean()
-    if 'MA30' not in df.columns: df['MA30'] = df['Close'].rolling(30).mean()
-    if 'High_100d' not in df.columns: df['High_100d'] = df['Close'].rolling(100).max()
-    if 'Close_Lag5' not in df.columns: df['Close_Lag5'] = df['Close'].shift(5)
-    
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     
-    # 準備 Raw Data Arrays
-    action = df['Action'].values
-    position = pd.Series(df['Position'].values).ffill().fillna(0).values
+    # 準備 Numpy Arrays 加速運算
     close = df['Close'].values
-    ma20 = df['MA20'].ffill().values
-    ma60 = df['MA60'].ffill().values
-    ma120 = df['MA120'].fillna(method='bfill').values
-    ma240 = df['MA240'].fillna(method='bfill').values
-    ma30 = df['MA30'].ffill().values
-    high_100d = df['High_100d'].fillna(0).values
-    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
+    ma20 = df['MA20'].fillna(method='bfill').values
+    ma60 = df['MA60'].fillna(method='bfill').values
+    rsi = df['RSI'].fillna(50).values
     volume = df['Volume'].fillna(0).values
     vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
-    rsi = df['RSI'].fillna(50).values
     
-    # 2. 計算「類比調節因子」 (Analog Modulators)
-    bias_val = (close - ma20) / ma20 * 100
-    score_bias = np.clip(bias_val * 2, -15, 15)
-    score_rsi = np.clip((rsi - 50) * 0.6, -15, 15)
+    # 讀取策略訊號
+    actions = df['Action'].values
+    positions = df['Position'].values # 0=空手, 1=持倉
+
+    # ==========================================
+    # A. 計算連續性技術分數 (Analog Base Score)
+    # ==========================================
+    # 範圍設計：約 -50 ~ +50，作為背景波動
     
+    # 1. 趨勢分數 (Trend): 價格在均線之上給分
+    score_trend = np.zeros(len(df))
+    score_trend += np.where(close > ma20, 15, -15)
+    score_trend += np.where(close > ma60, 15, -15)
+    score_trend += np.where(ma20 > ma60, 10, -5) # 多頭排列
+
+    # 2. 動能分數 (Momentum): RSI 的連續變化
+    # 將 RSI 50 定為 0 分，每增減 1 點貢獻 0.8 分，並限制範圍
+    score_rsi = (rsi - 50) * 1.2 
+    score_rsi = np.clip(score_rsi, -25, 25)
+
+    # 3. 量能分數 (Volume): 量增價漲
     vol_ratio = volume / vol_ma20
-    score_vol = np.where(vol_ratio > 1, np.clip((vol_ratio - 1) * 5, 0, 10), 0)
-    
-    # 3. 趨勢判定
-    ma240_slope_neg = np.zeros(len(df), dtype=bool)
-    ma60_slope_pos = np.zeros(len(df), dtype=bool)
-    if len(ma240) > 1:
-        ma240_slope_neg[1:] = ma240[1:] < ma240[:-1]
-        ma60_slope_pos[1:] = ma60[1:] > ma60[:-1]
-    
-    penalty_mask = ma240_slope_neg & (~ma60_slope_pos)
-    score_trend_penalty = np.where(penalty_mask, -15, 0)
-    
-    # 4. 加分條件 (Bonuses)
-    # A. MA30 乖離
-    cond_ma30_gap = (close > ma30 * 1.04)
-    score_ma30 = np.where(cond_ma30_gap, 5, 0)
-    
-    # B. 百日突破
-    weekly_ratio = np.divide(close, close_lag5, out=np.ones_like(close), where=close_lag5!=0)
-    cond_not_overheated = weekly_ratio < 1.27
-    cond_breakout = (close >= high_100d)
-    score_breakout = np.where(cond_breakout & cond_not_overheated, 15, 0)
-    
-    # C. 均線支撐 (MA Support)
-    above_ma60 = (close > ma60).astype(int)
-    above_ma120 = (close > ma120).astype(int)
-    above_ma240 = (close > ma240).astype(int)
-    ma_support_count = above_ma60 + above_ma120 + above_ma240
-    score_ma_support = np.select([ma_support_count == 3, ma_support_count == 2, ma_support_count == 1], [20, 10, 5], default=0)
-    
-    # D. 發散噴出 (Expansion)
-    ma_stack = np.vstack([ma60, ma120, ma240])
-    ma_max = np.max(ma_stack, axis=0)
-    ma_min = np.min(ma_stack, axis=0)
-    raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
-    gap_series = pd.Series(raw_gap_ratio)
-    # 60日平均 (修正為 60MA 糾結)
-    congestion_index = gap_series.rolling(60, min_periods=1).mean().fillna(1.0).values
-    congestion_slope = pd.Series(congestion_index).diff().fillna(0).values
-    
-    cond_expansion = (ma_support_count == 3) & (congestion_slope > 0)
-    score_expansion = np.where(cond_expansion, 15, 0)
-    
-    # 綜合調節值
-    analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout + score_ma_support + score_expansion
+    is_up = close > df['Close'].shift(1).fillna(method='bfill').values
+    score_vol = np.where((vol_ratio > 1.2) & is_up, 10, 0)
+    score_vol = np.where((vol_ratio > 1.2) & (~is_up), -10, score_vol)
 
-    # 5. 狀態錨定與事件處理
-    alpha_score = np.zeros(len(df))
-    log_msg = np.full(len(df), "", dtype=object) # 簡單評語
-    detail_html = [] # 詳細 HTML 列表
+    # 4. 乖離修正 (Bias Penalty)
+    bias = (close - ma20) / ma20
+    score_bias = np.where(bias > 0.15, -10, 0) # 乖離過大扣分(避免過熱)
+    
+    # 合成背景技術分 (-60 ~ +60)
+    raw_analog = score_trend + score_rsi + score_vol + score_bias
 
-    # 準備事件 Mask
-    buy_mask = (action == 'Buy')
-    sell_mask = (action == 'Sell')
+    # ==========================================
+    # B. 訊號錨定與狀態融合 (Signal Anchoring)
+    # ==========================================
+    final_score = np.zeros(len(df))
+    detail_html = []
     
-    # 準備 Penalty Mask
-    reason_series = df['Reason'].fillna("").astype(str)
-    is_panic_strat = reason_series.str.contains('反彈|超賣').values
-    panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
-    
-    not_above_long_ma = (close < ma120) | (close < ma240)
-    trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
-    
-    is_extremely_congested = congestion_index < 0.03
-    is_congested = (congestion_index >= 0.03) & (congestion_index < 0.05)
-    
-    extreme_congestion_penalty_mask = buy_mask & is_extremely_congested
-    congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
+    # 用於平滑的暫存變數
+    last_score = 0.0
 
-    # --- 逐行計算詳細分數並生成 HTML ---
-    # 為了生成 hover text，這裡使用迴圈處理 (N 不大，效能可接受)
     for i in range(len(df)):
-        # 1. 決定基礎分 (Base)
-        base_val = 0
-        state_str = ""
+        act = actions[i]
+        pos = positions[i]
         
-        if buy_mask[i]:
-            base_val = 85
-            state_str = "🔥 買進訊號"
-        elif sell_mask[i]:
-            base_val = -85
-            state_str = "⚡ 賣出訊號"
-        elif position[i] == 1:
-            base_val = 60
-            state_str = "✊ 持倉監控"
+        # 1. 決定目標分數 (Target Score)
+        if act == 'Buy':
+            # 買進日：強制極高分 (代表訊號觸發)
+            current_score = 95.0
+            status_desc = "🚀 策略買進"
+            c_status = "#ff1744"
+            
+        elif act == 'Sell':
+            # 賣出日：強制極低分 (代表訊號結束)
+            current_score = -95.0
+            status_desc = "⚡ 策略賣出"
+            c_status = "#00e676"
+            
+        elif pos == 1:
+            # 持倉中：以 50 分為基準，疊加技術波動
+            # 讓分數在 20 ~ 90 之間浮動，體現持股強弱
+            base = 50.0
+            current_score = base + (raw_analog[i] * 0.8) # 係數調整波動幅度
+            current_score = np.clip(current_score, 20, 90) # 限制在正值區間
+            status_desc = "✊ 持倉續抱"
+            c_status = "#ff5252"
+            
         else:
-            base_val = -30
-            state_str = "👀 空手觀望"
-            
-        # 2. 事件扣分處理 (Event Penalties)
-        event_penalty = 0
-        ep_list = []
-        if panic_bear_penalty_mask[i]:
-            event_penalty -= 15; ep_list.append("逆勢抄底 (-15)")
-        if trend_buy_penalty_mask[i]:
-            event_penalty -= 20; ep_list.append("未站上長均 (-20)")
-        if extreme_congestion_penalty_mask[i]:
-            event_penalty -= 30; ep_list.append("極度糾結 (-30)")
-        elif congestion_penalty_mask[i]:
-            event_penalty -= 15; ep_list.append("均線糾結 (-15)")
-            
-        # 3. 原始加總 (Raw Sum)
-        # 注意: 買賣訊號時，analog_modulation 減半
-        mod_factor = 0.5 if (buy_mask[i] or sell_mask[i]) else 1.0
-        
-        # 加分項
-        bonuses = score_ma30[i] + score_breakout[i] + score_ma_support[i] + score_expansion[i]
-        # 扣分項 (年線蓋頭)
-        penalties = score_trend_penalty[i]
-        # 浮動項
-        fluctuation = score_bias[i] + score_rsi[i] + score_vol[i]
-        
-        total_mod = (fluctuation + bonuses + penalties) * mod_factor
-        raw_score = base_val + total_mod + event_penalty
-        
-        # 4. 限制範圍
-        # 若有重大違規，上限鎖 60/65
-        cap = 100
-        if buy_mask[i]:
-            any_penalty = panic_bear_penalty_mask[i] | trend_buy_penalty_mask[i] | extreme_congestion_penalty_mask[i] | congestion_penalty_mask[i]
-            if any_penalty: cap = 65 if not extreme_congestion_penalty_mask[i] else 60
-            raw_score = min(raw_score, 99) # 買進最高99
-            
-        final_val = np.clip(raw_score, -100, cap)
-        alpha_score[i] = final_val # 存入陣列 (暫不平滑，保留銳利度)
+            # 空手/觀望：以 -30 分為基準
+            # 讓分數在 -80 ~ 10 之間浮動
+            base = -30.0
+            current_score = base + (raw_analog[i] * 0.6)
+            current_score = np.clip(current_score, -90, 10)
+            status_desc = "👀 空手觀望"
+            c_status = "#b9f6ca"
 
-        # 5. 建構 HTML String
-        # 顏色定義
-        c_val = "#ef5350" if final_val > 0 else "#00e676"
-        c_pos = "#ff8a80"
-        c_neg = "#b9f6ca"
+        # 2. 平滑處理 (Smoothing) - 僅針對非買賣點
+        # 買賣點不平滑，確保視覺上的「乾脆」
+        if act in ['Buy', 'Sell']:
+            final_val = current_score
+        else:
+            # 使用 EMA 讓曲線圓滑 (alpha=0.6 代表新值佔 60%)
+            final_val = (last_score * 0.4) + (current_score * 0.6)
         
-        txt = f"<b>總分: <span style='color:{c_val}; font-size:14px'>{int(final_val)}</span></b><br>"
-        txt += f"<span style='color:#888'>──────────</span><br>"
-        txt += f"<b>[{state_str}] 基分: {base_val}</b><br>"
+        last_score = final_val
+        final_score[i] = final_val
+
+        # 3. 生成 HTML 詳細報告 (Hover Tooltip)
+        val_int = int(final_val)
         
-        # 技術浮動
-        if fluctuation != 0:
-            txt += f"<b>技術浮動: {fluctuation:.1f}</b><br>"
-            if score_bias[i] != 0: txt += f" • 乖離: {score_bias[i]:+.1f}<br>"
-            if score_rsi[i] != 0: txt += f" • RSI: {score_rsi[i]:+.1f}<br>"
-            if score_vol[i] > 0: txt += f" • 量能: {score_vol[i]:+.1f}<br>"
-            
-        # 加分項目
-        if bonuses > 0:
-            txt += f"<b><span style='color:{c_pos}'>加分項目: +{int(bonuses)}</span></b><br>"
-            if score_ma_support[i] > 0: txt += f" • 均線支撐: +{int(score_ma_support[i])}<br>"
-            if score_expansion[i] > 0: txt += f" • 發散噴出: +{int(score_expansion[i])}<br>"
-            if score_breakout[i] > 0: txt += f" • 百日突破: +{int(score_breakout[i])}<br>"
-            if score_ma30[i] > 0: txt += f" • 強勢乖離: +{int(score_ma30[i])}<br>"
-            
-        # 扣分項目
-        total_pen = penalties + event_penalty
-        if total_pen < 0:
-            txt += f"<b><span style='color:{c_neg}'>扣分項目: {int(total_pen)}</span></b><br>"
-            if penalties < 0: txt += f" • 年線蓋頭: {int(penalties)}<br>"
-            for ep in ep_list:
-                txt += f" • {ep}<br>"
-                
+        # 顏色邏輯
+        c_score = "#ff5252" if val_int > 0 else "#00e676"
+        
+        txt = f"<b>Alpha Score: <span style='color:{c_score}; font-size:16px'>{val_int}</span></b><br>"
+        txt += f"<span style='color:#888; font-size:12px'>────── 狀態解析 ──────</span><br>"
+        txt += f"<b><span style='color:{c_status}'>{status_desc}</span></b><br>"
+        
+        if act not in ['Buy', 'Sell']:
+            txt += f"技術基底: {raw_analog[i]:.1f}<br>"
+            if score_rsi[i] != 0: txt += f" • RSI貢獻: {score_rsi[i]:+.1f}<br>"
+            if score_trend[i] != 0: txt += f" • 趨勢貢獻: {score_trend[i]:+.1f}<br>"
+            if score_vol[i] != 0: txt += f" • 量能貢獻: {score_vol[i]:+.1f}<br>"
+        else:
+            reason = df['Reason'].iloc[i]
+            txt += f"觸發原因: {reason}<br>"
+
         detail_html.append(txt)
 
-    # 平滑化處理 (僅針對非買賣點)
-    final_series = pd.Series(alpha_score)
-    smoothed_score = final_series.ewm(alpha=0.5, adjust=False).mean().values
-    final_score = np.where(buy_mask | sell_mask, alpha_score, smoothed_score)
-    
+    # 存入 DataFrame
     df['Alpha_Score'] = np.clip(final_score, -100, 100)
-    df['Score_Detail'] = detail_html # [新增] 存入 DataFrame
-
-    # 簡單評語生成 (維持舊邏輯)
-    conditions = [
-        (df['Alpha_Score'] >= 80), (df['Alpha_Score'] >= 50), (df['Alpha_Score'] >= 0),
-        (df['Alpha_Score'] <= -80), (df['Alpha_Score'] <= -50)
-    ]
-    choices = ["🔥 極強勢", "📈 多頭攻勢", "⚖️ 偏多震盪", "⚡ 極弱勢", "📉 空頭修正"]
-    base_log = np.select(conditions, choices, default="☁️ 盤整")
-    df['Score_Log'] = np.where(buy_mask | sell_mask, log_msg, base_log)
+    df['Score_Detail'] = detail_html
     
-    # 補充評語
-    df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & penalty_mask, df['Score_Log'] + " (長空)", df['Score_Log'])
-    rescue_mask = ma240_slope_neg & ma60_slope_pos
-    df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & rescue_mask, df['Score_Log'] + " (轉強)", df['Score_Log'])
-    df['Score_Log'] = np.where(cond_expansion, df['Score_Log'] + " [🚀噴出]", df['Score_Log'])
-    df['Score_Log'] = np.where(ma_support_count == 3, df['Score_Log'] + " [☀️三線]", df['Score_Log'])
-
+    # 產生簡易評語 Log
+    conditions = [
+        (df['Alpha_Score'] >= 80), (df['Alpha_Score'] >= 40), (df['Alpha_Score'] >= 0),
+        (df['Alpha_Score'] <= -80), (df['Alpha_Score'] <= -40)
+    ]
+    choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 偏多震盪", "⚡ 極弱勢", "📉 空頭修正"]
+    df['Score_Log'] = np.select(conditions, choices, default="☁️ 盤整")
+    
+    # 輔助欄位：建議倉位 (將 -100~100 映射到 0~100%)
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
