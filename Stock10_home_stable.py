@@ -1979,8 +1979,22 @@ elif page == "📊 單股深度分析":
                         increasing_line_color='#ef5350', decreasing_line_color='#00bfa5' 
                     ), row=1, col=1)
                     
+                    # 停損基準線 (SuperTrend)
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
+                    
+                    # 季線 (MA60) - 白色半透明
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
+
+                    # [新增] 年線 (MA240) - 紫色
+                    # 使用紫色 (#e040fb) 標示年線，方便區分長期趨勢
+                    if 'MA240' in final_df.columns:
+                        fig.add_trace(go.Scatter(
+                            x=final_df['Date'], 
+                            y=final_df['MA240'], 
+                            mode='lines', 
+                            line=dict(color='#e040fb', width=1.5), 
+                            name='年線 (MA240)'
+                        ), row=1, col=1)
 
                     # 買賣點標記
                     final_df['Buy_Y'] = final_df['Low'] * 0.92
