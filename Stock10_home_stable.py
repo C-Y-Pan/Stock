@@ -300,43 +300,131 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [修復版] 獲取股價資料
-    1. 修正順序：優先嘗試 .TW (上市)，再嘗試 .TWO (上櫃)
-    2. 增加 ETF 相容性
+    [智慧偵測修正版]
+    修正成交量怪異問題：
+    在執行「斷崖偵測」時，同步檢查成交量是否出現對應的暴增。
+    只有當「股價崩跌」且「成交量暴增」同時發生時，才執行成交量還原。
+    避免對 Yahoo 已經還原過的成交量進行二次放大。
     """
     ticker = str(ticker).strip().upper()
     
-    # 如果使用者已經輸入完整代號 (e.g., 2330.TW)，直接使用
-    if ticker.endswith('.TW') or ticker.endswith('.TWO'):
-        candidates = [ticker]
+    candidates = []
+    if '.' in ticker:
+        candidates.append(ticker)
+        base_code = ticker.split('.')[0]
+        candidates.extend([f"{base_code}.TW", f"{base_code}.TWO"])
     else:
-        # [關鍵修正] 0050 等上市股票需優先使用 .TW
-        # 大多數熱門股都是上市，將 .TW 放前面可大幅減少錯誤與等待時間
-        candidates = [f"{ticker}.TW", f"{ticker}.TWO", ticker] 
-        
+        import re
+        if ticker.startswith('00') and re.search('[A-Z]', ticker):
+            candidates = [f"{ticker}.TWO", f"{ticker}.TW", ticker]
+        else:
+            candidates = [f"{ticker}.TW", f"{ticker}.TWO", ticker]
+
     for t in candidates:
         try:
             stock = yf.Ticker(t)
-            # auto_adjust=True 對某些 ETF (如 0050) 有時會導致資料缺失，若失敗可改 False
-            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=True)
+            df = stock.history(start=start_date - timedelta(days=700), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
             
-            # 如果 auto_adjust 抓不到資料，嘗試關閉自動調整 (針對部分 ETF)
-            if df.empty:
-                df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False)
+            if df.empty or len(df) < 5: continue
 
-            if not df.empty and len(df) > 10: # 確保至少有 10 天資料
-                df = df.reset_index()
-                # 處理時區問題，統一轉為無時區格式
-                df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
+            df_safe = df.copy()
+            df = df.sort_index(ascending=True)
+
+            try:
+                # ==========================================
+                # A. 基礎事件還原 (Metadata)
+                # ==========================================
+                if 'Stock Splits' in df.columns or 'Dividends' in df.columns:
+                    df_rev = df.sort_index(ascending=False).copy()
+                    opens, highs, lows, closes = df_rev['Open'].values, df_rev['High'].values, df_rev['Low'].values, df_rev['Close'].values
+                    vols = df_rev['Volume'].values.astype(float)
+                    splits = df_rev['Stock Splits'].values if 'Stock Splits' in df.columns else np.zeros(len(df))
+                    divs = df_rev['Dividends'].values if 'Dividends' in df.columns else np.zeros(len(df))
+                    
+                    p_cum, v_cum = 1.0, 1.0
+                    for i in range(len(df_rev)):
+                        if splits[i] > 0:
+                            p_cum *= (1.0 / splits[i])
+                            v_cum *= splits[i]
+                        if divs[i] > 0:
+                            price_before = closes[i] + divs[i]
+                            if price_before > 0: p_cum *= (1 - divs[i] / price_before)
+                        
+                        opens[i] *= p_cum; highs[i] *= p_cum; lows[i] *= p_cum; closes[i] *= p_cum
+                        vols[i] *= v_cum 
+                    
+                    df['Open'], df['High'], df['Low'], df['Close'], df['Volume'] = opens[::-1], highs[::-1], lows[::-1], closes[::-1], vols[::-1]
+
+                # ==========================================
+                # B. 智慧斷崖偵測 (Smart Gap Detection)
+                # ==========================================
+                p_open = df['Open'].values
+                p_close = df['Close'].values
+                p_high, p_low = df['High'].values, df['Low'].values
+                p_vol = df['Volume'].values.astype(float)
                 
-                # 檢查是否有收盤價
-                if 'Close' in df.columns:
-                    return df, t
-        except Exception as e:
+                p_close = np.nan_to_num(p_close, nan=0.0)
+                
+                for i in range(1, len(df)):
+                    prev_close = p_close[i-1]
+                    curr_open = p_open[i]
+                    
+                    # 取得前後日的成交量 (處理 0 的情況)
+                    prev_vol = p_vol[i-1] if p_vol[i-1] > 0 else 1.0
+                    curr_vol = p_vol[i]
+                    
+                    if prev_close > 5:
+                        ratio = curr_open / prev_close
+                        
+                        # 偵測到股價斷崖 (跌幅 > 40%) -> 疑似分割
+                        if ratio < 0.6:
+                            curr_close = p_close[i]
+                            gap_factor = curr_close / prev_close # 價格縮小因子 (如 0.14)
+                            
+                            # 強制修正歷史價格 (變小)
+                            p_open[:i] *= gap_factor; p_high[:i] *= gap_factor
+                            p_low[:i] *= gap_factor; p_close[:i] *= gap_factor
+                            
+                            # [關鍵修正] 智慧判斷是否需要修正成交量
+                            # 理論上，若價格變 1/7，成交量應變 7倍。
+                            # 我們檢查：現在的量是不是比昨天暴增了 3 倍以上？
+                            # 如果是 -> 代表是原始量，需要還原歷史量 (放大歷史量)
+                            # 如果否 -> 代表 Yahoo 已經還原過量了，我們不動它
+                            
+                            vol_jump_ratio = curr_vol / prev_vol
+                            expected_jump = 1.0 / gap_factor # 理論應跳增倍數 (如 7.0)
+                            
+                            # 判定門檻：實際跳增幅度大於理論的一半 (例如 > 3.5倍)
+                            if vol_jump_ratio > (expected_jump * 0.5):
+                                # 確實暴增了，執行歷史量還原 (放大歷史量，讓它跟現在一樣高)
+                                vol_correction_factor = expected_jump
+                                p_vol[:i] *= vol_correction_factor
+                            else:
+                                # 量沒變，代表 Yahoo 已經調過了，或該 ETF 規模縮水
+                                # 不做任何動作，保持原樣
+                                pass
+                
+                df['Open'], df['High'], df['Low'], df['Close'], df['Volume'] = p_open, p_high, p_low, p_close, p_vol
+
+            except Exception:
+                df = df_safe
+
+            # C. 輸出
+            mask = (df.index >= pd.to_datetime(start_date - timedelta(days=100)).tz_localize(df.index.tz))
+            df = df.loc[mask].reset_index()
+            df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
+            
+            cols = ['Dividends', 'Stock Splits']
+            df = df.drop(columns=[c for c in cols if c in df.columns], errors='ignore')
+            
+            if not df.empty and 'Close' in df.columns:
+                return df, t
+                
+        except Exception:
             continue
             
-    # 若全數失敗，回傳空表
     return pd.DataFrame(), ticker
+
 
 
 @st.cache_data(ttl=5, show_spinner=False)
