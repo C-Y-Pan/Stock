@@ -300,15 +300,13 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [全方位還原版] 智慧獲取股價資料
-    涵蓋：除權息 (Dividends)、股票分割 (Splits)、逆分割 (Reverse Splits)。
-    邏輯：
-    1. 優先使用 auto_adjust=True (Yahoo 自動處理所有還原)。
-    2. 若失敗，抓取原始資料並透過 Adj Close 反推還原係數，強制修正 OHLC。
+    [絕對還原版] 智慧獲取股價資料
+    策略：放棄 auto_adjust=True，一律抓取原始資料 (Raw Data)，
+    並強制使用 Adj Close 進行 OHLC 的校正計算。
     """
     ticker = str(ticker).strip().upper()
     
-    # 定義搜尋候選清單
+    # 候選名單邏輯
     candidates = []
     if '.' in ticker:
         candidates.append(ticker)
@@ -325,40 +323,41 @@ def get_stock_data(ticker, start_date, end_date):
         try:
             stock = yf.Ticker(t)
             
-            # --- 嘗試 1: 要求 API 自動處理分割與股利 ---
-            # actions=True 確保內部有下載分割事件表，計算更準確
-            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=True, actions=True)
+            # [修正點] 
+            # 不再嘗試 auto_adjust=True，因為有時它會失效卻不報錯。
+            # 直接抓 auto_adjust=False (原始資料)
+            df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
             
-            # --- 嘗試 2: 手動還原 (防禦機制) ---
-            if df.empty:
-                # 抓取原始資料 (Raw Data)
-                df = stock.history(start=start_date - timedelta(days=400), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
-                
-                if not df.empty and 'Adj Close' in df.columns:
-                    # 計算還原係數 (此係數同時包含 分割因子 與 股利因子)
-                    # 例如 1拆2，Adj Close 會是 Close 的 0.5 倍，Factor = 0.5
-                    factor = df['Adj Close'] / df['Close'].replace(0, 1)
+            # 資料驗證
+            if not df.empty and len(df) > 5:
+                # [核心還原邏輯]
+                # 只要有 Adj Close，就無視 Close，強制進行還原運算
+                if 'Adj Close' in df.columns:
+                    # 計算還原係數 (Factor)
+                    # 避免分母為 0
+                    close_data = df['Close'].replace(0, np.nan).fillna(method='ffill')
+                    factor = df['Adj Close'] / close_data
                     
-                    # 修正 OHLC
+                    # 修正所有價格欄位
                     df['Open'] = df['Open'] * factor
                     df['High'] = df['High'] * factor
                     df['Low'] = df['Low'] * factor
-                    df['Close'] = df['Adj Close'] # 將收盤價替換為還原值
+                    df['Close'] = df['Adj Close'] # 收盤價直接用調整後價格覆蓋
                     
-                    # 清理欄位
-                    if 'Adj Close' in df.columns: df = df.drop(columns=['Adj Close'])
-
-            # 驗證資料有效性
-            if not df.empty and len(df) > 5:
+                    # 移除 Adj Close 以免混淆
+                    df = df.drop(columns=['Adj Close'])
+                
+                # 格式整理
                 df = df.reset_index()
                 df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
                 
-                if 'Close' in df.columns:
-                    return df, t
+                return df, t
+                
         except Exception:
             continue
             
     return pd.DataFrame(), ticker
+
 
 @st.cache_data(ttl=5, show_spinner=False)
 def get_market_data(start_date, end_date):
