@@ -619,8 +619,9 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003):
     """
-    執行策略回測，加入「年線斜率」濾網：
-    - 若 MA240 下彎：買進條件加嚴，停損條件縮緊。
+    執行策略回測 v2 (MA60 Rescue):
+    - 年線(MA240)下彎 + 季線(MA60)下彎/平 => 嚴格空頭模式 (高門檻、緊停損)。
+    - 年線(MA240)下彎 + 季線(MA60)上彎   => 視為中期轉強，恢復正常買賣標準。
     """
     df = data.copy()
     positions = []; reasons = []; actions = []; target_prices = []
@@ -631,7 +632,7 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     # 轉為 numpy array 加速迭代
     close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
     bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
-    # [新增] 讀取 MA240，並處理 NaN (若無年線數據，預設視為持平，不影響策略)
+    # 讀取 MA240
     ma240 = df['MA240'].fillna(method='bfill').values
     
     volume = df['Volume'].values; vol_ma20 = df['Vol_MA20'].values
@@ -644,38 +645,38 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
         this_target = entry_price * 1.15 if position == 1 else np.nan
         ret_label = ""; conf_score = 0
 
-        # [新增] 判斷年線斜率 (Bearish Trend)
-        # 若當前年線 < 昨日年線，視為下彎 (空頭壓力)
-        is_long_term_bear = False
-        if i > 0 and ma240[i] < ma240[i-1]:
-            is_long_term_bear = True
+        # [核心判斷] 趨勢狀態
+        is_ma240_down = False
+        is_ma60_up = False
+        
+        if i > 0:
+            if ma240[i] < ma240[i-1]: is_ma240_down = True
+            if ma60[i] > ma60[i-1]: is_ma60_up = True
+            
+        # 定義「嚴格空頭 (Strict Bear)」: 年線下彎 且 季線沒有救援
+        is_strict_bear = is_ma240_down and (not is_ma60_up)
 
         # --- 進場邏輯 ---
         if position == 0:
             is_buy = False
             
-            # [邏輯調整] 根據年線斜率調整買入難度
-            # 若年線下彎，要求更強的動能 (RSI 門檻提高)，且禁止逆勢策略
+            # 若是嚴格空頭，RSI 門檻提高到 60；若有季線救援，維持 55
+            rsi_threshold_A = 60 if is_strict_bear else 55
             
             # 策略 A: 動能突破
-            # 若長空，要求 RSI > 60 (原本 55) 且量能更強
-            rsi_threshold_A = 60 if is_long_term_bear else 55
-            
             if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                 is_buy=True; trade_type=1; reason_str="動能突破"
             
             # 策略 B: 均線回測
-            # [嚴格限制] 若年線下彎，禁止接回測 (因容易是下跌中繼)
-            elif not is_long_term_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
+            # 只有在「嚴格空頭」時才禁止接回測；若季線上彎，允許接回測
+            elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                 is_buy=True; trade_type=1; reason_str="均線回測"
             
             # 策略 C: 籌碼佈局
-            # 若長空，需要更嚴格的底部確認
-            elif not is_long_term_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
+            elif not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                 is_buy=True; trade_type=3; reason_str="籌碼佈局"
             
-            # 策略 D: 超賣反彈 (搶反彈)
-            # 搶反彈不受年線限制 (本來就是逆勢)，但需嚴格遵守
+            # 策略 D: 超賣反彈 (逆勢策略不受趨勢限制，但需嚴守)
             elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                 is_buy=True; trade_type=2; reason_str="超賣反彈"
             
@@ -684,9 +685,12 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
                 
                 # === 計算信心值 ===
                 base_score = 60
-                # 若年線下彎還硬買，基礎分扣 10 分
-                if is_long_term_bear: base_score -= 10
+                # 只有嚴格空頭才扣分
+                if is_strict_bear: base_score -= 10
                 
+                # 若年線下彎但季線上彎，這是轉折特徵，微幅加分
+                if is_ma240_down and is_ma60_up: base_score += 5
+
                 if volume[i] > vol_ma20[i] * 1.5: base_score += 15
                 elif volume[i] > vol_ma20[i]: base_score += 8
                 
@@ -709,25 +713,24 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
             
             is_sell = False
             
-            # [邏輯調整] 根據年線斜率調整賣出意願
-            # 正常停損 10%
-            # 若年線下彎 (長空)，停損縮緊至 6%
-            stop_loss_limit = -0.06 if is_long_term_bear else -0.10
+            # [停損調整]
+            # 嚴格空頭: -6%
+            # 季線救援或多頭: -10%
+            stop_loss_limit = -0.06 if is_strict_bear else -0.10
             
-            # 停損 check
             if drawdown < stop_loss_limit:
                 is_sell=True; reason_str=f"觸發停損({stop_loss_limit*100:.0f}%)"; action_code="Sell"
             
-            # 鎖倉期 (長空時縮短鎖倉期，有賺就跑)
-            elif days_held <= (2 if is_long_term_bear else 3):
+            # 鎖倉期
+            elif days_held <= (2 if is_strict_bear else 3):
                 action_code="Hold"; reason_str="鎖倉觀察"
             
             # 條件出場
             else:
                 if trade_type==1 and trend[i]==-1: 
                     is_sell=True; reason_str="趨勢轉弱"
-                # [新增] 若長空且跌破月線，立刻出場 (不凹單)
-                elif is_long_term_bear and close[i] < ma20[i]:
+                # 嚴格空頭且破月線才強制走；若有季線保護，允許稍微震盪
+                elif is_strict_bear and close[i] < ma20[i]:
                     is_sell=True; reason_str="長空破月線"
                     
                 elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
@@ -751,7 +754,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     # === 計算含成本報酬 ===
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
-    
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     
     cost_series = pd.Series(0.0, index=df.index)
@@ -956,8 +958,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v5.2 (Trend Aware):
-    加入年線 (MA240) 斜率作為重大權重因子。
+    Alpha Score v5.3 (Trend Aware + MA60 Rescue):
+    - 年線下彎且季線無力：扣分 (空頭格局)。
+    - 年線下彎但季線上彎：不扣分 (視為中期轉強/救援)。
     """
     df = df.copy()
 
@@ -966,7 +969,7 @@ def calculate_alpha_score(df, margin_df, short_df):
 
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    # 補算 MA240
+    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240, min_periods=60).mean()
     
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
@@ -975,7 +978,8 @@ def calculate_alpha_score(df, margin_df, short_df):
     position = pd.Series(df['Position'].values).ffill().fillna(0).values
     close = df['Close'].values
     ma20 = df['MA20'].ffill().values
-    ma240 = df['MA240'].fillna(method='bfill').values # 避免空值
+    ma60 = df['MA60'].ffill().values
+    ma240 = df['MA240'].fillna(method='bfill').values
     
     volume = df['Volume'].fillna(0).values
     vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
@@ -991,13 +995,17 @@ def calculate_alpha_score(df, margin_df, short_df):
     vol_ratio = volume / vol_ma20
     score_vol = np.where(vol_ratio > 1, np.clip((vol_ratio - 1) * 5, 0, 10), 0)
     
-    # [新增] 年線趨勢因子 (Long-term Trend Penalty)
-    # 若當前 MA240 < 昨日 MA240 => 扣分
+    # [修正] 年線趨勢判定 (含季線救援邏輯)
     ma240_slope_neg = np.zeros(len(df), dtype=bool)
+    ma60_slope_pos = np.zeros(len(df), dtype=bool)
+    
     if len(ma240) > 1:
         ma240_slope_neg[1:] = ma240[1:] < ma240[:-1]
+        ma60_slope_pos[1:] = ma60[1:] > ma60[:-1]
     
-    score_trend_penalty = np.where(ma240_slope_neg, -15, 0)
+    # 扣分條件：年線下彎 且 季線沒有上彎 (沒有救援)
+    penalty_mask = ma240_slope_neg & (~ma60_slope_pos)
+    score_trend_penalty = np.where(penalty_mask, -15, 0)
     
     # 綜合調節值
     analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty
@@ -1013,8 +1021,13 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     # 基礎 Log
     base_log_msg = np.where(position == 1, "持倉監控", "空手觀望")
-    # 若年線下彎，強制加入警語
-    base_log_msg = np.where(ma240_slope_neg, base_log_msg + " [⚠️年線蓋頭-15]", base_log_msg)
+    
+    # 若被扣分 => 顯示警告
+    base_log_msg = np.where(penalty_mask, base_log_msg + " [⚠️年線蓋頭]", base_log_msg)
+    
+    # 若年線下彎但季線救援 => 顯示提示
+    rescue_mask = ma240_slope_neg & ma60_slope_pos
+    base_log_msg = np.where(rescue_mask, base_log_msg + " [季線救援中]", base_log_msg)
     
     log_msg = base_log_msg
 
@@ -1056,8 +1069,9 @@ def calculate_alpha_score(df, margin_df, short_df):
     base_log = np.select(conditions, choices, default="☁️ 盤整")
     df['Score_Log'] = np.where(buy_mask | sell_mask, log_msg, base_log)
     
-    # 若年線下彎，評語顯示也要提示
-    df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & ma240_slope_neg, df['Score_Log'] + " (長空)", df['Score_Log'])
+    # 在評語中補充趨勢狀態
+    df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & penalty_mask, df['Score_Log'] + " (長空)", df['Score_Log'])
+    df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & rescue_mask, df['Score_Log'] + " (轉強)", df['Score_Log'])
     
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
