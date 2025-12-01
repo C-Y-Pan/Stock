@@ -619,9 +619,10 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003):
     """
-    執行策略回測 v2 (MA60 Rescue):
-    - 年線(MA240)下彎 + 季線(MA60)下彎/平 => 嚴格空頭模式 (高門檻、緊停損)。
-    - 年線(MA240)下彎 + 季線(MA60)上彎   => 視為中期轉強，恢復正常買賣標準。
+    執行策略回測 v3 (Relaxed & Filtered):
+    1. 停損放寬至 -12% (正常) / -10% (嚴格)。
+    2. 出場增加濾網：SuperTrend 轉弱且跌破月線才賣。
+    3. 嚴格空頭定義加嚴：需同時跌破季線與月線。
     """
     df = data.copy()
     positions = []; reasons = []; actions = []; target_prices = []
@@ -632,7 +633,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     # 轉為 numpy array 加速迭代
     close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
     bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
-    # 讀取 MA240
     ma240 = df['MA240'].fillna(method='bfill').values
     
     volume = df['Volume'].values; vol_ma20 = df['Vol_MA20'].values
@@ -653,41 +653,39 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
             if ma240[i] < ma240[i-1]: is_ma240_down = True
             if ma60[i] > ma60[i-1]: is_ma60_up = True
             
-        # [修正 1] 定義「嚴格空頭 (Strict Bear)」
-        # 原本邏輯: is_strict_bear = is_ma240_down and (not is_ma60_up)
-        # 修正後邏輯: 必須同時滿足 "股價也在季線下" 才是真的空頭。
-        # 如果股價已經站上季線，代表主力已經在拉抬，此時不該用嚴格停損洗自己。
+        # [放寬 1] 定義「嚴格空頭」：需同時跌破季線與月線才算數
+        # 如果還守在月線之上，代表短線仍強，不應進入嚴格模式
+        is_price_weak = (close[i] < ma60[i]) and (close[i] < ma20[i])
         
-        is_price_below_ma60 = (close[i] < ma60[i])
-        
-        # 只有當「年線下彎」且「季線沒救」且「股價還在季線下」時，才是嚴格空頭
-        is_strict_bear = is_ma240_down and (not is_ma60_up) and is_price_below_ma60
+        is_strict_bear = is_ma240_down and (not is_ma60_up) and is_price_weak
 
         # --- 進場邏輯 ---
         if position == 0:
             is_buy = False
             
-            # 若是嚴格空頭，RSI 門檻提高到 60；否則維持 55
+            # 若是嚴格空頭，RSI 門檻維持 60；正常則 55
             rsi_threshold_A = 60 if is_strict_bear else 55
             
-            # ... (中間進場策略代碼保持不變) ...
-            
-            # 策略 A
+            # 策略 A: 動能突破
             if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                 is_buy=True; trade_type=1; reason_str="動能突破"
-            # 策略 B
+            
+            # 策略 B: 均線回測 (非嚴格空頭即可做)
             elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                 is_buy=True; trade_type=1; reason_str="均線回測"
-            # 策略 C
+            
+            # 策略 C: 籌碼佈局
             elif not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                 is_buy=True; trade_type=3; reason_str="籌碼佈局"
-            # 策略 D
+            
+            # 策略 D: 超賣反彈
             elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                 is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
-                # ... (進場記錄代碼保持不變) ...
                 signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
+                
+                # 計算信心值
                 base_score = 60
                 if is_strict_bear: base_score -= 10
                 if is_ma240_down and is_ma60_up: base_score += 5
@@ -709,10 +707,10 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
             
             is_sell = False
             
-            # [修正 2] 放寬停損幅度
-            # 嚴格空頭: 改回 -8% (原本 -6% 太容易被洗)
-            # 正常狀況: 維持 -10%
-            stop_loss_limit = -0.08 if is_strict_bear else -0.10
+            # [放寬 2] 停損幅度再加大
+            # 嚴格空頭: -10% (原本 -8%)
+            # 正常狀況: -12% (原本 -10%)
+            stop_loss_limit = -0.10 if is_strict_bear else -0.12
             
             if drawdown < stop_loss_limit:
                 is_sell=True; reason_str=f"觸發停損({stop_loss_limit*100:.0f}%)"; action_code="Sell"
@@ -723,17 +721,23 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
             
             # 條件出場
             else:
+                # [放寬 3] 趨勢轉弱濾網
+                # 原本: trend[i]==-1 就賣
+                # 現在: trend[i]==-1 且 跌破月線 才賣 (防止假跌破)
                 if trade_type==1 and trend[i]==-1: 
-                    is_sell=True; reason_str="趨勢轉弱"
+                    if close[i] < ma20[i]:
+                        is_sell=True; reason_str="趨勢轉弱且破月線"
+                    else:
+                        # 雖然 SuperTrend 轉空，但還守住月線，給予機會續抱
+                        action_code="Hold"; reason_str="轉弱(守月線)"
                 
-                # [修正 3] 只有在嚴格空頭模式下，破月線才強制走
-                # 這裡的邏輯是：如果我已經不是嚴格空頭(例如股價站上季線)，那就不要因為破月線就急著跑，可以看季線支撐
+                # 只有在「嚴格空頭」且「破月線」時才強制離場
                 elif is_strict_bear and close[i] < ma20[i]:
                     is_sell=True; reason_str="長空破月線"
                     
                 elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
                 elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
-
+                
             if is_sell:
                 signal=0; action_code="Sell"
                 pnl = (close[i] - entry_price) / entry_price * 100
