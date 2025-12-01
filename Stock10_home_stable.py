@@ -2851,70 +2851,88 @@ elif page == "💼 持股健診與建議":
             
             status.update(label="AI 分析完成！", state="complete", expanded=False)
 
-        # ==========================================
-        # 自動寄信邏輯：評分變動觸發 (優化版：計算具體變化)
+# ==========================================
+        # [優化] 自動寄信邏輯：智慧訊號過濾
         # ==========================================
         if enable_monitor and portfolio_results:
-            # 1. 建立當前分數快照
-            current_scores_fingerprint = {
-                item['代號']: item['綜合評分'] 
+            
+            # 1. 建立當前快照 (包含分數與建議)
+            # 使用字典儲存更多資訊: {代號: {'score': 分數, 'advice': 建議}}
+            current_snapshot = {
+                item['代號']: {'score': item['綜合評分'], 'advice': item['AI 建議']}
                 for item in portfolio_results
             }
             
-            # 2. 比較是否發生變動
-            last_scores = st.session_state['last_sent_scores']
-            has_score_changed = (current_scores_fingerprint != last_scores)
+            # 讀取上次的快照 (若無則為空)
+            last_snapshot = st.session_state.get('last_sent_snapshot', {})
             
-            if has_score_changed:
-                st.toast("⚡ 偵測到評分變動，準備發送通知...", icon="📧")
+            # 2. 檢查是否觸發「重要條件」
+            should_send_email = False
+            email_data_list = []
+            
+            for ticker, curr_info in current_snapshot.items():
+                curr_score = curr_info['score']
+                curr_advice = curr_info['advice']
                 
-                # 3. [關鍵] 製作 "Email 專用數據"，加入 "分數變動" 欄位
-                email_data_list = []
-                for item in portfolio_results:
-                    ticker = item['代號']
-                    new_score = item['綜合評分']
-                    old_score = last_scores.get(ticker) # 嘗試取得舊分數
+                # 取得舊資料
+                prev_info = last_snapshot.get(ticker)
+                
+                is_alert_needed = False
+                change_str = f"{curr_score}"
+                
+                if prev_info is None:
+                    # A. 新加入的持股 -> 通知
+                    is_alert_needed = True
+                    change_str = f"<span style='color:blue'>New ({curr_score})</span>"
+                else:
+                    prev_score = prev_info['score']
+                    prev_advice = prev_info['advice']
                     
-                    # 產生變動字串
-                    if old_score is None:
-                        # 如果是新加入的股票
-                        change_str = f"<span style='color:blue'>New ({new_score})</span>"
-                    elif new_score != old_score:
-                        # 有變動
-                        if new_score > old_score:
-                            change_str = f"{old_score} <b style='color:red'>➜ {new_score}</b>"
-                        else:
-                            change_str = f"{old_score} <b style='color:green'>➜ {new_score}</b>"
-                    else:
-                        # 沒變動
-                        change_str = f"{new_score}"
-                    
-                    # 複製並加入新欄位
-                    item_copy = item.copy()
-                    item_copy['分數變動'] = change_str
-                    email_data_list.append(item_copy)
+                    # B. 建議改變 (例如: 續抱 -> 賣出) -> 重要！通知
+                    if curr_advice != prev_advice:
+                        is_alert_needed = True
+                        change_str = f"{prev_score} ➜ <b>{curr_score}</b> ({prev_advice}➜{curr_advice})"
+                        
+                    # C. 分數劇烈波動 (變動 > 5 分) -> 顯著！通知
+                    elif abs(curr_score - prev_score) >= 5:
+                        is_alert_needed = True
+                        arrow = "🔺" if curr_score > prev_score else "🔻"
+                        color = "red" if curr_score > prev_score else "green"
+                        change_str = f"{prev_score} <b style='color:{color}'>{arrow} {curr_score}</b>"
+                
+                # 如果符合任一條件，加入發送列表
+                if is_alert_needed:
+                    should_send_email = True
+                    # 找出原始資料以便複製
+                    original_item = next((x for x in portfolio_results if x['代號'] == ticker), None)
+                    if original_item:
+                        item_copy = original_item.copy()
+                        item_copy['分數變動'] = change_str
+                        email_data_list.append(item_copy)
 
+            # 3. 執行發送
+            if should_send_email:
+                st.toast(f"⚡ 偵測到 {len(email_data_list)} 筆重要異動，發送通知...", icon="📧")
+                
                 res_df_for_email = pd.DataFrame(email_data_list)
                 
-                # 4. 準備市場分析文字
+                # 準備市場分析文字 (避免 API 頻繁呼叫，可設為簡單文字或快取)
                 try:
                     market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
                     analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
-                except Exception as e:
-                    print(f"市場分析生成失敗: {e}")
+                except:
                     analysis_html_for_email = "<p>暫無法獲取市場分析數據</p>"
                 
-                # 5. 發送 Email
-                with st.spinner("📧 評分異動，正在發送信件..."):
+                with st.spinner("📧 正在發送重要通知信..."):
                     success = send_analysis_email(res_df_for_email, analysis_html_for_email)
                     
                 if success:
-                    # 發送成功後，才更新記憶體中的 "上次分數"
-                    st.session_state['last_sent_scores'] = current_scores_fingerprint
-                    st.toast(f"✅ 已發送變動通知！")
+                    # 發送成功後，更新快照
+                    st.session_state['last_sent_snapshot'] = current_snapshot
+                    st.toast(f"✅ 通知已發送！")
                 else:
                     st.toast("❌ Email 發送失敗", icon="⚠️")
-                    
+                                        
         # ==========================================
         # 顯示結果
         # ==========================================
