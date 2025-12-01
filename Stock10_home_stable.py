@@ -625,8 +625,9 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v9 (Squeeze Ban):
-    - [新增] 禁買令: 若均線糾結度 < 3% (極度壓縮)，強制禁止買入，防止遇到盤整後崩盤。
+    執行策略回測 v9.1 (Crash Protection):
+    - [既有] Squeeze Ban: 糾結度 < 3% 禁止買入。
+    - [新增] Crash Ban: 若年線(MA240)日跌幅達 -0.1% 或更低，禁止恐慌抄底 (Strategy D)。
     """
     df = data.copy()
     
@@ -645,6 +646,7 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     
     # 確保有 MA120 (若上游沒算，這裡需防呆)
     if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
+    if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240).mean() # 確保有 MA240
     
     ma120 = df['MA120'].fillna(method='bfill').values
     ma240 = df['MA240'].fillna(method='bfill').values
@@ -658,15 +660,20 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     market_panic = df['Is_Market_Panic'].values
     bb_width_vals = ((df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']).values
 
-    # [新增] 預先計算「均線糾結指數」 (Rolling Congestion Index)
-    # 使用 numpy 向量化計算加速
+    # [新增] 計算年線斜率 (用於偵測崩盤趨勢)
+    ma240_series = pd.Series(ma240)
+    # 計算變化率： (MA_t - MA_t-1) / MA_t-1
+    ma240_slope = ma240_series.pct_change().fillna(0).values
+    is_crash_trend = ma240_slope <= -0.001
+    # 崩盤扣分 Mask: 只要處於崩盤趨勢，若出現買訊或持倉，都給予重罰
+    crash_penalty_mask = (buy_mask | (position == 1)) & is_crash_trend
+
+
+    # 預先計算「均線糾結指數」
     ma_stack = np.vstack([ma60, ma120, ma240])
     ma_max = np.max(ma_stack, axis=0)
     ma_min = np.min(ma_stack, axis=0)
-    # 瞬時差距
     raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
-    # 20日平均差距 (糾結指數)
-    # 利用 pandas rolling 計算後轉回 numpy
     congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
 
     for i in range(len(df)):
@@ -684,9 +691,12 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
         is_price_weak = (close[i] < ma60[i]) and (close[i] < ma20[i])
         is_strict_bear = is_ma240_down and (not is_ma60_up) and is_price_weak
 
-        # [新增] 糾結禁買判定
-        # 若糾結指數 < 3% (0.03)，禁止買入
+        # [既有] 糾結禁買判定 (Squeeze Ban)
         is_squeeze_ban = congestion_index[i] < 0.03
+
+        # [新增] 崩盤禁買判定 (Crash Ban)
+        # 條件：年線每日下彎幅度 >= 0.1% (即 <= -0.001)
+        is_crash_trend = ma240_slope[i] <= -0.001
 
         # --- 進場邏輯 ---
         if position == 0:
@@ -695,17 +705,18 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             
             # 只有在「非禁買」狀態下才檢查策略
             if not is_squeeze_ban:
-                # 策略 A
+                # 策略 A: 動能突破
                 if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                     is_buy=True; trade_type=1; reason_str="動能突破"
-                # 策略 B
+                # 策略 B: 均線回測
                 elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                     is_buy=True; trade_type=1; reason_str="均線回測"
-                # 策略 C
+                # 策略 C: 籌碼佈局
                 elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                     is_buy=True; trade_type=3; reason_str="籌碼佈局"
-                # 策略 D (超賣反彈也需避開極度壓縮後的崩盤)
-                elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
+                # 策略 D: 超賣反彈 (Crash Protection Applied)
+                # 增加條件：and (not is_crash_trend)
+                elif (not is_crash_trend) and rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                     is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
@@ -1120,6 +1131,8 @@ def calculate_alpha_score(df, margin_df, short_df):
             event_penalty -= 30; ep_list.append("極度糾結 (-30)")
         elif congestion_penalty_mask[i]:
             event_penalty -= 15; ep_list.append("均線糾結 (-15)")
+        if crash_penalty_mask[i]:
+            event_penalty -= 40; ep_list.append("主跌崩盤 (-40)")
             
         # 3. 原始加總 (Raw Sum)
         # 注意: 買賣訊號時，analog_modulation 減半
