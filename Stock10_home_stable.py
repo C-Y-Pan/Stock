@@ -2979,6 +2979,7 @@ elif page == "🧪 策略實驗室":
     # 2. 核心遍歷迴圈
     # ==========================================
     if st.session_state['lab_running']:
+        lab_market_df = get_market_data(test_start_date, test_end_date)
         progress_bar = st.progress(0)
         status_text = st.empty()
         result_area = st.container()
@@ -2995,45 +2996,40 @@ elif page == "🧪 策略實驗室":
             progress_bar.progress((i + 1) / total)
 
             try:
-                # A. 獲取數據
+                # A. 獲取數據 (修改這裡：增加獲取股名的邏輯)
                 raw_df, fmt_ticker = get_stock_data(ticker, test_start_date, test_end_date)
                 if raw_df.empty or len(raw_df) < 100: continue
+                
+                # [新增] 取得股名並組合成顯示字串
+                stock_name = get_stock_name(fmt_ticker)
+                display_label = f"{ticker} {stock_name}"
 
-                # B. 執行策略 (使用最佳參數搜尋)
-                # 注意：這裡假設 run_optimization 內部已經計算了 Buy & Hold (Cum_Market)
-                best_params, strat_df = run_optimization(raw_df, market_df, test_start_date, fee_input, tax_input)
+                # B. 執行策略
+                best_params, strat_df = run_optimization(raw_df, lab_market_df, test_start_date, fee_input, tax_input)
                 
                 if strat_df is None or strat_df.empty: continue
 
-                # C. 計算關鍵指標
-                # 1. 報酬率比較
+                # C. 計算關鍵指標 (維持不變)
                 strat_ret = strat_df['Cum_Strategy'].iloc[-1] - 1
                 bh_ret = strat_df['Cum_Market'].iloc[-1] - 1
                 alpha = strat_ret - bh_ret
 
-                # 2. 策略執行細節
                 total_days = len(strat_df)
                 market_bull_days = strat_df[strat_df['Close'] > strat_df['MA60']]
                 market_bear_days = strat_df[strat_df['Close'] < strat_df['MA60']]
                 
-                # 多頭捕捉率：市場在多頭時，策略持有的時間比例
                 bull_held_days = market_bull_days[market_bull_days['Position'] == 1]
                 bull_capture = len(bull_held_days) / len(market_bull_days) if len(market_bull_days) > 0 else 0
                 
-                # 空頭曝險率：市場在空頭時，策略持有的時間比例 (越低越好)
                 bear_held_days = market_bear_days[market_bear_days['Position'] == 1]
                 bear_exposure = len(bear_held_days) / len(market_bear_days) if len(market_bear_days) > 0 else 0
 
-                # 3. 恐慌抄底驗證
-                # 篩選出 Reason 包含 "反彈" 或 "超賣" 的交易
                 panic_buys = strat_df[(strat_df['Action'] == 'Buy') & (strat_df['Reason'].str.contains('反彈|超賣'))]
                 panic_wins = 0
                 panic_count = len(panic_buys)
                 
                 if panic_count > 0:
-                    # 簡單驗證：買進後持有期間是否有獲利出場
                     for idx in panic_buys.index:
-                        # 找到下一次賣出
                         future = strat_df.loc[idx:]
                         sells = future[future['Action'] == 'Sell']
                         if not sells.empty:
@@ -3043,13 +3039,13 @@ elif page == "🧪 策略實驗室":
                 
                 panic_win_rate = (panic_wins / panic_count) if panic_count > 0 else np.nan
 
-                # D. 存入結果
+                # D. 存入結果 (修改這裡：將 '代號' 的值改成 display_label)
                 res_item = {
-                    "代號": ticker,
+                    "代號": display_label,  # <--- 修改這行，顯示 "2330 台積電"
                     "策略報酬": strat_ret,
                     "買持報酬": bh_ret,
                     "Alpha": alpha,
-                    "勝率": float(best_params.get('WinRate', 0)) if 'WinRate' in best_params else calculate_realized_win_rate(strat_df)[3], # 若無則由 calculate_realized_win_rate 補
+                    "勝率": float(best_params.get('WinRate', 0)) if 'WinRate' in best_params else calculate_realized_win_rate(strat_df)[3],
                     "MDD": calculate_mdd(strat_df['Cum_Strategy']),
                     "多頭捕捉率": bull_capture,
                     "空頭曝險率": bear_exposure,
@@ -3057,18 +3053,17 @@ elif page == "🧪 策略實驗室":
                     "抄底勝率": panic_win_rate
                 }
                 
-                # 補充實際勝率 (如果 run_optimization 沒回傳)
                 if '勝率' not in res_item or res_item['勝率'] == 0:
                      wr_str, wins, totals, avg_p = calculate_realized_win_rate(strat_df)
                      res_item['勝率'] = float(wr_str.strip('%')) / 100
 
                 results.append(res_item)
-                st.session_state['lab_results'] = results # 即時存檔
+                st.session_state['lab_results'] = results 
 
             except Exception as e:
                 print(f"Error analyzing {ticker}: {e}")
                 continue
-        
+
         st.session_state['lab_running'] = False
         st.success("✅ 驗證完成！")
 
