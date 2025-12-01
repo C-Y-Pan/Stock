@@ -547,7 +547,8 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['MA20'] = data['Close'].rolling(20).mean()
     # [新增] MA30 用於乖離判斷
     data['MA30'] = data['Close'].rolling(30).mean()
-    data['MA60'] = data['Close'].rolling(60).mean() 
+    data['MA60'] = data['Close'].rolling(60).mean()
+    data['MA120'] = data['Close'].rolling(120).mean() 
     data['MA240'] = data['Close'].rolling(240, min_periods=60).mean()
     
     # [新增] 100日新高 與 週漲幅參考價
@@ -1985,6 +1986,16 @@ elif page == "📊 單股深度分析":
                     # 季線 (MA60) - 白色半透明
                     fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
 
+                    # [新增] 半年線 (MA120) - 天藍色
+                    if 'MA120' in final_df.columns:
+                        fig.add_trace(go.Scatter(
+                            x=final_df['Date'], 
+                            y=final_df['MA120'], 
+                            mode='lines', 
+                            line=dict(color='#2979ff', width=1.5), 
+                            name='半年線 (MA120)'
+                        ), row=1, col=1)
+
                     # [新增] 年線 (MA240) - 紫色
                     # 使用紫色 (#e040fb) 標示年線，方便區分長期趨勢
                     if 'MA240' in final_df.columns:
@@ -1996,14 +2007,6 @@ elif page == "📊 單股深度分析":
                             name='年線 (MA240)'
                         ), row=1, col=1)
                     
-                    if 'MA120' in final_df.columns:
-                        fig.add_trace(go.Scatter(
-                            x=final_df['Date'], 
-                            y=final_df['MA120'], 
-                            mode='lines', 
-                            line=dict(color="#40fbaa", width=1), 
-                            name='半年線 (MA120)'
-                        ), row=1, col=1)
 
                     # 買賣點標記
                     final_df['Buy_Y'] = final_df['Low'] * 0.92
