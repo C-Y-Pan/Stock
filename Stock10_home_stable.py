@@ -300,17 +300,14 @@ ALL_TECH_TICKERS = "\n".join(list(TW_STOCK_NAMES_STATIC.keys()))
 @st.cache_data(ttl=60, show_spinner=False)
 def get_stock_data(ticker, start_date, end_date):
     """
-    [暴力還原終極版]
-    包含：
-    1. 股利回溯還原 (Dividend Back-Adjustment)
-    2. 分割回溯還原 (Split Back-Adjustment)
-    3. [新增] 統計學斷崖偵測 (Statistical Gap Detection)
-       -> 專門修復 0052 這類 Yahoo 漏標記分割事件導致的斷崖。
-       -> 邏輯：單日跌幅 > 50% 強制視為分割並還原。
+    [價量雙還原 + 斷崖偵測版]
+    修正重點：
+    在「統計學斷崖偵測 (Section B)」中，當偵測到股價分割 (Price Split) 時，
+    除了將歷史股價縮小 (x Factor)，同時將歷史成交量放大 (x 1/Factor)。
+    這能確保 0052 等股票在分割前後的 OBV 指標連貫。
     """
     ticker = str(ticker).strip().upper()
     
-    # 搜尋候選名單
     candidates = []
     if '.' in ticker:
         candidates.append(ticker)
@@ -327,110 +324,101 @@ def get_stock_data(ticker, start_date, end_date):
         try:
             stock = yf.Ticker(t)
             
-            # 1. 抓取原始資料 (包含所有事件)
-            # 抓取較長區間以確保因子計算完整
+            # 1. 抓取原始資料
             df = stock.history(start=start_date - timedelta(days=700), end=end_date + timedelta(days=1), auto_adjust=False, actions=True)
             
             if df.empty or len(df) < 5: continue
 
-            # 確保資料按舊到新排序
             df = df.sort_index(ascending=True)
 
             # ==========================================
             # A. 基礎事件還原 (Metadata Based)
             # ==========================================
-            # 先處理 Yahoo 有紀錄的分割與股利
             if 'Stock Splits' in df.columns or 'Dividends' in df.columns:
-                # 採用倒序乘法累積因子 (從最新往回推)
-                # 這裡使用簡單有效的反向迴圈
                 df_rev = df.sort_index(ascending=False).copy()
                 
-                opens = df_rev['Open'].values
-                highs = df_rev['High'].values
-                lows = df_rev['Low'].values
-                closes = df_rev['Close'].values
+                # 取出數值陣列
+                opens, highs, lows, closes = df_rev['Open'].values, df_rev['High'].values, df_rev['Low'].values, df_rev['Close'].values
+                vols = df_rev['Volume'].values # [成交量]
                 
                 splits = df_rev['Stock Splits'].values if 'Stock Splits' in df.columns else np.zeros(len(df))
                 divs = df_rev['Dividends'].values if 'Dividends' in df.columns else np.zeros(len(df))
                 
-                cum_factor = 1.0
+                p_cum = 1.0 # 價格累積因子
+                v_cum = 1.0 # 成交量累積因子
                 
                 for i in range(len(df_rev)):
-                    # 1. 處理分割 (Yahoo 紀錄在分割日當天)
+                    # 1. 分割處理 (影響價格與量)
                     if splits[i] > 0:
-                        cum_factor *= (1.0 / splits[i])
+                        split_ratio = splits[i]
+                        p_cum *= (1.0 / split_ratio) # 價格變小
+                        v_cum *= split_ratio         # 量變大 (1股變N股)
                     
-                    # 2. 處理股利 (Yahoo 紀錄在除息日當天)
-                    # 我們要調整的是「前一天」的價格，但在倒序迴圈中，
-                    # 當我們遇到除息日(i)，代表從這裡開始往舊資料走(i+1...)都要打折
+                    # 2. 股利處理 (只影響價格)
                     if divs[i] > 0:
-                        # 估算除息前價格 ~= 當日收盤 + 股利 (近似值)
                         price_before = closes[i] + divs[i]
                         if price_before > 0:
-                            cum_factor *= (1 - divs[i] / price_before)
+                            p_cum *= (1 - divs[i] / price_before)
                     
                     # 應用因子
-                    opens[i] *= cum_factor
-                    highs[i] *= cum_factor
-                    lows[i] *= cum_factor
-                    closes[i] *= cum_factor
+                    opens[i] *= p_cum
+                    highs[i] *= p_cum
+                    lows[i] *= p_cum
+                    closes[i] *= p_cum
+                    vols[i]   *= v_cum # [修正] 還原成交量
                 
-                # 寫回 DataFrame (注意要轉回正序)
+                # 寫回 DataFrame
                 df['Open'] = opens[::-1]
                 df['High'] = highs[::-1]
                 df['Low'] = lows[::-1]
                 df['Close'] = closes[::-1]
+                df['Volume'] = vols[::-1]
 
             # ==========================================
             # B. [核彈級] 統計學斷崖偵測 (Gap Detection)
             # ==========================================
-            # 專門修復 Yahoo 漏標記的分割 (如 0052)
-            # 邏輯：掃描調整過後的股價，如果發現某天 "Open/Prev_Close" < 0.5 (跌幅超過50%)
-            # 就認定它是分割，強制把前面的股價壓下來。
-            
-            # 取得數值陣列
             p_open = df['Open'].values
             p_close = df['Close'].values
             p_high = df['High'].values
             p_low = df['Low'].values
+            p_vol = df['Volume'].values # [新增] 取得成交量陣列
             
             # 從第二天開始檢查
             for i in range(1, len(df)):
                 prev_close = p_close[i-1]
-                curr_open = p_open[i] # 用開盤價比對最準，因為分割缺口發生在開盤
-                curr_close = p_close[i]
+                curr_open = p_open[i]
                 
-                if prev_close > 0:
-                    # 計算跳空比例
+                if prev_close > 5: # 股價過低不偵測，避免誤判
                     ratio = curr_open / prev_close
                     
-                    # 門檻設定：0.6 (即單日跌幅超過 40%)
-                    # 1拆2 = 0.5, 1拆7 = 0.14
-                    # 為了避免誤判崩盤，我們加上額外條件：
-                    # 1. Ratio < 0.6 (跌深)
-                    # 2. 當日收盤沒有漲停板或跌停板回復 (確認是結構性改變) -> 簡化為直接判斷
-                    # 3. 股價 > 5 元 (避免雞蛋水餃股波動)
-                    
-                    if ratio < 0.6 and prev_close > 5:
-                        # 偵測到斷崖！
-                        # 假設這是分割，計算修正因子
-                        # 這裡我們用 Close/Prev_Close 來算因子，比較穩
+                    # 偵測到斷崖 (跌幅 > 40%) -> 視為分割
+                    if ratio < 0.6:
+                        curr_close = p_close[i]
+                        # 價格修正因子 (例如 0.14)
                         gap_factor = curr_close / prev_close
                         
-                        # 強制修正：將 [0 ~ i-1] (昨天以前) 的所有資料都乘以這個因子
+                        # [修正重點] 成交量修正因子 = 1 / 價格因子
+                        # 價格變 1/7，成交量就要變 7倍
+                        if gap_factor > 0:
+                            vol_gap_factor = 1.0 / gap_factor
+                        else:
+                            vol_gap_factor = 1.0
+                        
+                        # 強制修正歷史價格 (變小)
                         p_open[:i] *= gap_factor
                         p_high[:i] *= gap_factor
                         p_low[:i] *= gap_factor
                         p_close[:i] *= gap_factor
                         
-                        # 注意：因為我們直接修改了 p_close 陣列，
-                        # 下一圈迴圈讀取 p_close[i-1] 時已經是修正後的數值，邏輯依然正確。
+                        # [修正重點] 強制修正歷史成交量 (變大)
+                        p_vol[:i] *= vol_gap_factor
             
             # 寫回修正後的數值
             df['Open'] = p_open
             df['High'] = p_high
             df['Low'] = p_low
             df['Close'] = p_close
+            df['Volume'] = p_vol # [寫回成交量]
 
             # ==========================================
             # C. 格式整理與輸出
@@ -440,7 +428,6 @@ def get_stock_data(ticker, start_date, end_date):
             df = df.reset_index()
             df['Date'] = df['Date'].dt.tz_localize(None).dt.normalize()
             
-            # 移除干擾欄位
             cols_drop = ['Dividends', 'Stock Splits']
             df = df.drop(columns=[c for c in cols_drop if c in df.columns], errors='ignore')
             
