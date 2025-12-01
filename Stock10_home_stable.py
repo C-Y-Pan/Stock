@@ -3120,8 +3120,6 @@ elif page == "🧪 策略實驗室":
             # 劃分理想區域
             fig_regime.add_hline(y=0.5, line_dash="dash", line_color="gray")
             fig_regime.add_vline(x=0.3, line_dash="dash", line_color="gray")
-            fig_regime.add_annotation(x=0.1, y=0.9, text="🏆 聖杯區 (避開空頭+吃到多頭)", showarrow=False, font=dict(color="#ff5252"))
-            fig_regime.add_annotation(x=0.8, y=0.1, text="💀 韭菜區 (空頭滿倉+多頭空手)", showarrow=False, font=dict(color="#00e676"))
             
             fig_regime.update_layout(template="plotly_dark", xaxis_tickformat='.0%', yaxis_tickformat='.0%')
             st.plotly_chart(fig_regime, use_container_width=True)
