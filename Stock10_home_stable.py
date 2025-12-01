@@ -2075,6 +2075,13 @@ elif page == "📊 單股深度分析":
                 with tab1:
                     # 1. 準備數據
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
+                    
+                    if 'Score_Detail' in stock_alpha_df.columns:
+                        final_df['Score_Detail'] = stock_alpha_df['Score_Detail']
+                    else:
+                        # 防呆：萬一上游沒算出來，填入空字串避免報錯
+                        final_df['Score_Detail'] = ""
+
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
                     
                     # 確保長均線存在
