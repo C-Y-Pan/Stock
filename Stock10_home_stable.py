@@ -2033,27 +2033,35 @@ elif page == "📊 單股深度分析":
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
                     
-                    # [新增] 計算均線糾結度 (MA Congestion)
-                    # 確保欄位存在，若無則填補
+                    # 確保長均線存在
                     if 'MA120' not in final_df.columns: final_df['MA120'] = final_df['Close'].rolling(120).mean()
                     if 'MA240' not in final_df.columns: final_df['MA240'] = final_df['Close'].rolling(240).mean()
                     
-                    # 取出長均線群
+                    # 計算均線糾結度 (MA Congestion)
                     ma_subset = final_df[['MA60', 'MA120', 'MA240']].ffill().bfill()
                     ma_max = ma_subset.max(axis=1)
                     ma_min = ma_subset.min(axis=1)
                     
-                    # 計算糾結率 (%)：(最高均線 - 最低均線) / 收盤價
-                    final_df['MA_Gap'] = (ma_max - ma_min) / final_df['Close'] * 100
-                    final_df['MA_Gap'] = final_df['MA_Gap'].fillna(100) # 防止除以0或空值
+                    # 1. 瞬時 GAP
+                    raw_gap = (ma_max - ma_min) / final_df['Close'] * 100
+                    
+                    # 2. 20日平均 GAP (糾結指數)
+                    congestion_idx = raw_gap.rolling(20, min_periods=1).mean().fillna(100)
+                    final_df['Congestion_Index'] = congestion_idx
+                    
+                    # [新增] 3. 糾結度斜率 (Slope) - 判斷發散或收斂
+                    # 正值 = 發散中 (趨勢加速)
+                    # 負值 = 收斂中 (進入盤整)
+                    congestion_slope = congestion_idx.diff().fillna(0)
+                    final_df['Congestion_Slope'] = congestion_slope
 
-                    # 2. 建立子圖 (Rows 從 6 增加為 7)
+                    # 2. 建立子圖 (Rows 增加為 8)
                     fig = make_subplots(
-                        rows=7, cols=1, 
+                        rows=8, cols=1, 
                         shared_xaxes=True, 
                         vertical_spacing=0.02, 
-                        # 調整高度比例，最下方增加一欄
-                        row_heights=[0.30, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10], 
+                        # 調整高度比例
+                        row_heights=[0.30, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10], 
                         subplot_titles=(
                             "", 
                             "買賣評等 (Alpha Score)", 
@@ -2061,7 +2069,8 @@ elif page == "📊 單股深度分析":
                             "成交量", 
                             "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)",
-                            "均線糾結度 (MA Gap %)" # [新增標題]
+                            "均線糾結指數 (20MA Gap%)",
+                            "糾結度變化 (Slope)" # [新增標題]
                         )
                     )
             
@@ -2079,15 +2088,10 @@ elif page == "📊 單股深度分析":
                     if 'MA240' in final_df.columns:
                         fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA240'], mode='lines', line=dict(color='#e040fb', width=1.5), name='年線'), row=1, col=1)
 
-                    # 買賣點標記 logic (略...維持原樣)
+                    # 買賣點標記
                     final_df['Buy_Y'] = final_df['Low'] * 0.92
                     final_df['Sell_Y'] = final_df['High'] * 1.08
                     
-                    # (此處為了簡潔省略 get_buy_text/get_sell_text 定義，請保留您原本代碼中的定義)
-                    # ... [請保留您原本繪製 Buy/Sell Markers 的程式碼] ...
-                    # ... (如果您直接複製貼上，請確保之前的 marker 繪製代碼有放進來)
-                    
-                    # 為確保完整性，我把Marker繪製補上：
                     def get_buy_text(sub_df): return [f"<b>{int(score)}</b>" for score in sub_df['Alpha_Score']]
                     def get_sell_text(sub_df):
                         labels = []
@@ -2135,37 +2139,30 @@ elif page == "📊 單股深度分析":
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=6, col=1)
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
                     
-                    # --- [升級] Row 7: 均線糾結指數 (Congestion Index) ---
-                    # 1. 瞬時 GAP
-                    raw_gap = (ma_max - ma_min) / final_df['Close'] * 100
-                    
-                    # 2. 20日平均 GAP (糾結指數)
-                    # 這裡使用 rolling mean 平滑化，顯示一段時間的糾結感
-                    congestion_idx = raw_gap.rolling(20, min_periods=1).mean().fillna(100)
-                    final_df['Congestion_Index'] = congestion_idx
-                    
-                    # 顏色邏輯：
-                    # - 紅色 (Entangled): 指數 < 5% (長期黏合)
-                    # - 黃色 (Neutral): 5% - 15%
-                    # - 綠色 (Trending): > 15% (趨勢發散)
+                    # --- Row 7: 均線糾結指數 (Congestion Index) ---
                     colors_gap = []
                     for v in congestion_idx:
-                        if v < 5: colors_gap.append('#ef5350') 
+                        if v < 5: colors_gap.append('#ef5350') # 紅色警戒 (糾結)
                         elif v < 15: colors_gap.append('#ffd740')
-                        else: colors_gap.append('#00e676')
+                        else: colors_gap.append('#00e676') # 綠色 (發散)
                     
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Congestion_Index'], name='均線差距%', marker_color=colors_gap), row=7, col=1)
+                    fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(5%)", row=7, col=1)
+
+                    # --- [新增] Row 8: 糾結度斜率 (Slope) ---
+                    # 綠色: 發散中 (Gap變大，趨勢加速)
+                    # 紅色: 收斂中 (Gap變小，趨勢休息)
+                    colors_cong_slope = ['#00e676' if v > 0 else '#ef5350' for v in final_df['Congestion_Slope']]
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], 
-                        y=final_df['Congestion_Index'], 
-                        name='均線糾結指數(20日)', 
-                        marker_color=colors_gap
-                    ), row=7, col=1)
-                    
-                    # 5% 警戒線
-                    fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(<5%)", row=7, col=1)
+                        y=final_df['Congestion_Slope'], 
+                        name='差距變動(Slope)', 
+                        marker_color=colors_cong_slope
+                    ), row=8, col=1)
+                    fig.add_hline(y=0, line_width=1, line_color="gray", row=8, col=1)
 
                     # Layout
-                    fig.update_layout(height=1400, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
+                    fig.update_layout(height=1600, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
                                                     legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
                     fig.update_yaxes(side='right')
                     st.plotly_chart(fig, use_container_width=True)
