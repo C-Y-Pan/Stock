@@ -978,8 +978,11 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.0 (Squeeze Prohibition):
-    - [更新] 極度糾結 (< 3%): 策略層級已禁止買入，此處給予大幅扣分 (-30) 並標註「禁止買入」。
+    Alpha Score v6.1 (MA Support Bonus):
+    - [新增] 均線支撐加分:
+      * 站上 1 條長均線 (季/半/年): +5 分
+      * 站上 2 條長均線: +10 分
+      * 站上 3 條長均線 (三線多排): +20 分 (大幅獎勵趨勢確立)
     """
     df = df.copy()
 
@@ -1030,7 +1033,22 @@ def calculate_alpha_score(df, margin_df, short_df):
     penalty_mask = ma240_slope_neg & (~ma60_slope_pos)
     score_trend_penalty = np.where(penalty_mask, -15, 0)
     
-    # 加分條件
+    # [新增] 均線支撐加分 (MA Support Bonus)
+    # 邏輯：站上的長均線越多，分數加越多
+    above_ma60 = (close > ma60).astype(int)
+    above_ma120 = (close > ma120).astype(int)
+    above_ma240 = (close > ma240).astype(int)
+    
+    ma_support_count = above_ma60 + above_ma120 + above_ma240
+    
+    # 3條全上: +20, 2條: +10, 1條: +5
+    score_ma_support = np.select(
+        [ma_support_count == 3, ma_support_count == 2, ma_support_count == 1],
+        [20, 10, 5],
+        default=0
+    )
+
+    # 既有的加分條件
     cond_ma30_gap = (close > ma30 * 1.04)
     score_ma30 = np.where(cond_ma30_gap, 5, 0)
     
@@ -1039,8 +1057,8 @@ def calculate_alpha_score(df, margin_df, short_df):
     cond_breakout = (close >= high_100d)
     score_breakout = np.where(cond_breakout & cond_not_overheated, 15, 0)
     
-    # 綜合調節值
-    analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout
+    # 綜合調節值 (加入 score_ma_support)
+    analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout + score_ma_support
 
     # 3. 狀態錨定評分
     alpha_score = np.zeros(len(df))
@@ -1053,6 +1071,9 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     base_log_msg = np.where(position == 1, "持倉監控", "空手觀望")
     base_log_msg = np.where(penalty_mask, base_log_msg + " [⚠️年線蓋頭]", base_log_msg)
+    
+    # 新增評語：若是三線全上，顯示多頭排列
+    base_log_msg = np.where(ma_support_count == 3, base_log_msg + " [☀️三線多排]", base_log_msg)
     
     rescue_mask = ma240_slope_neg & ma60_slope_pos
     base_log_msg = np.where(rescue_mask, base_log_msg + " [季線救援]", base_log_msg)
@@ -1080,13 +1101,10 @@ def calculate_alpha_score(df, margin_df, short_df):
     gap_series = pd.Series(raw_gap_ratio)
     congestion_index = gap_series.rolling(20, min_periods=1).mean().fillna(1.0).values
     
-    # [修正] 極度糾結門檻改為 3%
     is_extremely_congested = congestion_index < 0.03
-    # 一般糾結: 3% ~ 5%
     is_congested = (congestion_index >= 0.03) & (congestion_index < 0.05)
     
-    # 注意：此處僅用於評分顯示，實際禁買已在 run_simple_strategy 執行
-    extreme_congestion_penalty_mask = buy_mask & is_extremely_congested # 對所有策略都警告
+    extreme_congestion_penalty_mask = buy_mask & is_extremely_congested
     congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
 
     buy_pulse = 85 + (analog_modulation * 0.5)
@@ -1094,8 +1112,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     # 扣分
     buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
     buy_pulse = np.where(trend_buy_penalty_mask, buy_pulse - 20, buy_pulse)
-    
-    # 極度糾結扣 30 分 (顯示為不建議)
     buy_pulse = np.where(extreme_congestion_penalty_mask, buy_pulse - 30, buy_pulse)
     buy_pulse = np.where(congestion_penalty_mask, buy_pulse - 15, buy_pulse)
     
