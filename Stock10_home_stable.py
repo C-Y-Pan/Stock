@@ -978,16 +978,16 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v6.2 (Expansion Bonus):
-    - [新增] 發散噴出加分: 若股價站上三條長均線 (趨勢多頭) 且 均線糾結度斜率為正 (正在發散加速)，額外 +15 分。
-      這能獎勵策略抓住「盤整後噴出」的甜蜜點。
+    Alpha Score v7.0 (Detail Breakdown):
+    - 功能: 除了計算分數，還產生詳細的 HTML 格式評分報告 (Score_Detail)，供圖表 Hover 使用。
     """
     df = df.copy()
 
+    # 防呆
     if 'Action' not in df.columns or 'Position' not in df.columns:
         return calculate_alpha_score_technical_fallback(df)
 
-    # 補全指標
+    # 1. 補全指標
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
@@ -999,6 +999,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     
+    # 準備 Raw Data Arrays
     action = df['Action'].values
     position = pd.Series(df['Position'].values).ffill().fillna(0).values
     close = df['Close'].values
@@ -1007,14 +1008,13 @@ def calculate_alpha_score(df, margin_df, short_df):
     ma120 = df['MA120'].fillna(method='bfill').values
     ma240 = df['MA240'].fillna(method='bfill').values
     ma30 = df['MA30'].ffill().values
-    
     high_100d = df['High_100d'].fillna(0).values
     close_lag5 = df['Close_Lag5'].fillna(close[0]).values
     volume = df['Volume'].fillna(0).values
     vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
     rsi = df['RSI'].fillna(50).values
     
-    # 2. 計算「類比調節因子」
+    # 2. 計算「類比調節因子」 (Analog Modulators)
     bias_val = (close - ma20) / ma20 * 100
     score_bias = np.clip(bias_val * 2, -15, 15)
     score_rsi = np.clip((rsi - 50) * 0.6, -15, 15)
@@ -1022,7 +1022,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     vol_ratio = volume / vol_ma20
     score_vol = np.where(vol_ratio > 1, np.clip((vol_ratio - 1) * 5, 0, 10), 0)
     
-    # 趨勢判定
+    # 3. 趨勢判定
     ma240_slope_neg = np.zeros(len(df), dtype=bool)
     ma60_slope_pos = np.zeros(len(df), dtype=bool)
     if len(ma240) > 1:
@@ -1032,76 +1032,50 @@ def calculate_alpha_score(df, margin_df, short_df):
     penalty_mask = ma240_slope_neg & (~ma60_slope_pos)
     score_trend_penalty = np.where(penalty_mask, -15, 0)
     
-    # [MA Support Bonus] 站上均線獎勵
-    above_ma60 = (close > ma60).astype(int)
-    above_ma120 = (close > ma120).astype(int)
-    above_ma240 = (close > ma240).astype(int)
-    ma_support_count = above_ma60 + above_ma120 + above_ma240
-    
-    score_ma_support = np.select(
-        [ma_support_count == 3, ma_support_count == 2, ma_support_count == 1],
-        [20, 10, 5],
-        default=0
-    )
-
-    # 既有的加分條件
+    # 4. 加分條件 (Bonuses)
+    # A. MA30 乖離
     cond_ma30_gap = (close > ma30 * 1.04)
     score_ma30 = np.where(cond_ma30_gap, 5, 0)
     
+    # B. 百日突破
     weekly_ratio = np.divide(close, close_lag5, out=np.ones_like(close), where=close_lag5!=0)
     cond_not_overheated = weekly_ratio < 1.27
     cond_breakout = (close >= high_100d)
     score_breakout = np.where(cond_breakout & cond_not_overheated, 15, 0)
     
-    # --- 均線糾結與發散計算 ---
+    # C. 均線支撐 (MA Support)
+    above_ma60 = (close > ma60).astype(int)
+    above_ma120 = (close > ma120).astype(int)
+    above_ma240 = (close > ma240).astype(int)
+    ma_support_count = above_ma60 + above_ma120 + above_ma240
+    score_ma_support = np.select([ma_support_count == 3, ma_support_count == 2, ma_support_count == 1], [20, 10, 5], default=0)
+    
+    # D. 發散噴出 (Expansion)
     ma_stack = np.vstack([ma60, ma120, ma240])
     ma_max = np.max(ma_stack, axis=0)
     ma_min = np.min(ma_stack, axis=0)
     raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
     gap_series = pd.Series(raw_gap_ratio)
-    # 20日平均差距 (糾結指數)
+    # 60日平均 (修正為 60MA 糾結)
     congestion_index = gap_series.rolling(60, min_periods=1).mean().fillna(1.0).values
-    
-    # [新增] 計算糾結度斜率 (Slope)
-    # 使用 pandas diff 計算變化
     congestion_slope = pd.Series(congestion_index).diff().fillna(0).values
     
-    # [新增] 發散噴出加分 (Expansion Bonus)
-    # 條件：三線全上 (趨勢強) 且 糾結度在變大 (正在發散)
-    # 這代表行情正在加速，而非死魚盤
     cond_expansion = (ma_support_count == 3) & (congestion_slope > 0)
-    score_expansion = np.where(cond_expansion, 50, 0)
+    score_expansion = np.where(cond_expansion, 15, 0)
     
-    # 綜合調節值 (加入 score_expansion)
+    # 綜合調節值
     analog_modulation = score_bias + score_rsi + score_vol + score_trend_penalty + score_ma30 + score_breakout + score_ma_support + score_expansion
 
-    # 3. 狀態錨定評分
+    # 5. 狀態錨定與事件處理
     alpha_score = np.zeros(len(df))
-    log_msg = np.full(len(df), "", dtype=object)
+    log_msg = np.full(len(df), "", dtype=object) # 簡單評語
+    detail_html = [] # 詳細 HTML 列表
 
-    holding_score = 60 + analog_modulation
-    waiting_score = -30 + analog_modulation
-    
-    alpha_score = np.where(position == 1, holding_score, waiting_score)
-    
-    base_log_msg = np.where(position == 1, "持倉監控", "空手觀望")
-    base_log_msg = np.where(penalty_mask, base_log_msg + " [⚠️年線蓋頭]", base_log_msg)
-    
-    # 評語邏輯
-    base_log_msg = np.where(ma_support_count == 3, base_log_msg + " [☀️三線多排]", base_log_msg)
-    base_log_msg = np.where(cond_expansion, base_log_msg + " [🚀發散噴出]", base_log_msg) # 新增評語
-    
-    rescue_mask = ma240_slope_neg & ma60_slope_pos
-    base_log_msg = np.where(rescue_mask, base_log_msg + " [季線救援]", base_log_msg)
-    base_log_msg = np.where(cond_ma30_gap, base_log_msg + " [📈強勢乖離]", base_log_msg)
-    base_log_msg = np.where(cond_breakout & cond_not_overheated, base_log_msg + " [🚀百日突破]", base_log_msg)
-
-    log_msg = base_log_msg
-
-    # 4. 訊號事件 (買賣點強制加扣分)
+    # 準備事件 Mask
     buy_mask = (action == 'Buy')
+    sell_mask = (action == 'Sell')
     
-    # 風控檢查
+    # 準備 Penalty Mask
     reason_series = df['Reason'].fillna("").astype(str)
     is_panic_strat = reason_series.str.contains('反彈|超賣').values
     panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
@@ -1109,66 +1083,128 @@ def calculate_alpha_score(df, margin_df, short_df):
     not_above_long_ma = (close < ma120) | (close < ma240)
     trend_buy_penalty_mask = buy_mask & (~is_panic_strat) & not_above_long_ma
     
-    # 極度糾結檢查 (<3%)
-    is_extremely_congested = congestion_index < 0.015
-    is_congested = (congestion_index >= 0.015) & (congestion_index < 0.025)
+    is_extremely_congested = congestion_index < 0.03
+    is_congested = (congestion_index >= 0.03) & (congestion_index < 0.05)
     
     extreme_congestion_penalty_mask = buy_mask & is_extremely_congested
     congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
 
-    buy_pulse = 85 + (analog_modulation * 0.5)
-    
-    # 執行扣分
-    buy_pulse = np.where(panic_bear_penalty_mask, buy_pulse - 15, buy_pulse)
-    buy_pulse = np.where(trend_buy_penalty_mask, buy_pulse - 20, buy_pulse)
-    buy_pulse = np.where(extreme_congestion_penalty_mask, buy_pulse - 30, buy_pulse)
-    buy_pulse = np.where(congestion_penalty_mask, buy_pulse - 15, buy_pulse)
-    
-    any_penalty = panic_bear_penalty_mask | trend_buy_penalty_mask | extreme_congestion_penalty_mask | congestion_penalty_mask
-    buy_pulse = np.clip(buy_pulse, 85 if not np.any(any_penalty) else 60, 99)
-    
-    alpha_score = np.where(buy_mask, buy_pulse, alpha_score)
-    
-    if 'Reason' in df.columns:
-        buy_reasons = df['Reason'].fillna("")
-        log_msg = np.where(buy_mask, "買進: " + buy_reasons, log_msg)
+    # --- 逐行計算詳細分數並生成 HTML ---
+    # 為了生成 hover text，這裡使用迴圈處理 (N 不大，效能可接受)
+    for i in range(len(df)):
+        # 1. 決定基礎分 (Base)
+        base_val = 0
+        state_str = ""
         
-        log_msg = np.where(panic_bear_penalty_mask, log_msg + " [⚠️逆勢抄底]", log_msg)
-        log_msg = np.where(trend_buy_penalty_mask, log_msg + " [⚠️未站上長均]", log_msg)
-        log_msg = np.where(congestion_penalty_mask, log_msg + " [⚠️均線糾結]", log_msg)
-        log_msg = np.where(extreme_congestion_penalty_mask, log_msg + " [⛔禁止買入]", log_msg)
+        if buy_mask[i]:
+            base_val = 85
+            state_str = "🔥 買進訊號"
+        elif sell_mask[i]:
+            base_val = -85
+            state_str = "⚡ 賣出訊號"
+        elif position[i] == 1:
+            base_val = 60
+            state_str = "✊ 持倉監控"
+        else:
+            base_val = -30
+            state_str = "👀 空手觀望"
+            
+        # 2. 事件扣分處理 (Event Penalties)
+        event_penalty = 0
+        ep_list = []
+        if panic_bear_penalty_mask[i]:
+            event_penalty -= 15; ep_list.append("逆勢抄底 (-15)")
+        if trend_buy_penalty_mask[i]:
+            event_penalty -= 20; ep_list.append("未站上長均 (-20)")
+        if extreme_congestion_penalty_mask[i]:
+            event_penalty -= 30; ep_list.append("極度糾結 (-30)")
+        elif congestion_penalty_mask[i]:
+            event_penalty -= 15; ep_list.append("均線糾結 (-15)")
+            
+        # 3. 原始加總 (Raw Sum)
+        # 注意: 買賣訊號時，analog_modulation 減半
+        mod_factor = 0.5 if (buy_mask[i] or sell_mask[i]) else 1.0
+        
+        # 加分項
+        bonuses = score_ma30[i] + score_breakout[i] + score_ma_support[i] + score_expansion[i]
+        # 扣分項 (年線蓋頭)
+        penalties = score_trend_penalty[i]
+        # 浮動項
+        fluctuation = score_bias[i] + score_rsi[i] + score_vol[i]
+        
+        total_mod = (fluctuation + bonuses + penalties) * mod_factor
+        raw_score = base_val + total_mod + event_penalty
+        
+        # 4. 限制範圍
+        # 若有重大違規，上限鎖 60/65
+        cap = 100
+        if buy_mask[i]:
+            any_penalty = panic_bear_penalty_mask[i] | trend_buy_penalty_mask[i] | extreme_congestion_penalty_mask[i] | congestion_penalty_mask[i]
+            if any_penalty: cap = 65 if not extreme_congestion_penalty_mask[i] else 60
+            raw_score = min(raw_score, 99) # 買進最高99
+            
+        final_val = np.clip(raw_score, -100, cap)
+        alpha_score[i] = final_val # 存入陣列 (暫不平滑，保留銳利度)
 
-    sell_mask = (action == 'Sell')
-    sell_pulse = -85 + (analog_modulation * 0.5)
-    sell_pulse = np.clip(sell_pulse, -99, -85)
-    alpha_score = np.where(sell_mask, sell_pulse, alpha_score)
-    
-    if 'Reason' in df.columns:
-        sell_reasons = df['Reason'].fillna("")
-        log_msg = np.where(sell_mask, "賣出: " + sell_reasons, log_msg)
+        # 5. 建構 HTML String
+        # 顏色定義
+        c_val = "#ef5350" if final_val > 0 else "#00e676"
+        c_pos = "#ff8a80"
+        c_neg = "#b9f6ca"
+        
+        txt = f"<b>總分: <span style='color:{c_val}; font-size:14px'>{int(final_val)}</span></b><br>"
+        txt += f"<span style='color:#888'>──────────</span><br>"
+        txt += f"<b>[{state_str}] 基分: {base_val}</b><br>"
+        
+        # 技術浮動
+        if fluctuation != 0:
+            txt += f"<b>技術浮動: {fluctuation:.1f}</b><br>"
+            if score_bias[i] != 0: txt += f" • 乖離: {score_bias[i]:+.1f}<br>"
+            if score_rsi[i] != 0: txt += f" • RSI: {score_rsi[i]:+.1f}<br>"
+            if score_vol[i] > 0: txt += f" • 量能: {score_vol[i]:+.1f}<br>"
+            
+        # 加分項目
+        if bonuses > 0:
+            txt += f"<b><span style='color:{c_pos}'>加分項目: +{int(bonuses)}</span></b><br>"
+            if score_ma_support[i] > 0: txt += f" • 均線支撐: +{int(score_ma_support[i])}<br>"
+            if score_expansion[i] > 0: txt += f" • 發散噴出: +{int(score_expansion[i])}<br>"
+            if score_breakout[i] > 0: txt += f" • 百日突破: +{int(score_breakout[i])}<br>"
+            if score_ma30[i] > 0: txt += f" • 強勢乖離: +{int(score_ma30[i])}<br>"
+            
+        # 扣分項目
+        total_pen = penalties + event_penalty
+        if total_pen < 0:
+            txt += f"<b><span style='color:{c_neg}'>扣分項目: {int(total_pen)}</span></b><br>"
+            if penalties < 0: txt += f" • 年線蓋頭: {int(penalties)}<br>"
+            for ep in ep_list:
+                txt += f" • {ep}<br>"
+                
+        detail_html.append(txt)
 
-    # 5. 平滑化
+    # 平滑化處理 (僅針對非買賣點)
     final_series = pd.Series(alpha_score)
     smoothed_score = final_series.ewm(alpha=0.5, adjust=False).mean().values
     final_score = np.where(buy_mask | sell_mask, alpha_score, smoothed_score)
     
     df['Alpha_Score'] = np.clip(final_score, -100, 100)
-    
+    df['Score_Detail'] = detail_html # [新增] 存入 DataFrame
+
+    # 簡單評語生成 (維持舊邏輯)
     conditions = [
-        (df['Alpha_Score'] >= 80),
-        (df['Alpha_Score'] >= 50),
-        (df['Alpha_Score'] >= 0),
-        (df['Alpha_Score'] <= -80),
-        (df['Alpha_Score'] <= -50)
+        (df['Alpha_Score'] >= 80), (df['Alpha_Score'] >= 50), (df['Alpha_Score'] >= 0),
+        (df['Alpha_Score'] <= -80), (df['Alpha_Score'] <= -50)
     ]
     choices = ["🔥 極強勢", "📈 多頭攻勢", "⚖️ 偏多震盪", "⚡ 極弱勢", "📉 空頭修正"]
-    
     base_log = np.select(conditions, choices, default="☁️ 盤整")
     df['Score_Log'] = np.where(buy_mask | sell_mask, log_msg, base_log)
     
+    # 補充評語
     df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & penalty_mask, df['Score_Log'] + " (長空)", df['Score_Log'])
+    rescue_mask = ma240_slope_neg & ma60_slope_pos
     df['Score_Log'] = np.where((~buy_mask) & (~sell_mask) & rescue_mask, df['Score_Log'] + " (轉強)", df['Score_Log'])
-    
+    df['Score_Log'] = np.where(cond_expansion, df['Score_Log'] + " [🚀噴出]", df['Score_Log'])
+    df['Score_Log'] = np.where(ma_support_count == 3, df['Score_Log'] + " [☀️三線]", df['Score_Log'])
+
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
@@ -2128,6 +2164,16 @@ elif page == "📊 單股深度分析":
                     # --- Row 2: Alpha Score ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Score'], name='Alpha Score', marker_color=colors_score), row=2, col=1)
+                    fig.add_trace(go.Bar(
+                        x=final_df['Date'], 
+                        y=final_df['Alpha_Score'], 
+                        name='Alpha Score', 
+                        marker_color=colors_score,
+                        # [新增] 綁定詳細 HTML
+                        hovertext=final_df['Score_Detail'],
+                        # [設定] 顯示模式：x軸(日期) + 自訂文字
+                        hoverinfo="x+text" 
+                    ), row=2, col=1)
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
                     # --- Row 3: Alpha Slope ---
