@@ -625,7 +625,7 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v9.1 (Crash Protection):
+    執行策略回測 v9.1 (Crash Protection Fixed):
     - [既有] Squeeze Ban: 糾結度 < 3% 禁止買入。
     - [新增] Crash Ban: 若年線(MA240)日跌幅達 -0.1% 或更低，禁止恐慌抄底 (Strategy D)。
     """
@@ -664,10 +664,9 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     ma240_series = pd.Series(ma240)
     # 計算變化率： (MA_t - MA_t-1) / MA_t-1
     ma240_slope = ma240_series.pct_change().fillna(0).values
-    is_crash_trend = ma240_slope <= -0.001
-    # 崩盤扣分 Mask: 只要處於崩盤趨勢，若出現買訊或持倉，都給予重罰
-    crash_penalty_mask = (buy_mask | (position == 1)) & is_crash_trend
-
+    
+    # 產生一個陣列，標記每天是否處於崩盤趨勢
+    is_crash_trend_array = ma240_slope <= -0.001
 
     # 預先計算「均線糾結指數」
     ma_stack = np.vstack([ma60, ma120, ma240])
@@ -694,9 +693,8 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
         # [既有] 糾結禁買判定 (Squeeze Ban)
         is_squeeze_ban = congestion_index[i] < 0.03
 
-        # [新增] 崩盤禁買判定 (Crash Ban)
-        # 條件：年線每日下彎幅度 >= 0.1% (即 <= -0.001)
-        is_crash_trend = ma240_slope[i] <= -0.001
+        # [新增] 崩盤禁買判定 (Crash Ban) - 使用陣列索引 [i]
+        is_crash_active = is_crash_trend_array[i]
 
         # --- 進場邏輯 ---
         if position == 0:
@@ -715,8 +713,8 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                 elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                     is_buy=True; trade_type=3; reason_str="籌碼佈局"
                 # 策略 D: 超賣反彈 (Crash Protection Applied)
-                # 增加條件：and (not is_crash_trend)
-                elif (not is_crash_trend) and rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
+                # 這裡使用 is_crash_active (布林值) 來判斷
+                elif (not is_crash_active) and rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                     is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
