@@ -2163,7 +2163,7 @@ elif page == "📊 單股深度分析":
 
                     # --- Row 2: Alpha Score ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Score'], name='Alpha Score', marker_color=colors_score), row=2, col=1)
+             
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], 
                         y=final_df['Alpha_Score'], 
@@ -2174,6 +2174,7 @@ elif page == "📊 單股深度分析":
                         # [設定] 顯示模式：x軸(日期) + 自訂文字
                         hoverinfo="x+text" 
                     ), row=2, col=1)
+
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
                     # --- Row 3: Alpha Slope ---
