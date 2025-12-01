@@ -987,8 +987,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v7.0 (Detail Breakdown):
+    Alpha Score v7.1 (Crash Penalty Added):
     - 功能: 除了計算分數，還產生詳細的 HTML 格式評分報告 (Score_Detail)，供圖表 Hover 使用。
+    - [新增] 崩盤扣分機制：若年線下彎斜率過大，給予嚴重扣分。
     """
     df = df.copy()
 
@@ -1098,8 +1099,18 @@ def calculate_alpha_score(df, margin_df, short_df):
     extreme_congestion_penalty_mask = buy_mask & is_extremely_congested
     congestion_penalty_mask = buy_mask & (~is_panic_strat) & is_congested
 
+    # =========================================================================
+    # [關鍵修正點] 必須在進入迴圈前，定義 crash_penalty_mask
+    # =========================================================================
+    ma240_series = pd.Series(ma240)
+    ma240_slope_val = ma240_series.pct_change().fillna(0).values # 變數名稱改為 slope_val 避免混淆
+    is_crash_trend = ma240_slope_val <= -0.001
+    
+    # 定義：若買進或持倉時遇到崩盤趨勢，給予扣分
+    crash_penalty_mask = (buy_mask | (position == 1)) & is_crash_trend
+    # =========================================================================
+
     # --- 逐行計算詳細分數並生成 HTML ---
-    # 為了生成 hover text，這裡使用迴圈處理 (N 不大，效能可接受)
     for i in range(len(df)):
         # 1. 決定基礎分 (Base)
         base_val = 0
@@ -1125,10 +1136,13 @@ def calculate_alpha_score(df, margin_df, short_df):
             event_penalty -= 15; ep_list.append("逆勢抄底 (-15)")
         if trend_buy_penalty_mask[i]:
             event_penalty -= 20; ep_list.append("未站上長均 (-20)")
+        
         if extreme_congestion_penalty_mask[i]:
             event_penalty -= 30; ep_list.append("極度糾結 (-30)")
         elif congestion_penalty_mask[i]:
             event_penalty -= 15; ep_list.append("均線糾結 (-15)")
+            
+        # [新增] 崩盤趨勢扣分 (這裡就可以安全呼叫 crash_penalty_mask[i] 了)
         if crash_penalty_mask[i]:
             event_penalty -= 40; ep_list.append("主跌崩盤 (-40)")
             
@@ -1150,7 +1164,8 @@ def calculate_alpha_score(df, margin_df, short_df):
         # 若有重大違規，上限鎖 60/65
         cap = 100
         if buy_mask[i]:
-            any_penalty = panic_bear_penalty_mask[i] | trend_buy_penalty_mask[i] | extreme_congestion_penalty_mask[i] | congestion_penalty_mask[i]
+            # 包含 crash_penalty_mask
+            any_penalty = panic_bear_penalty_mask[i] | trend_buy_penalty_mask[i] | extreme_congestion_penalty_mask[i] | congestion_penalty_mask[i] | crash_penalty_mask[i]
             if any_penalty: cap = 65 if not extreme_congestion_penalty_mask[i] else 60
             raw_score = min(raw_score, 99) # 買進最高99
             
@@ -1198,7 +1213,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     final_score = np.where(buy_mask | sell_mask, alpha_score, smoothed_score)
     
     df['Alpha_Score'] = np.clip(final_score, -100, 100)
-    df['Score_Detail'] = detail_html # [新增] 存入 DataFrame
+    df['Score_Detail'] = detail_html 
 
     # 簡單評語生成 (維持舊邏輯)
     conditions = [
