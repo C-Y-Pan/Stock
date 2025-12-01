@@ -620,13 +620,10 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True):
     """
-    執行策略回測 v4 (Bonus Factors):
-    新增信心加分條件:
-    1. 收盤 > MA30 * 1.04 (乖離 > 4%)
-    2. 週漲幅 < 27% (未過熱)
-    3. 收盤創 100 日新高 (突破)
+    執行策略回測 v5 (Chip Strategy Toggle):
+    新增 use_chip_strategy 參數，控制是否啟用「籌碼佈局」策略。
     """
     df = data.copy()
     positions = []; reasons = []; actions = []; target_prices = []
@@ -638,8 +635,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
     bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
     ma240 = df['MA240'].fillna(method='bfill').values
-    
-    # [新增] 讀取新指標
     ma30 = df['MA30'].ffill().values
     high_100d = df['High_100d'].fillna(0).values
     close_lag5 = df['Close_Lag5'].fillna(close[0]).values
@@ -670,26 +665,27 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
             is_buy = False
             rsi_threshold_A = 60 if is_strict_bear else 55
             
-            # 策略 A
+            # 策略 A: 動能突破
             if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
                 is_buy=True; trade_type=1; reason_str="動能突破"
-            # 策略 B
+            
+            # 策略 B: 均線回測
             elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
                 is_buy=True; trade_type=1; reason_str="均線回測"
-            # 策略 C
-            elif not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
+            
+            # 策略 C: 籌碼佈局 (新增 use_chip_strategy 開關)
+            elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
                 is_buy=True; trade_type=3; reason_str="籌碼佈局"
-            # 策略 D
+            
+            # 策略 D: 超賣反彈
             elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
                 is_buy=True; trade_type=2; reason_str="超賣反彈"
             
             if is_buy:
                 signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
                 
-                # === 計算信心值 (AI Confidence Score) ===
+                # === 計算信心值 ===
                 base_score = 60
-                
-                # 既有因子
                 if is_strict_bear: base_score -= 10
                 if is_ma240_down and is_ma60_up: base_score += 5
                 if volume[i] > vol_ma20[i] * 1.5: base_score += 15
@@ -699,19 +695,13 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
                 elif trade_type == 2 and rsi[i] <= 25: base_score += 10
                 if i > 3 and bb_width_vals[i-1] < 0.15: base_score += 5
                 
-                # [新增] 額外加分條件
-                # 1. 強勢動能：收盤 > MA30 * 1.04 (+5分)
-                if close[i] > ma30[i] * 1.04:
-                    base_score += 5
+                if close[i] > ma30[i] * 1.04: base_score += 5
                 
-                # 2. 優質突破：創新高 且 週漲幅未過熱 (+15分)
-                # 週漲幅 = current / 5_days_ago
                 weekly_ratio = close[i] / close_lag5[i] if close_lag5[i] > 0 else 1.0
                 is_not_overheated = weekly_ratio < 1.27
                 is_breakout = close[i] >= high_100d[i]
                 
-                if is_breakout and is_not_overheated:
-                    base_score += 15
+                if is_breakout and is_not_overheated: base_score += 15
                 
                 conf_score = min(base_score, 99)
         
@@ -756,7 +746,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
     df['Target_Price']=target_prices; df['Return_Label']=return_labels
     df['Confidence'] = confidences
     
-    # 計算報酬
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = df['Close'].pct_change().fillna(0)
     df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
@@ -771,18 +760,18 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003)
 
 
 # 修改後：傳遞成本參數
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003):
+def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True):
     best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
     
-    # 為了節省運算，這裡只展示部分參數組合，實務上可擴增
+    # 這裡只展示部分參數組合
     for m in [3.0, 3.5]:
         for r in [25, 30]:
             df_ind = calculate_indicators(raw_df, 10, m, market_df)
             df_slice = df_ind[df_ind['Date'] >= target_start].copy()
             if df_slice.empty: continue
             
-            # [關鍵] 傳入成本參數
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate)
+            # [修改] 傳遞 use_chip_strategy
+            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy)
             
             ret = df_res['Cum_Strategy'].iloc[-1] - 1
             if ret > best_ret:
@@ -1568,7 +1557,7 @@ with st.sidebar:
     tw_tz = pytz.timezone('Asia/Taipei')
     today = datetime.now(tw_tz).date() # 強制使用台北時間的今天
     st.markdown("---")
-    with st.expander("⚙️ 參數與日期設定", expanded=False):
+with st.expander("⚙️ 參數與日期設定", expanded=False):
             today = datetime.now(tw_tz).date()
             start_date = st.date_input("開始", value=today - timedelta(days=365*2+1))
             end_date = st.date_input("結束", value=today)
@@ -1576,6 +1565,10 @@ with st.sidebar:
             st.caption("交易成本設定")
             fee_input = st.number_input("手續費(%)", value=0.1425, step=0.01) / 100
             tax_input = st.number_input("交易稅(%)", value=0.3000, step=0.01) / 100
+            
+            # [新增] 策略開關
+            st.caption("策略組態")
+            enable_chip_strategy = st.toggle("啟用籌碼佈局策略 (Strategy C)", value=True)
 
 market_df = get_market_data(start_date, end_date)
 
