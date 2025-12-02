@@ -978,155 +978,152 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v8.0 (Analog & Signal-Synced):
-    - 買賣點精確對齊策略回測結果 (Buy=+95, Sell=-95)。
-    - 非交易日採用連續性技術指標評分，呈現類比 (Analog) 波動。
+    Alpha Score v9.0 (Digital Quant):
+    基於「積木式計分」將策略邏輯數位化。
+    買賣訊號具最高權重，持倉期間則依據技術面狀態動態加減分。
     """
     df = df.copy()
 
-    # 防呆：若無策略結果，回傳備用版
-    if 'Action' not in df.columns or 'Position' not in df.columns:
-        return calculate_alpha_score_technical_fallback(df)
-
-    # 1. 補全基礎指標 (若上游未計算)
+    # 1. 確保必要欄位存在
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
+    if 'OBV_MA20' not in df.columns: df['OBV_MA20'] = df['OBV'].rolling(20).mean()
     
-    # 準備 Numpy Arrays 加速運算
+    # 準備 Numpy Arrays
     close = df['Close'].values
-    ma20 = df['MA20'].fillna(method='bfill').values
-    ma60 = df['MA60'].fillna(method='bfill').values
+    ma20 = df['MA20'].fillna(0).values
+    ma60 = df['MA60'].fillna(0).values
     rsi = df['RSI'].fillna(50).values
     volume = df['Volume'].fillna(0).values
     vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
+    obv = df['OBV'].fillna(0).values
+    obv_ma20 = df['OBV_MA20'].fillna(0).values
     
-    # 讀取策略訊號
-    actions = df['Action'].values
-    positions = df['Position'].values # 0=空手, 1=持倉
+    # 策略訊號
+    actions = df['Action'].values if 'Action' in df.columns else np.array(['Wait']*len(df))
+    positions = df['Position'].values if 'Position' in df.columns else np.zeros(len(df))
+    reasons = df['Reason'].values if 'Reason' in df.columns else np.array(['']*len(df))
 
-    # ==========================================
-    # A. 計算連續性技術分數 (Analog Base Score)
-    # ==========================================
-    # 範圍設計：約 -50 ~ +50，作為背景波動
-    
-    # 1. 趨勢分數 (Trend): 價格在均線之上給分
-    score_trend = np.zeros(len(df))
-    score_trend += np.where(close > ma20, 15, -15)
-    score_trend += np.where(close > ma60, 15, -15)
-    score_trend += np.where(ma20 > ma60, 10, -5) # 多頭排列
-
-    # 2. 動能分數 (Momentum): RSI 的連續變化
-    # 將 RSI 50 定為 0 分，每增減 1 點貢獻 0.8 分，並限制範圍
-    score_rsi = (rsi - 50) * 1.2 
-    score_rsi = np.clip(score_rsi, -25, 25)
-
-    # 3. 量能分數 (Volume): 量增價漲
-    vol_ratio = volume / vol_ma20
-    is_up = close > df['Close'].shift(1).fillna(method='bfill').values
-    score_vol = np.where((vol_ratio > 1.2) & is_up, 10, 0)
-    score_vol = np.where((vol_ratio > 1.2) & (~is_up), -10, score_vol)
-
-    # 4. 乖離修正 (Bias Penalty)
-    bias = (close - ma20) / ma20
-    score_bias = np.where(bias > 0.15, -10, 0) # 乖離過大扣分(避免過熱)
-    
-    # 合成背景技術分 (-60 ~ +60)
-    raw_analog = score_trend + score_rsi + score_vol + score_bias
-
-    # ==========================================
-    # B. 訊號錨定與狀態融合 (Signal Anchoring)
-    # ==========================================
-    final_score = np.zeros(len(df))
-    detail_html = []
-    
-    # 用於平滑的暫存變數
-    last_score = 0.0
+    final_scores = []
+    detail_htmls = []
+    log_summaries = []
 
     for i in range(len(df)):
+        score = 0
+        details = [] # 用於儲存每一項得分的說明文字
+        
+        # ==========================================
+        # A. 訊號強制權重 (Signal Override)
+        # ==========================================
         act = actions[i]
         pos = positions[i]
         
-        # 1. 決定目標分數 (Target Score)
         if act == 'Buy':
-            # 買進日：強制極高分 (代表訊號觸發)
-            current_score = 95.0
-            status_desc = "🚀 策略買進"
-            c_status = "#ff1744"
-            
+            score = 95
+            details.append(f"🚀 <b>策略買進訊號</b> (+95)<br><span style='font-size:10px; color:#aaa'>原因: {reasons[i]}</span>")
+            status_desc = "極強勢"
+        
         elif act == 'Sell':
-            # 賣出日：強制極低分 (代表訊號結束)
-            current_score = -95.0
-            status_desc = "⚡ 策略賣出"
-            c_status = "#00e676"
-            
-        elif pos == 1:
-            # 持倉中：以 50 分為基準，疊加技術波動
-            # 讓分數在 20 ~ 90 之間浮動，體現持股強弱
-            base = 50.0
-            current_score = base + (raw_analog[i] * 0.8) # 係數調整波動幅度
-            current_score = np.clip(current_score, 20, 90) # 限制在正值區間
-            status_desc = "✊ 持倉續抱"
-            c_status = "#ff5252"
+            score = -95
+            details.append(f"⚡ <b>策略賣出訊號</b> (-95)<br><span style='font-size:10px; color:#aaa'>原因: {reasons[i]}</span>")
+            status_desc = "極弱勢"
             
         else:
-            # 空手/觀望：以 -30 分為基準
-            # 讓分數在 -80 ~ 10 之間浮動
-            base = -30.0
-            current_score = base + (raw_analog[i] * 0.6)
-            current_score = np.clip(current_score, -90, 10)
-            status_desc = "👀 空手觀望"
-            c_status = "#b9f6ca"
+            # ==========================================
+            # B. 持倉/觀望狀態的技術面評分 (Technical Scoring)
+            # ==========================================
+            
+            # 1. 基礎持倉分 (Base Position Score)
+            if pos == 1:
+                score += 30
+                details.append("✊ <b>持倉基礎分</b> (+30)")
+            else:
+                score -= 10
+                details.append("👀 <b>空手基礎分</b> (-10)")
 
-        # 2. 平滑處理 (Smoothing) - 僅針對非買賣點
-        # 買賣點不平滑，確保視覺上的「乾脆」
-        if act in ['Buy', 'Sell']:
-            final_val = current_score
-        else:
-            # 使用 EMA 讓曲線圓滑 (alpha=0.6 代表新值佔 60%)
-            final_val = (last_score * 0.4) + (current_score * 0.6)
-        
-        last_score = final_val
-        final_score[i] = final_val
+            # 2. 趨勢面 (Trend)
+            if close[i] > ma60[i]:
+                score += 20
+                details.append("📈 股價 > 季線 (+20)")
+            else:
+                score -= 20
+                details.append("📉 股價 < 季線 (-20)")
+                
+            if ma20[i] > ma60[i]:
+                score += 10
+                details.append("✅ 均線多頭排列 (+10)")
+            
+            # 3. 動能面 (Momentum)
+            if rsi[i] > 50:
+                score += 10
+                details.append("🔥 RSI 強勢區 (>50) (+10)")
+            elif rsi[i] < 30:
+                 # 低檔鈍化/超賣給予一點支撐分，除非是持倉狀態且破線
+                if pos == 1 and close[i] < ma20[i]:
+                    score -= 10
+                    details.append("⚠️ RSI 低檔弱勢 (-10)")
+                else:
+                    score += 5
+                    details.append("💎 RSI 超賣潛力 (+5)")
+            
+            # 4. 籌碼量能面 (Volume & Chip)
+            if volume[i] > vol_ma20[i]:
+                if close[i] > close[i-1]:
+                    score += 10
+                    details.append("🔴 量增價漲 (+10)")
+                else:
+                    score -= 10
+                    details.append("🟢 量增價跌 (-10)")
+            
+            if obv[i] > obv_ma20[i]:
+                score += 10
+                details.append("💰 OBV > 均量 (+10)")
 
-        # 3. 生成 HTML 詳細報告 (Hover Tooltip)
-        val_int = int(final_val)
-        
-        # 顏色邏輯
-        c_score = "#ff5252" if val_int > 0 else "#00e676"
-        
-        txt = f"<b>Alpha Score: <span style='color:{c_score}; font-size:16px'>{val_int}</span></b><br>"
-        txt += f"<span style='color:#888; font-size:12px'>────── 狀態解析 ──────</span><br>"
-        txt += f"<b><span style='color:{c_status}'>{status_desc}</span></b><br>"
-        
-        if act not in ['Buy', 'Sell']:
-            txt += f"技術基底: {raw_analog[i]:.1f}<br>"
-            if score_rsi[i] != 0: txt += f" • RSI貢獻: {score_rsi[i]:+.1f}<br>"
-            if score_trend[i] != 0: txt += f" • 趨勢貢獻: {score_trend[i]:+.1f}<br>"
-            if score_vol[i] != 0: txt += f" • 量能貢獻: {score_vol[i]:+.1f}<br>"
-        else:
-            reason = df['Reason'].iloc[i]
-            txt += f"觸發原因: {reason}<br>"
+            # 5. 乖離修正 (Bias Penalty)
+            # 防止分數無限膨脹，當乖離過大時扣分
+            bias = (close[i] - ma20[i]) / ma20[i]
+            if bias > 0.15:
+                score -= 10
+                details.append("⚠️ 乖離過大 (-10)")
 
-        detail_html.append(txt)
+            # 限制分數區間 -100 ~ 100
+            score = max(min(score, 100), -100)
+            
+            # 狀態描述
+            if score >= 60: status_desc = "強勢多頭"
+            elif score >= 20: status_desc = "偏多整理"
+            elif score >= -20: status_desc = "中性震盪"
+            elif score <= -60: status_desc = "弱勢空頭"
+            else: status_desc = "偏空調整"
 
-    # 存入 DataFrame
-    df['Alpha_Score'] = np.clip(final_score, -100, 100)
-    df['Score_Detail'] = detail_html
+        final_scores.append(score)
+        log_summaries.append(status_desc)
+
+        # ==========================================
+        # C. 組合 HTML Tooltip
+        # ==========================================
+        # 標題顏色
+        title_color = "#ff5252" if score > 0 else "#00e676"
+        
+        # 組合 HTML
+        html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:16px'>{int(score)}</span></b><br>"
+        html_str += f"<span style='color:#ccc; font-size:12px'>狀態: {status_desc}</span><br>"
+        html_str += "<hr style='margin:4px 0; border-color:#444'>"
+        html_str += "<br>".join(details)
+        
+        detail_htmls.append(html_str)
+
+    df['Alpha_Score'] = final_scores
+    df['Score_Detail'] = detail_htmls
+    df['Score_Log'] = log_summaries
     
-    # 產生簡易評語 Log
-    conditions = [
-        (df['Alpha_Score'] >= 80), (df['Alpha_Score'] >= 40), (df['Alpha_Score'] >= 0),
-        (df['Alpha_Score'] <= -80), (df['Alpha_Score'] <= -40)
-    ]
-    choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 偏多震盪", "⚡ 極弱勢", "📉 空頭修正"]
-    df['Score_Log'] = np.select(conditions, choices, default="☁️ 盤整")
-    
-    # 輔助欄位：建議倉位 (將 -100~100 映射到 0~100%)
+    # 輔助欄位：建議倉位
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
+    
 
 
 def calculate_alpha_score_technical_fallback(df):
@@ -1818,9 +1815,17 @@ elif page == "📊 單股深度分析":
                 if math.isnan(final_composite_score):
                     final_composite_score = 0
                 
-                # 組合最終顯示日誌
-                full_log_text = f"{base_log} {adjustment_log}" if base_log or adjustment_log else "無顯著特徵"
+                # 組合最終顯示日誌 (改為顯示最後一天的詳細 HTML，需去除 HTML 標籤以純文字顯示在 st.info)
+                import re
+                last_detail_html = final_df['Score_Detail'].iloc[-1]
+                # 簡單去除 HTML tag 方便在 st.info 閱讀
+                clean_log = re.sub('<[^<]+?>', ' ', last_detail_html).replace("Alpha Score:", "").strip()
+                # 整理格式
+                clean_log = clean_log.replace("  ", "\n").replace("狀態:", " | 狀態:")
                 
+                with log_col:
+                     st.info(f"**🧮 本日評分結構：**\n\n{clean_log}")
+
                 # 計算其餘指標
                 beta, vol, personality = calculate_stock_personality(final_df, market_df)
                 hit_rate, hits, total = calculate_target_hit_rate(final_df)
@@ -1858,25 +1863,52 @@ elif page == "📊 單股深度分析":
 
                 st.markdown("---")
 
-                # 3. AI 評分區塊 (維持不變，僅微調版面)
+                # ==========================================
+                # 3. AI 評分區塊 (修正版)
+                # ==========================================
                 st.markdown("### 🏆 AI 綜合評分與決策依據")
+                
+                # [修正 1] 先定義 Columns，解決 log_col not defined 錯誤
                 score_col, log_col = st.columns([1, 3])
                 
+                # [修正 2] 重新計算與準備資料
+                # 確保使用新的 calculate_alpha_score (v9.0 Digital Quant)
+                stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
+                final_score = stock_alpha_df['Alpha_Score'].iloc[-1]
+                
+                # [修正 3] 準備 full_log_text (從 HTML 轉回純文字以利閱讀)
+                import re
+                last_detail_html = stock_alpha_df['Score_Detail'].iloc[-1]
+                
+                # 使用 Regex 去除 HTML 標籤 (例如 <b>, <span>, <br>) 以便在 st.info 顯示
+                clean_log = re.sub('<[^<]+?>', ' ', last_detail_html)
+                # 去除標題贅字並整理空白
+                clean_log = clean_log.replace("Alpha Score:", "").strip()
+                # 將連續空白轉為換行，讓排版更整齊
+                full_log_text = clean_log.replace("   ", "\n").replace("  ", "\n").replace("狀態:", " | 狀態:")
+
+                # 取得動作建議 (用於 Metric 顯示)
+                action, color, reason = analyze_signal(final_df)
+
+                # --- 左側：顯示大數字分數 ---
                 with score_col:
                     s_color = "normal"
-                    if final_composite_score >= 60: s_color = "off" 
-                    elif final_composite_score <= -20: s_color = "inverse"
+                    if final_score >= 60: s_color = "off" 
+                    elif final_score <= -20: s_color = "inverse"
                     
                     st.metric(
                         label="綜合評分 (Alpha Score)",
-                        value=f"{int(final_composite_score)} 分",
+                        value=f"{int(final_score)} 分",
                         delta=action,
                         delta_color=s_color
                     )
                 
+                # --- 右側：顯示詳細算式 ---
                 with log_col:
-                    st.info(f"**🧮 演算歷程解析：**\n\n{full_log_text}")
+                    # 這裡使用剛剛處理好的 full_log_text
+                    st.info(f"**🧮 演算歷程解析 (積木計分)：**\n\n{full_log_text}")
 
+                # [後續接回原本的程式碼]
                 # 1. 計算策略績效
                 strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
                 strat_ret = best_params['Return'] * 100
@@ -2087,7 +2119,7 @@ elif page == "📊 單股深度分析":
                     if not sell_all.empty:
                         fig.add_trace(go.Scatter(x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', text=get_sell_text(sell_all), textposition="top center", textfont=dict(color='white', size=11), marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), name='賣出', hovertext=sell_all['Reason']), row=1, col=1)
 
-                    # --- Row 2: Alpha Score ---
+                    # --- Row 2: Alpha Score (Updated) ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
              
                     fig.add_trace(go.Bar(
@@ -2095,9 +2127,14 @@ elif page == "📊 單股深度分析":
                         y=final_df['Alpha_Score'], 
                         name='Alpha Score', 
                         marker_color=colors_score,
-                        # [新增] 綁定詳細 HTML
+                        
+                        # [重點 1] 綁定我們計算好的 HTML 詳細說明欄位
                         hovertext=final_df['Score_Detail'],
-                        # [設定] 顯示模式：x軸(日期) + 自訂文字
+                        
+                        # [重點 2] 設定顯示模式
+                        # x: 顯示日期 (X軸)
+                        # text: 顯示我們自訂的 hovertext HTML 內容
+                        # 這樣可以遮蔽掉 Plotly 預設醜醜的 "Alpha Score=80" 格式
                         hoverinfo="x+text" 
                     ), row=2, col=1)
 
