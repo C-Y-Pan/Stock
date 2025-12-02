@@ -760,6 +760,27 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
 
 
 
+# 修改後：傳遞成本參數
+def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
+    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
+    
+    for m in [3.0, 3.5]:
+        for r in [25, 30]:
+            df_ind = calculate_indicators(raw_df, 10, m, market_df)
+            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
+            if df_slice.empty: continue
+            
+            # [修改] 傳遞 use_strict_bear_exit
+            df_res = run_alpha_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy, use_strict_bear_exit)
+            
+            ret = df_res['Cum_Strategy'].iloc[-1] - 1
+            if ret > best_ret:
+                best_ret = ret
+                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
+                best_df = df_res
+    return best_params, best_df
+
+
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
@@ -791,7 +812,7 @@ def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.0014
     test_ind = calculate_indicators(test_data_raw, 10, best_params_train['Mult'], market_df)
     
     # 執行策略 (使用訓練集找出的最佳 RSI 閾值)
-    test_res_df = run_simple_strategy(test_ind, best_params_train['RSI_Buy'], fee_rate, tax_rate)
+    test_res_df = run_alpha_strategy(test_ind, best_params_train['RSI_Buy'], fee_rate, tax_rate)
     
     # 4. 績效比較與指標計算
     def get_metrics(df):
