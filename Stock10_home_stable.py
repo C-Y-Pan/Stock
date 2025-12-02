@@ -1051,14 +1051,12 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v10.0 (Panic Fix):
-    1. 修正「高檔出貨」邏輯：低檔爆量不扣分，視為換手。
-    2. 引入「抄底豁免權」：若觸發反彈策略，暫時無視均線空頭扣分。
-    3. 放寬反彈觸發門檻：RSI < 35 即可 (原 30)。
+    Alpha Score v10.1 (Fix NameError):
+    修復缺少 low/high 變數定義導致的崩潰問題。
     """
     df = df.copy()
 
-    # --- 1. 基礎指標準備 (維持不變) ---
+    # --- 1. 基礎指標準備 ---
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
@@ -1074,8 +1072,12 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['BB_Lower'] = df['MA20'] - 2 * std
     if 'SuperTrend' not in df.columns: df['SuperTrend'] = df['MA20']
 
-    # Numpy 加速
+    # --- Numpy 加速 (變數定義區) ---
     close = df['Close'].values
+    # [關鍵修正] 補上 high 與 low
+    high = df['High'].values
+    low = df['Low'].values
+    
     vol = df['Volume'].fillna(0).values
     vol_ma = df['Vol_MA20'].replace(0, 1).fillna(1).values
     rsi = df['RSI'].fillna(50).values
@@ -1095,7 +1097,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     ma120_slope = pd.Series(ma120).pct_change().fillna(0).values
     ma240_slope = pd.Series(ma240).pct_change().fillna(0).values
 
-    # --- 2. 趨勢評分 (維持不變) ---
+    # --- 2. 趨勢評分 ---
     score_trend = np.zeros(len(df))
     score_trend += np.where(close > ma20, 5, -5)
     score_trend += np.where(close > ma60, 10, -10)
@@ -1104,7 +1106,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_bull_align = (ma20 > ma60) & (ma60 > ma120)
     score_trend += np.where(is_bull_align, 5, 0)
 
-    # --- 3. 動能評分 (維持不變) ---
+    # --- 3. 動能評分 ---
     score_mom = np.zeros(len(df))
     score_mom += np.clip((rsi - 50) * 0.5, -10, 10)
     price_change = pd.Series(close).diff().fillna(0).values
@@ -1120,22 +1122,22 @@ def calculate_alpha_score(df, margin_df, short_df):
     # --- 4. 策略型態加分 (Pattern) ---
     score_pattern = np.zeros(len(df))
     
+    # 策略 A: 動能突破
     cond_strat_a = is_supertrend_bull & (vol > vol_ma) & (close > ma60) & (rsi > 55) & (obv > obv_ma)
     score_pattern += np.where(cond_strat_a, 15, 0)
     
+    # 策略 B: 均線回測 (這裡原本會報錯，因為用了 low)
     cond_strat_b = is_supertrend_bull & (close > ma60) & (close > ma20) & (low <= ma20 * 1.02) & (vol < vol_ma) & (rsi > 45)
     score_pattern += np.where(cond_strat_b, 15, 0)
     
+    # 策略 C: 籌碼佈局
     cond_strat_c = (close > ma60) & (obv > obv_ma) & (vol < vol_ma) & ((close < ma20) | (rsi < 55)) & (close > bb_lower)
     score_pattern += np.where(cond_strat_c, 10, 0)
     
-    # [修正] 策略 D: 超賣反彈 (放寬條件)
-    # RSI < 35 即可 (原 30)，或者乖離極大 (Close < BB_Lower * 0.98)
+    # 策略 D: 超賣反彈 (放寬條件)
     cond_rebound_rsi = (rsi < 35)
     cond_rebound_price = (close < bb_lower)
-    cond_rebound_vol = (vol > vol_ma * 0.5) # 稍微有量
-    
-    # 只要 (RSI低 且 破布林 且 有量) 即觸發
+    cond_rebound_vol = (vol > vol_ma * 0.5) 
     cond_strat_d = cond_rebound_rsi & cond_rebound_price & cond_rebound_vol
     score_pattern += np.where(cond_strat_d, 45, 0)
 
@@ -1147,23 +1149,17 @@ def calculate_alpha_score(df, margin_df, short_df):
     # --- 5. 風險懲罰 (Risk Fix) ---
     score_penalty = np.zeros(len(df))
     
-    # A. 崩盤濾網 (年線快速下彎) - 這依然要保留，防止接到主跌段
+    # A. 崩盤濾網
     is_crash = ma240_slope <= -0.001
-    # [優化] 如果觸發了「超賣反彈」，且年線斜率沒有到非常誇張 (例如 > -0.003)，則豁免崩盤扣分
-    # 意即：允許緩跌中的反彈，但禁止急跌中的接刀
     exempt_crash = cond_strat_d & (ma240_slope > -0.003)
     score_penalty += np.where(is_crash & (~exempt_crash), -50, 0)
     
-    # B. 高檔出貨 (Critical Fix!)
-    # 原邏輯：量大 + 漲不動 = 出貨
-    # 新邏輯：量大 + 漲不動 + [RSI > 40] = 出貨。如果 RSI < 40 且爆量，那是「恐慌清洗」，不扣分！
+    # B. 高檔出貨
     cond_distribution = (vol > vol_ma * 2.5) & (pd.Series(close).pct_change().fillna(0) < 0.005) & (rsi > 40)
     score_penalty += np.where(cond_distribution, -20, 0)
 
-    # C. 三線空頭 (Critical Fix!)
+    # C. 三線空頭 (抄底豁免)
     is_triple_bear = (ma60_slope < 0) & (ma120_slope < 0) & (ma240_slope < 0)
-    # [優化] 豁免權：如果觸發了「超賣反彈 (Strategy D)」，就忽略三線空頭的扣分
-    # 因為抄底本身就是在空頭趨勢中尋找轉折，不應重複懲罰趨勢
     score_penalty += np.where(is_triple_bear & (~cond_strat_d), -30, 0)
     
     # D. 均線糾結
@@ -1176,12 +1172,11 @@ def calculate_alpha_score(df, margin_df, short_df):
     raw_score = score_trend + score_mom + score_pattern + score_penalty
     final_score = np.clip(raw_score, -100, 100)
     
-    # 平滑化
     final_series = pd.Series(final_score).ewm(alpha=0.6, adjust=False).mean()
     final_score_smoothed = final_series.values
     df['Alpha_Score'] = final_score_smoothed.astype(int)
     
-    # 生成 HTML Tooltip (保持您之前要求的詳細版)
+    # HTML Tooltip
     detail_html = []
     log_msg = []
     C_POS = "#ef5350"; C_NEG = "#00e676"
@@ -1207,18 +1202,15 @@ def calculate_alpha_score(df, margin_df, short_df):
             if is_triple_bear[i] and not cond_strat_d[i]: txt += "  • 🐻 三線空頭 (-30)<br>"
             if cond_distribution[i]: txt += "  • 💣 高檔出貨 (-20)<br>"
             
-        # 豁免提示 (Debug用)
         if cond_strat_d[i] and is_triple_bear[i]:
              txt += "<span style='color:orange; font-size:0.8em'>*觸發抄底，豁免空頭扣分</span><br>"
 
-        # 診斷資訊
         txt += "────────────────<br>🔍 <b>關鍵數據:</b><br>"
         txt += f"• RSI: {rsi[i]:.1f}<br>"
         txt += f"• 年線斜率: {ma240_slope[i]:.5f}<br>"
 
         detail_html.append(txt)
         
-        # 簡單日誌
         log = "盤整"
         if cond_strat_d[i]: log = "💎 抄底機會"
         elif s >= 0: log = "📈 偏多"
