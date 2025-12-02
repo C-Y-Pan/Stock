@@ -816,9 +816,9 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
     best_df = df_slice.copy()
     
     # 2. 測試不同的「買進門檻」
-    # 注意：賣出門檻固定設為 20 (稍微轉弱就跑，不要等到 0)
-    # 如果您想要更靈敏，可以改成 30
-    fixed_sell_threshold = 20
+    # 注意：賣出門檻固定設為 4 (稍微轉弱就跑，不要等到 0)
+    # 如果您想要更靈敏，可以改成 10
+    fixed_sell_threshold = 4
     
     thresholds = [55, 60, 65, 70]
     
