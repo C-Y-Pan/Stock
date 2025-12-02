@@ -625,16 +625,27 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略執行核心 v10.4 (Pure Alpha / No Stop Loss):
-    - [移除] 硬性停損保護。現在即便虧損 50%，只要 Alpha Score >= 0 就會死抱。
-    - [嚴格] 賣出條件只有一個：Alpha Score < sell_threshold (預設為 0)。
+    策略執行核心 v10.5 (Clean Slate):
+    - [強制清洗] 計算分數前清空歷史 Action/Position，確保取得「純技術評分」。
+    - [顯示優化] 顯示小數點位，避免 -0.5 被誤認為 0 分。
+    - [嚴格執行] 只有 Score < sell_threshold (0) 才會賣出。
     """
     df = data.copy()
     
-    # 1. 確保 Alpha Score 已計算
-    if 'Alpha_Score' not in df.columns:
-        df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
+    # ==========================================
+    # 1. 強制清洗與重算 (關鍵修正)
+    # ==========================================
+    # 我們需要「純粹」的技術分數，不受上次回測的「賣出訊號(-85分)」干擾
+    # 所以先將狀態重置為「觀望」
+    df['Action'] = 'Wait'
+    df['Position'] = 0
+    
+    # 重新計算 Alpha Score (基於純技術面)
+    df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
+    # ==========================================
+    # 2. 開始回測
+    # ==========================================
     positions = []      
     actions = []        
     reasons = []        
@@ -673,13 +684,15 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
             curr_val = price + cum_div
             
             # --- 賣出檢查 ---
-            # [修正] 移除硬性停損，完全依賴分數
+            # 條件: 分數低於門檻 (例如 < 0)
+            # 這裡我們使用浮點數比較，非常精確
             cond_score_exit = (score < sell_threshold)
             
             if cond_score_exit:
                 position = 0
                 current_action = "Sell"
-                current_reason = f"趨勢翻空 ({int(score)}分)"
+                # [顯示修正] 使用 .1f 顯示小數點，避免 int(-0.5) = 0 的誤會
+                current_reason = f"趨勢翻空 ({score:.1f}分)"
                 
                 # 結算損益
                 final_pnl = (curr_val - entry_price) / entry_price * 100
@@ -688,7 +701,7 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
             else:
                 position = 1
                 current_action = "Hold"
-                current_reason = f"續抱 ({int(score)}分)"
+                current_reason = f"續抱 ({score:.1f}分)"
 
         # 情境 B: 空手 (Position = 0) -> 只能檢查【買進】
         else:
@@ -741,24 +754,26 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    參數優化 v10.4:
-    - 固定賣出門檻為 0。
+    參數優化 v10.5:
+    - 強制賣出門檻為 0。
+    - 確保傳入純淨的 DataFrame。
     """
     target_start = pd.to_datetime(user_start_date)
     
-    df_scored = calculate_alpha_score(raw_df, pd.DataFrame(), pd.DataFrame())
+    # 這裡我們不先算分，因為 run_simple_strategy 內部會清洗後重算
+    # 這樣更安全
+    df_slice = raw_df[raw_df['Date'] >= target_start].copy()
     
-    df_slice = df_scored[df_scored['Date'] >= target_start].copy()
     if df_slice.empty: 
         return None, pd.DataFrame()
 
     best_ret = -999
     best_params = {'Buy_Threshold': 60, 'Return': 0}
-    best_df = df_slice.copy()
+    
+    # 預設至少回傳一個計算過的版本 (以防迴圈沒跑出更好的)
+    best_df = run_simple_strategy(df_slice, buy_threshold=60, sell_threshold=0, fee_rate=fee_rate, tax_rate=tax_rate)
     
     buy_thresholds = [55, 60, 65, 70]
-    
-    # [設定] 賣出門檻固定為 0
     fixed_sell_threshold = 0
     
     for thresh in buy_thresholds:
