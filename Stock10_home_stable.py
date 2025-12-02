@@ -974,13 +974,13 @@ def analyze_signal(final_df):
     else: return "👀 觀望", "gray", "空手"
 
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - 數位積分版
+# 5. [核心演算法] 買賣評等 (Alpha Score) - 客觀技術積分版
 # ==========================================
 def calculate_alpha_score(df, margin_df=None, short_df=None):
     """
-    Alpha Score v9.0 (Digital Scorecard):
-    將策略訊號與技術指標「數位化」為具體分數 (-100 ~ +100)。
-    並生成 HTML 格式的詳細評分依據 (Score_Detail)。
+    Alpha Score v10.0 (Objective Technical Scorecard):
+    修正邏輯：分數是持有的「依據」，而非持有的「結果」。
+    完全移除持倉基本分，改以技術面 (趨勢/動能/籌碼) 為唯一評分標準。
     """
     df = df.copy()
 
@@ -990,117 +990,171 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     if 'Action' not in df.columns: df['Action'] = 'Hold'
-    if 'Position' not in df.columns: df['Position'] = 0
     if 'Reason' not in df.columns: df['Reason'] = ''
+    
+    # [新增] 乖離率與布林通道計算 (用於評分)
+    if 'BB_Upper' not in df.columns:
+        std = df['Close'].rolling(20).std()
+        df['BB_Upper'] = df['MA20'] + 2 * std
+        df['BB_Lower'] = df['MA20'] - 2 * std
 
-    # 準備列表儲存計算結果
     final_scores = []
     score_details = []
 
-    # 為了計算變化，取得上一日的數據 (Iterative)
-    # 雖然慢一點，但為了生成精確的文字解釋，這是必要的
+    # 迭代每一天進行評分
     for i in range(len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i-1] if i > 0 else row
         
+        # === 初始化積分卡 (從 0 開始) ===
         score = 0
-        reasons = [] # 儲存詳細加扣分理由
+        reasons = [] 
         
-        # --- A. 策略訊號錨定 (Event Anchor) ---
-        action = row['Action']
-        pos = row['Position']
+        # ==========================================
+        # A. 趨勢面 (Trend) - 權重佔比約 50%
+        # ==========================================
+        # 核心邏輯：股價必須在均線之上，才值得高分
         
-        if action == 'Buy':
-            base = 90
-            reasons.append(f"<b>🚀 觸發買進訊號 (Base: {base})</b>")
-            reasons.append(f"<span style='color:#888; font-size:10px'>{row['Reason']}</span>")
-            score = base
-            
-        elif action == 'Sell':
-            base = -90
-            reasons.append(f"<b>⚡ 觸發賣出訊號 (Base: {base})</b>")
-            reasons.append(f"<span style='color:#888; font-size:10px'>{row['Reason']}</span>")
-            score = base
-            
-        elif pos == 1:
-            base = 50
-            reasons.append(f"<b>✊ 持倉基本分 (Base: {base})</b>")
-            score = base
+        close = row['Close']
+        ma20 = row['MA20']
+        ma60 = row['MA60']
+        
+        # 1. 月線 (生命線) 檢核
+        if close > ma20:
+            score += 20
+            reasons.append("股價 > 月線 (+20)")
         else:
-            base = -20
-            reasons.append(f"<b>👀 空手觀望 (Base: {base})</b>")
-            score = base
+            score -= 20
+            reasons.append("股價破月線 (-20)")
+            
+        # 2. 季線 (趨勢線) 檢核
+        if close > ma60:
+            score += 15
+            reasons.append("股價 > 季線 (+15)")
+        else:
+            score -= 15
+            reasons.append("股價破季線 (-15)")
+            
+        # 3. 均線排列
+        if ma20 > ma60:
+            score += 10
+            reasons.append("均線多頭排列 (+10)")
+        elif ma20 < ma60:
+            score -= 5
+            reasons.append("均線空頭排列 (-5)")
 
-        # --- B. 技術面加權 (Technical Weighting) ---
-        # 僅在非買賣訊號當日進行波動調整 (讓持有期間分數會跳動)
-        if action not in ['Buy', 'Sell']:
+        # ==========================================
+        # B. 動能面 (Momentum) - 權重佔比約 30%
+        # ==========================================
+        rsi = row['RSI']
+        
+        if rsi >= 60:
+            score += 10
+            reasons.append(f"RSI 強勢區 ({int(rsi)}) (+10)")
+        elif 50 <= rsi < 60:
+            score += 5
+            reasons.append(f"RSI 多方區 ({int(rsi)}) (+5)")
+        elif rsi < 30:
+            # 超賣區：通常是負分，除非出現背離(這裡簡化處理)
+            score -= 10
+            reasons.append(f"RSI 超賣弱勢 ({int(rsi)}) (-10)")
+        else:
+            score -= 5
+            reasons.append(f"RSI 弱勢區 ({int(rsi)}) (-5)")
             
-            # 1. 趨勢面 (Trend)
-            close = row['Close']
-            ma20 = row['MA20']
-            ma60 = row['MA60']
-            
-            if close > ma20:
-                score += 10; reasons.append("股價 > 月線 (+10)")
+        # 動能方向 (與昨日相比)
+        if i > 0:
+            if rsi > prev_row['RSI']:
+                score += 5
+                reasons.append("動能增強 (+5)")
             else:
-                score -= 10; reasons.append("股價破月線 (-10)")
-                
-            if ma20 > ma60:
-                score += 5; reasons.append("均線多頭排列 (+5)")
-            
-            # 2. 動能面 (Momentum - RSI)
-            rsi = row['RSI']
-            if rsi > 60:
-                score += 10; reasons.append(f"RSI 強勢區 ({int(rsi)}) (+10)")
-            elif rsi > 50:
-                score += 5; reasons.append(f"RSI 多方區 ({int(rsi)}) (+5)")
-            elif rsi < 30:
-                # 雖然弱勢，但如果是空手可能有反彈機會，如果是持倉則是危險
-                if pos == 1: 
-                    score -= 15; reasons.append("RSI 嚴重超賣 (-15)")
-                else:
-                    score += 5; reasons.append("RSI 醞釀反彈 (+5)")
-            
-            # RSI 趨勢 (跟昨天比)
-            if i > 0 and row['RSI'] > prev_row['RSI']:
-                score += 5; reasons.append("動能翻揚 (+5)")
+                reasons.append("動能衰退 (0)")
 
-            # 3. 量能面 (Volume)
-            vol = row['Volume']
-            vol_ma = row['Vol_MA20']
-            if vol > vol_ma and row['Close'] > row['Open']:
-                score += 5; reasons.append("量增價漲 (+5)")
-            elif vol > vol_ma * 2.5 and row['Close'] < row['Open']:
-                score -= 15; reasons.append("爆量長黑 (-15)")
+        # ==========================================
+        # C. 量價與結構 (Volume & Structure) - 權重佔比約 20%
+        # ==========================================
+        vol = row['Volume']
+        vol_ma = row['Vol_MA20']
+        
+        # 1. 攻擊量
+        if vol > vol_ma and close > row['Open']:
+            score += 10
+            reasons.append("出量上漲 (+10)")
+        # 2. 賣壓量
+        elif vol > vol_ma and close < row['Open']:
+            score -= 10
+            reasons.append("出量下跌 (-10)")
+        # 3. 窒息量/縮量盤整
+        elif vol < vol_ma * 0.6 and abs(close - row['Open']) / close < 0.005:
+            # 只有在趨勢向上時，縮量整理才是好事
+            if close > ma20:
+                score += 5
+                reasons.append("多頭縮量惜售 (+5)")
+            else:
+                score -= 5
+                reasons.append("空頭人氣退潮 (-5)")
 
-        # --- C. 分數邊界限制 (Clamping) ---
+        # ==========================================
+        # D. 策略訊號事件 (Signal Events)
+        # ==========================================
+        # 只有在訊號「發生當下」，給予強制加成，代表系統的強力介入
+        # 但這個加成是疊加在技術分之上的
+        
+        action = row['Action']
+        if action == 'Buy':
+            # 買進訊號當天，額外加分以突顯突破點
+            score += 20
+            reasons.insert(0, f"<b>🚀 策略買進訊號 ({row['Reason']}) (+20)</b>")
+        elif action == 'Sell':
+            # 賣出訊號當天，強制扣分
+            score -= 30
+            reasons.insert(0, f"<b>⚡ 策略賣出訊號 ({row['Reason']}) (-30)</b>")
+
+        # ==========================================
+        # E. 輸出格式化
+        # ==========================================
+        
+        # 限制範圍 -100 ~ 100
         final_score = max(min(score, 100), -100)
         final_scores.append(final_score)
         
-        # --- D. 生成 HTML 懸停文字 ---
-        # 根據分數決定標題顏色
+        # 生成 HTML 懸停文字
         title_color = "#ff5252" if final_score > 0 else "#00e676"
-        score_html = f"<b>Alpha Score: <span style='color:{title_color}; font-size:16px'>{int(final_score)}</span></b><br>"
-        score_html += "<span style='color:#777; font-size:10px'>───────────────</span><br>"
-        score_html += "<br>".join(reasons)
-        score_details.append(score_html)
+        
+        # 標頭：分數
+        html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
+        html_str += "<span style='color:#666; font-size:10px'>─── Technical Analysis ───</span><br>"
+        
+        # 內容：詳細理由 (只顯示前 6 個重要理由，避免太長)
+        # 將理由分為正向與負向，方便閱讀
+        pos_reasons = [r for r in reasons if "(+" in r]
+        neg_reasons = [r for r in reasons if "(-" in r or "(0)" in r]
+        
+        if pos_reasons:
+            html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
+        if neg_reasons:
+            html_str += f"<span style='color:#b9f6ca'>{'<br>'.join(neg_reasons)}</span>"
+            
+        score_details.append(html_str)
 
     # 寫回 DataFrame
     df['Alpha_Score'] = final_scores
-    df['Score_Detail'] = score_details # 這是新欄位，專門給 Plotly hover 使用
+    df['Score_Detail'] = score_details
     
-    # 產生簡易評語 Log (相容舊程式碼)
+    # 產生簡易評語 Log
     conditions = [
-        (df['Alpha_Score'] >= 80), (df['Alpha_Score'] >= 40), (df['Alpha_Score'] >= 0),
-        (df['Alpha_Score'] <= -80), (df['Alpha_Score'] <= -40)
+        (df['Alpha_Score'] >= 60), (df['Alpha_Score'] >= 20), (df['Alpha_Score'] >= -20),
+        (df['Alpha_Score'] <= -60), (df['Alpha_Score'] < -20)
     ]
-    choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 偏多震盪", "⚡ 極弱勢", "📉 空頭修正"]
-    df['Score_Log'] = np.select(conditions, choices, default="☁️ 盤整")
+    choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 震盪盤整", "⚡ 極弱勢", "📉 空頭修正"]
+    df['Score_Log'] = np.select(conditions, choices, default="☁️ 觀望")
     
-    # 輔助欄位
+    # 輔助欄位 (推薦倉位與分數掛鉤)
+    # 分數 100 -> 100% 倉位, 分數 0 -> 50% 倉位, 分數 -100 -> 0% 倉位
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
+
 
 
 def calculate_alpha_score_technical_fallback(df):
@@ -2431,7 +2485,7 @@ elif page == "🚀 科技股掃描":
                             prev_price = final_df['Close'].iloc[-2]
                             price_chg_pct = (current_price - prev_price) / prev_price
                             turnover = current_price * vol_now
-                            
+
                             res_item = {
                                 "代號": fmt_ticker.split('.')[0], 
                                 "名稱": name, 
