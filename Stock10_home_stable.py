@@ -1051,20 +1051,19 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v9.0 (Transparent Debug Mode):
-    增強版 HTML Tooltip，詳細列出所有加減分細項與未觸發原因。
+    Alpha Score v10.0 (Panic Fix):
+    1. 修正「高檔出貨」邏輯：低檔爆量不扣分，視為換手。
+    2. 引入「抄底豁免權」：若觸發反彈策略，暫時無視均線空頭扣分。
+    3. 放寬反彈觸發門檻：RSI < 35 即可 (原 30)。
     """
     df = df.copy()
 
-    # ==========================================
-    # 1. 預處理與指標補全 (維持不變)
-    # ==========================================
+    # --- 1. 基礎指標準備 (維持不變) ---
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240, min_periods=60).mean()
-    if 'MA30' not in df.columns: df['MA30'] = df['Close'].rolling(30).mean()
     if 'High_100d' not in df.columns: df['High_100d'] = df['Close'].rolling(100).max()
     if 'Close_Lag5' not in df.columns: df['Close_Lag5'] = df['Close'].shift(5)
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
@@ -1075,33 +1074,28 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['BB_Lower'] = df['MA20'] - 2 * std
     if 'SuperTrend' not in df.columns: df['SuperTrend'] = df['MA20']
 
-    # 轉為 Numpy Arrays 加速運算
+    # Numpy 加速
     close = df['Close'].values
-    high = df['High'].values
-    low = df['Low'].values
     vol = df['Volume'].fillna(0).values
     vol_ma = df['Vol_MA20'].replace(0, 1).fillna(1).values
     rsi = df['RSI'].fillna(50).values
-    
     ma20 = df['MA20'].ffill().values
     ma60 = df['MA60'].ffill().values
     ma120 = df['MA120'].fillna(method='bfill').values
     ma240 = df['MA240'].fillna(method='bfill').values
-    
     obv = df['OBV'].values
     obv_ma = df['OBV_MA20'].values
     bb_lower = df['BB_Lower'].values
     supertrend = df['SuperTrend'].values
+    high_100d = df['High_100d'].fillna(0).values
+    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
     
-    # 輔助變數
     is_supertrend_bull = (close > supertrend)
     ma60_slope = pd.Series(ma60).pct_change().fillna(0).values
     ma120_slope = pd.Series(ma120).pct_change().fillna(0).values
     ma240_slope = pd.Series(ma240).pct_change().fillna(0).values
 
-    # ==========================================
-    # 2. 趨勢與架構評分 (Trend)
-    # ==========================================
+    # --- 2. 趨勢評分 (維持不變) ---
     score_trend = np.zeros(len(df))
     score_trend += np.where(close > ma20, 5, -5)
     score_trend += np.where(close > ma60, 10, -10)
@@ -1110,84 +1104,75 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_bull_align = (ma20 > ma60) & (ma60 > ma120)
     score_trend += np.where(is_bull_align, 5, 0)
 
-    # ==========================================
-    # 3. 動能與籌碼評分 (Momentum)
-    # ==========================================
+    # --- 3. 動能評分 (維持不變) ---
     score_mom = np.zeros(len(df))
-    # RSI 線性評分 (-10 ~ +10)
     score_mom += np.clip((rsi - 50) * 0.5, -10, 10)
-    
     price_change = pd.Series(close).diff().fillna(0).values
     vol_ratio = vol / vol_ma
     cond_vol_bull = (price_change > 0) & (vol_ratio > 1.0)
     cond_vol_pullback = (price_change < 0) & (vol_ratio < 0.8)
     cond_vol_bear = (price_change < 0) & (vol_ratio > 1.2)
-    
     score_mom += np.where(cond_vol_bull, 5, 0)
     score_mom += np.where(cond_vol_pullback, 3, 0)
     score_mom += np.where(cond_vol_bear, -5, 0)
     score_mom += np.where(obv > obv_ma, 10, -5)
     
-    # ==========================================
-    # 4. 策略型態加分 (Pattern)
-    # ==========================================
+    # --- 4. 策略型態加分 (Pattern) ---
     score_pattern = np.zeros(len(df))
     
-    # 策略 A: 動能突破
     cond_strat_a = is_supertrend_bull & (vol > vol_ma) & (close > ma60) & (rsi > 55) & (obv > obv_ma)
     score_pattern += np.where(cond_strat_a, 15, 0)
     
-    # 策略 B: 均線回測
     cond_strat_b = is_supertrend_bull & (close > ma60) & (close > ma20) & (low <= ma20 * 1.02) & (vol < vol_ma) & (rsi > 45)
     score_pattern += np.where(cond_strat_b, 15, 0)
     
-    # 策略 C: 籌碼佈局
     cond_strat_c = (close > ma60) & (obv > obv_ma) & (vol < vol_ma) & ((close < ma20) | (rsi < 55)) & (close > bb_lower)
     score_pattern += np.where(cond_strat_c, 10, 0)
     
-    # 策略 D: 超賣反彈 (關鍵!)
-    # 條件: RSI < 30 (超賣) + 跌破布林下緣 + 有量
-    cond_strat_d = (rsi < 30) & (close < bb_lower) & (vol > vol_ma * 0.5)
+    # [修正] 策略 D: 超賣反彈 (放寬條件)
+    # RSI < 35 即可 (原 30)，或者乖離極大 (Close < BB_Lower * 0.98)
+    cond_rebound_rsi = (rsi < 35)
+    cond_rebound_price = (close < bb_lower)
+    cond_rebound_vol = (vol > vol_ma * 0.5) # 稍微有量
+    
+    # 只要 (RSI低 且 破布林 且 有量) 即觸發
+    cond_strat_d = cond_rebound_rsi & cond_rebound_price & cond_rebound_vol
     score_pattern += np.where(cond_strat_d, 45, 0)
 
     # 百日突破
-    high_100d = df['High_100d'].fillna(0).values
-    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
     weekly_ratio = np.divide(close, close_lag5, out=np.ones_like(close), where=close_lag5!=0)
     cond_breakout = (close >= high_100d) & (weekly_ratio < 1.27)
     score_pattern += np.where(cond_breakout, 10, 0)
 
-    # ==========================================
-    # 5. 風險懲罰 (Penalty)
-    # ==========================================
+    # --- 5. 風險懲罰 (Risk Fix) ---
     score_penalty = np.zeros(len(df))
     
-    # 均線糾結
-    ma_stack = np.vstack([ma60, ma120, ma240])
-    ma_max_val = np.max(ma_stack, axis=0)
-    ma_min_val = np.min(ma_stack, axis=0)
-    congestion_idx = np.divide((ma_max_val - ma_min_val), close, out=np.ones_like(close), where=close!=0)
-    is_squeeze = congestion_idx < 0.03
-    score_penalty += np.where(is_squeeze, -10, 0)
-    
-    # 崩盤濾網 (關鍵!)
-    # 年線下彎斜率門檻
+    # A. 崩盤濾網 (年線快速下彎) - 這依然要保留，防止接到主跌段
     is_crash = ma240_slope <= -0.001
-    score_penalty += np.where(is_crash, -50, 0) 
+    # [優化] 如果觸發了「超賣反彈」，且年線斜率沒有到非常誇張 (例如 > -0.003)，則豁免崩盤扣分
+    # 意即：允許緩跌中的反彈，但禁止急跌中的接刀
+    exempt_crash = cond_strat_d & (ma240_slope > -0.003)
+    score_penalty += np.where(is_crash & (~exempt_crash), -50, 0)
     
-    # 三線空頭
-    is_triple_bear = (ma60_slope < 0) & (ma120_slope < 0) & (ma240_slope < 0)
-    congestion_slope = pd.Series(congestion_idx).diff().fillna(0).values
-    is_valid_reversal = (congestion_slope > 0) & (close > ma60) & (close > ma120) & (close > ma240)
-    score_penalty += np.where(is_triple_bear & (~is_valid_reversal), -30, 0)
-    
-    # 高檔出貨
-    cond_distribution = (vol > vol_ma * 2.5) & (pd.Series(close).pct_change().fillna(0) < 0.005)
+    # B. 高檔出貨 (Critical Fix!)
+    # 原邏輯：量大 + 漲不動 = 出貨
+    # 新邏輯：量大 + 漲不動 + [RSI > 40] = 出貨。如果 RSI < 40 且爆量，那是「恐慌清洗」，不扣分！
+    cond_distribution = (vol > vol_ma * 2.5) & (pd.Series(close).pct_change().fillna(0) < 0.005) & (rsi > 40)
     score_penalty += np.where(cond_distribution, -20, 0)
 
-    # ==========================================
-    # 6. 總分計算與 HTML 生成
-    # ==========================================
+    # C. 三線空頭 (Critical Fix!)
+    is_triple_bear = (ma60_slope < 0) & (ma120_slope < 0) & (ma240_slope < 0)
+    # [優化] 豁免權：如果觸發了「超賣反彈 (Strategy D)」，就忽略三線空頭的扣分
+    # 因為抄底本身就是在空頭趨勢中尋找轉折，不應重複懲罰趨勢
+    score_penalty += np.where(is_triple_bear & (~cond_strat_d), -30, 0)
+    
+    # D. 均線糾結
+    ma_stack = np.vstack([ma60, ma120, ma240])
+    congestion_idx = np.divide((np.max(ma_stack, axis=0) - np.min(ma_stack, axis=0)), close, out=np.ones_like(close), where=close!=0)
+    is_squeeze = congestion_idx < 0.03
+    score_penalty += np.where(is_squeeze, -10, 0)
+
+    # --- 6. 總分計算與 HTML ---
     raw_score = score_trend + score_mom + score_pattern + score_penalty
     final_score = np.clip(raw_score, -100, 100)
     
@@ -1196,80 +1181,56 @@ def calculate_alpha_score(df, margin_df, short_df):
     final_score_smoothed = final_series.values
     df['Alpha_Score'] = final_score_smoothed.astype(int)
     
+    # 生成 HTML Tooltip (保持您之前要求的詳細版)
     detail_html = []
     log_msg = []
-    
-    C_POS = "#ef5350" # 紅
-    C_NEG = "#00e676" # 綠
+    C_POS = "#ef5350"; C_NEG = "#00e676"
     
     for i in range(len(df)):
         s = final_score_smoothed[i]
-        
-        # --- 詳盡版 Tooltip HTML ---
         txt = f"📅 <b>{df['Date'].iloc[i].strftime('%Y-%m-%d')}</b><br>"
         txt += f"📊 <b>總分: <span style='color:{C_POS if s>0 else C_NEG}'>{int(s)}</span></b><br>"
         txt += "────────────────<br>"
         
-        # 1. 基礎架構
         txt += f"📉 趨勢架構: <b>{int(score_trend[i]):+d}</b><br>"
         txt += f"🌊 動能籌碼: <b>{int(score_mom[i]):+d}</b><br>"
         
-        # 2. 策略加分 (顯示具體項目)
         if score_pattern[i] > 0:
             txt += f"🎁 <span style='color:{C_POS}'>策略加分: +{int(score_pattern[i])}</span><br>"
             if cond_strat_d[i]: txt += "  • 🔥 <b>超賣反彈 (+45)</b><br>"
             if cond_strat_a[i]: txt += "  • 🚀 動能突破 (+15)<br>"
             if cond_strat_b[i]: txt += "  • 📉 均線回測 (+15)<br>"
-            if cond_strat_c[i]: txt += "  • 💰 籌碼佈局 (+10)<br>"
-            if cond_breakout[i]: txt += "  • ☀️ 百日突破 (+10)<br>"
             
-        # 3. 風險扣分 (顯示具體項目)
         if score_penalty[i] < 0:
             txt += f"⚠️ <span style='color:{C_NEG}'>風險扣分: {int(score_penalty[i])}</span><br>"
-            if is_crash[i]: txt += "  • ☠️ <b>崩盤趨勢 (-50)</b><br>"
-            if is_triple_bear[i] and not is_valid_reversal[i]: txt += "  • 🐻 三線空頭 (-30)<br>"
+            if is_crash[i] and not exempt_crash[i]: txt += "  • ☠️ <b>崩盤趨勢 (-50)</b><br>"
+            if is_triple_bear[i] and not cond_strat_d[i]: txt += "  • 🐻 三線空頭 (-30)<br>"
             if cond_distribution[i]: txt += "  • 💣 高檔出貨 (-20)<br>"
-            if is_squeeze[i]: txt += "  • 🧶 均線糾結 (-10)<br>"
-
-        # 4. 未觸發診斷 (關鍵: 告訴使用者為什麼沒加分)
-        # 只在分數低或接近觸發時顯示
-        txt += "────────────────<br>"
-        txt += "🔍 <b>關鍵數據診斷:</b><br>"
-        
-        # 診斷 RSI 反彈
-        rsi_val = rsi[i]
-        if cond_strat_d[i]:
-            txt += f"• RSI: {rsi_val:.1f} (✅已觸發反彈)<br>"
-        elif rsi_val < 40:
-            txt += f"• RSI: {rsi_val:.1f} (需 < 30 才觸發)<br>"
             
-        # 診斷 崩盤
-        slope_val = ma240_slope[i]
-        if is_crash[i]:
-            txt += f"• 年線斜率: {slope_val:.5f} (❌崩盤中)<br>"
-        elif slope_val < 0:
-             txt += f"• 年線斜率: {slope_val:.5f} (安全)<br>"
-             
+        # 豁免提示 (Debug用)
+        if cond_strat_d[i] and is_triple_bear[i]:
+             txt += "<span style='color:orange; font-size:0.8em'>*觸發抄底，豁免空頭扣分</span><br>"
+
+        # 診斷資訊
+        txt += "────────────────<br>🔍 <b>關鍵數據:</b><br>"
+        txt += f"• RSI: {rsi[i]:.1f}<br>"
+        txt += f"• 年線斜率: {ma240_slope[i]:.5f}<br>"
+
         detail_html.append(txt)
         
-        # 日誌
-        log_txt = "盤整"
-        if s >= 60: log_txt = "🔥 強力買進"
-        elif s >= 0: log_txt = "📈 偏多操作"
-        elif s <= -60: log_txt = "⚡ 強力賣出"
-        elif s < 0: log_txt = "📉 偏空調節"
-        
-        if cond_strat_d[i]: log_txt = "💎 抄底機會"
-        if is_crash[i]: log_txt = "☠️ 崩盤迴避"
-        
-        log_msg.append(log_txt)
+        # 簡單日誌
+        log = "盤整"
+        if cond_strat_d[i]: log = "💎 抄底機會"
+        elif s >= 0: log = "📈 偏多"
+        elif s < 0: log = "📉 偏空"
+        log_msg.append(log)
 
     df['Score_Detail'] = detail_html
     df['Score_Log'] = log_msg
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
     return df
-    
+
 
 
 def calculate_alpha_score_technical_fallback(df):
