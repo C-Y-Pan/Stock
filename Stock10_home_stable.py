@@ -623,215 +623,177 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
+def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001425, tax_rate=0.003):
     """
-    執行策略回測 v9.2 (Triple Bear Filter):
-    - [既有] Squeeze Ban: 糾結度 < 3% 禁止買入。
-    - [既有] Crash Ban: 年線日跌幅 <= -0.1% 禁止恐慌抄底。
-    - [新增] Triple Bear Ban: 若三均線(60/120/240)皆下彎，僅允許「糾結度擴大 且 站上所有均線」時買入。
+    策略執行核心 v10.0 (Alpha Score Driven):
+    完全依賴 Alpha Score 進行決策。
+    - Buy: Score >= buy_threshold (Default 60)
+    - Sell: Score < sell_threshold (Default 0)
+    - Hold: 0 <= Score < 60
     """
     df = data.copy()
     
-    if 'Dividends' not in df.columns: df['Dividends'] = 0.0
-    df['Dividends'] = df['Dividends'].fillna(0.0)
-        
-    positions = []; reasons = []; actions = []; target_prices = []
-    return_labels = []; confidences = []
-    
-    position = 0; days_held = 0; entry_price = 0.0; trade_type = 0
-    cum_div = 0.0 
-    
-    # 準備 Numpy Array
-    close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
-    bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
-    
-    # 確保有 MA120/MA240
-    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
-    if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240).mean()
-    
-    ma120 = df['MA120'].fillna(method='bfill').values
-    ma240 = df['MA240'].fillna(method='bfill').values
-    ma30 = df['MA30'].ffill().values
-    high_100d = df['High_100d'].fillna(0).values
-    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
-    dividends = df['Dividends'].values
-    
-    volume = df['Volume'].values; vol_ma20 = df['Vol_MA20'].values
-    obv = df['OBV'].values; obv_ma20 = df['OBV_MA20'].values
-    market_panic = df['Is_Market_Panic'].values
-    bb_width_vals = ((df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']).values
+    # 1. 確保 Alpha Score 已計算
+    # 這裡傳入空的 margin/short df，因為回測時我們主要依賴技術面分數
+    # 若外部已經算好 Alpha_Score，這步會覆蓋，確保資料是最新的
+    if 'Alpha_Score' not in df.columns:
+        df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
-    # 1. 計算均線斜率 (Slope)
-    # 使用 Pandas Series 計算 pct_change 後轉回 numpy array
-    ma60_slope = pd.Series(ma60).pct_change().fillna(0).values
-    ma120_slope = pd.Series(ma120).pct_change().fillna(0).values
-    ma240_series = pd.Series(ma240)
-    ma240_slope = ma240_series.pct_change().fillna(0).values
+    # 初始化變數
+    positions = []
+    actions = []
+    reasons = []
+    return_labels = []
     
-    # 崩盤趨勢陣列 (年線急跌)
-    is_crash_trend_array = ma240_slope <= -0.001
-
-    # 2. 計算糾結指數與糾結度斜率 (Congestion Slope)
-    ma_stack = np.vstack([ma60, ma120, ma240])
-    ma_max = np.max(ma_stack, axis=0)
-    ma_min = np.min(ma_stack, axis=0)
-    raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
+    position = 0
+    entry_price = 0.0
+    days_held = 0
+    cum_div = 0.0
     
-    # 糾結指數 (60日平均)
-    congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
-    # [新增] 糾結度斜率
-    congestion_slope = pd.Series(congestion_index).diff().fillna(0).values
-
+    # 轉換為 Numpy 加速讀取
+    alpha_scores = df['Alpha_Score'].values
+    closes = df['Close'].values
+    dates = df['Date'].values
+    dividends = df['Dividends'].fillna(0).values if 'Dividends' in df.columns else np.zeros(len(df))
+    
+    # 2. 逐日回測迴圈
     for i in range(len(df)):
-        signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
-        this_target = entry_price * 1.15 if position == 1 else np.nan
-        ret_label = ""; conf_score = 0
-
-        # 趨勢狀態
-        is_ma240_down = False
-        is_ma60_up = False
-        if i > 0:
-            if ma240[i] < ma240[i-1]: is_ma240_down = True
-            if ma60[i] > ma60[i-1]: is_ma60_up = True
+        score = alpha_scores[i]
+        price = closes[i]
+        div = dividends[i]
+        
+        signal = position
+        action = "Wait"
+        reason = ""
+        ret_label = ""
+        
+        # --- 持倉狀態更新 ---
+        if position == 1:
+            days_held += 1
+            if div > 0: cum_div += div
             
-        is_price_weak = (close[i] < ma60[i]) and (close[i] < ma20[i])
-        is_strict_bear = is_ma240_down and (not is_ma60_up) and is_price_weak
-
-        # [既有] 糾結禁買判定 (Squeeze Ban)
-        is_squeeze_ban = congestion_index[i] < 0.03
-
-        # [既有] 崩盤禁買判定 (Crash Ban)
-        is_crash_active = is_crash_trend_array[i]
-
-        # [新增] 三線下彎判定 (Triple Bear)
-        is_triple_bear = (ma60_slope[i] < 0) and (ma120_slope[i] < 0) and (ma240_slope[i] < 0)
-
-        # --- 進場邏輯 ---
-        if position == 0:
-            is_buy = False
-            rsi_threshold_A = 60 if is_strict_bear else 55
+            # 賣出檢查
+            # 條件 1: 分數轉弱 (Score < 0)
+            # 條件 2: 硬性停損 (防止黑天鵝，例如虧損 > 15%)
             
-            # 只有在「非禁買」狀態下才檢查策略
-            if not is_squeeze_ban:
-                # 策略 A: 動能突破
-                if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
-                    is_buy=True; trade_type=1; reason_str="動能突破"
-                # 策略 B: 均線回測
-                elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
-                    is_buy=True; trade_type=1; reason_str="均線回測"
-                # 策略 C: 籌碼佈局
-                elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
-                    is_buy=True; trade_type=3; reason_str="籌碼佈局"
-                # 策略 D: 超賣反彈 (Crash Protection Applied)
-                elif (not is_crash_active) and rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
-                    is_buy=True; trade_type=2; reason_str="超賣反彈"
+            curr_val = price + cum_div
+            pnl_pct = (curr_val - entry_price) / entry_price
             
-            # [新增] Triple Bear Filter: 若三線皆下彎，進行嚴格過濾
-            if is_buy and is_triple_bear:
-                # 條件: 糾結度斜率為正 且 股價站上三條均線
-                is_price_above_all = (close[i] > ma60[i]) and (close[i] > ma120[i]) and (close[i] > ma240[i])
-                is_valid_reversal = (congestion_slope[i] > 0) and is_price_above_all
+            is_stop_loss = (pnl_pct < -0.15) # 硬性防呆停損
+            is_score_sell = (score < sell_threshold)
+            
+            if is_stop_loss:
+                signal = 0; action = "Sell"; reason = f"硬性停損 ({pnl_pct*100:.1f}%)"
+            elif is_score_sell:
+                signal = 0; action = "Sell"; reason = f"評分轉弱 ({int(score)}分)"
+            else:
+                signal = 1; action = "Hold"; reason = f"續抱 (分數:{int(score)})"
                 
-                if not is_valid_reversal:
-                    is_buy = False # 不滿足例外條件，禁止買入
-            
-            if is_buy:
-                signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
+            # 結算損益字串
+            if signal == 0:
+                final_pnl = (price + cum_div - entry_price) / entry_price * 100
+                sign = "+" if final_pnl > 0 else ""
+                ret_label = f"{sign}{final_pnl:.1f}%"
+
+        # --- 空手狀態更新 ---
+        else:
+            # 買進檢查
+            # 條件: 分數夠高 (Score >= 60)
+            if score >= buy_threshold:
+                signal = 1
+                action = "Buy"
+                entry_price = price
+                days_held = 0
                 cum_div = 0.0
                 
-                base_score = 60
-                if is_strict_bear: base_score -= 10
-                if is_ma240_down and is_ma60_up: base_score += 5
-                if volume[i] > vol_ma20[i] * 1.5: base_score += 15
-                elif volume[i] > vol_ma20[i]: base_score += 8
-                if i > 5 and ma60[i] > ma60[i-5] and close[i] > ma60[i]: base_score += 10
-                if trade_type == 1 and 60 <= rsi[i] <= 75: base_score += 10
-                elif trade_type == 2 and rsi[i] <= 25: base_score += 10
-                if i > 3 and bb_width_vals[i-1] < 0.15: base_score += 5
-                if close[i] > ma30[i] * 1.04: base_score += 5
-                
-                weekly_ratio = close[i] / close_lag5[i] if close_lag5[i] > 0 else 1.0
-                if close[i] >= high_100d[i] and weekly_ratio < 1.27: base_score += 15
-                
-                conf_score = min(base_score, 99)
-        
-        # --- 出場邏輯 ---
-        elif position == 1:
-            days_held+=1
-            if dividends[i] > 0: cum_div += dividends[i]
-            adjusted_current_value = close[i] + cum_div
-            drawdown = (adjusted_current_value - entry_price) / entry_price
-            
-            if trade_type==2 and trend[i]==1: trade_type=1; reason_str="反彈轉波段"
-            if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1; reason_str="佈局完成發動"
-            
-            is_sell = False
-            stop_loss_limit = -0.10 if is_strict_bear else -0.12
-            
-            if drawdown < stop_loss_limit:
-                is_sell=True; reason_str=f"觸發停損({stop_loss_limit*100:.0f}%)"; action_code="Sell"
-            elif days_held <= (2 if is_strict_bear else 3):
-                action_code="Hold"; reason_str="鎖倉觀察"
+                # 自動生成買進理由
+                if score >= 80: reason = "🔥 極強勢買進"
+                elif score >= 60: reason = "🚀 趨勢確立"
+                else: reason = "✅ 試單買進"
             else:
-                if trade_type==1 and trend[i]==-1: 
-                    if close[i] < ma20[i]:
-                        is_sell=True; reason_str="趨勢轉弱且破月線"
-                    else:
-                        action_code="Hold"; reason_str="轉弱(守月線)"
-                elif use_strict_bear_exit and is_strict_bear and close[i] < ma20[i]:
-                    is_sell=True; reason_str="長空破月線"
-                elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
-                elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
-                
-            if is_sell:
-                signal=0; action_code="Sell"
-                final_pnl_value = (close[i] + cum_div) - entry_price
-                pnl = final_pnl_value / entry_price * 100
-                sign = "+" if pnl > 0 else ""
-                ret_label = f"{sign}{pnl:.1f}%"
+                signal = 0
+                action = "Wait"
+                reason = "觀望"
 
-        position=signal
-        positions.append(signal); reasons.append(reason_str); actions.append(action_code)
-        target_prices.append(this_target); return_labels.append(ret_label)
-        confidences.append(conf_score if action_code == "Buy" else 0)
+        positions.append(signal)
+        actions.append(action)
+        reasons.append(reason)
+        return_labels.append(ret_label)
         
-    df['Position']=positions; df['Reason']=reasons; df['Action']=actions
-    df['Target_Price']=target_prices; df['Return_Label']=return_labels
-    df['Confidence'] = confidences
+    # 3. 將結果寫回 DataFrame
+    df['Position'] = positions
+    df['Action'] = actions
+    df['Reason'] = reasons
+    df['Return_Label'] = return_labels
     
-    df['Real_Position'] = df['Position'].shift(1).fillna(0)
+    # 4. 計算權益曲線 (Equity Curve)
+    df['Real_Position'] = df['Position'].shift(1).fillna(0) # 避免偷看未來，使用昨日訊號決定今日持倉
     df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
     df['Market_Return'] = df['Market_Return'].fillna(0)
     
-    df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
+    # 計算策略報酬 (扣除交易成本)
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
-    df['Strategy_Return'] = df['Strategy_Return'] - cost_series
     
-    df['Cum_Strategy']=(1+df['Strategy_Return']).cumprod()
-    df['Cum_Market']=(1+df['Market_Return']).cumprod()
+    df['Strategy_Return'] = df['Real_Position'] * df['Market_Return'] - cost_series
+    df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
+    df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
+    
     return df
 
 
 # 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
-    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
+    """
+    參數優化 v10.0:
+    針對 Alpha Model 尋找最佳的「買進門檻 (Buy Threshold)」。
+    不再優化 RSI 或 Multiplier，因為這些邏輯已內建於 calculate_alpha_score 中。
+    """
+    target_start = pd.to_datetime(user_start_date)
     
-    for m in [3.0, 3.5]:
-        for r in [25, 30]:
-            df_ind = calculate_indicators(raw_df, 10, m, market_df)
-            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
-            if df_slice.empty: continue
+    # 1. 預先計算 Alpha Score (算一次就好，節省時間)
+    # 注意：這裡我們先算好技術指標，傳給 run_simple_strategy 直接用
+    df_scored = calculate_alpha_score(raw_df, pd.DataFrame(), pd.DataFrame())
+    
+    # 篩選日期區間
+    df_slice = df_scored[df_scored['Date'] >= target_start].copy()
+    if df_slice.empty: 
+        return None, pd.DataFrame()
+
+    best_ret = -999
+    best_params = {'Buy_Threshold': 60, 'Return': 0}
+    best_df = df_slice.copy()
+    
+    # 2. 網格搜索：測試不同的買進門檻
+    # 測試範圍：55 (積極), 60 (標準), 65 (保守), 70 (嚴格)
+    # 賣出門檻固定為 0 (多空分界線)
+    thresholds = [55, 60, 65, 70]
+    
+    for thresh in thresholds:
+        # 執行策略
+        df_res = run_simple_strategy(
+            df_slice, 
+            buy_threshold=thresh, 
+            sell_threshold=0, 
+            fee_rate=fee_rate, 
+            tax_rate=tax_rate
+        )
+        
+        # 評估績效
+        total_ret = df_res['Cum_Strategy'].iloc[-1] - 1
+        
+        # 紀錄最佳結果
+        if total_ret > best_ret:
+            best_ret = total_ret
+            best_params = {'Buy_Threshold': thresh, 'Return': total_ret}
+            best_df = df_res
+
+    # 為了兼容舊版 UI 顯示，我們構造一個包含 'Mult', 'RSI_Buy' 的字典
+    # 雖然實際沒用到，但避免外部調用報錯 key error
+    best_params['Mult'] = 0 
+    best_params['RSI_Buy'] = best_params['Buy_Threshold'] 
             
-            # [修改] 傳遞 use_strict_bear_exit
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy, use_strict_bear_exit)
-            
-            ret = df_res['Cum_Strategy'].iloc[-1] - 1
-            if ret > best_ret:
-                best_ret = ret
-                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
-                best_df = df_res
     return best_params, best_df
 
 
