@@ -760,63 +760,36 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
 
 
 
-# 修改後：傳遞成本參數
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
-    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
-    
-    for m in [3.0, 3.5]:
-        for r in [25, 30]:
-            df_ind = calculate_indicators(raw_df, 10, m, market_df)
-            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
-            if df_slice.empty: continue
-            
-            # [修改] 傳遞 use_strict_bear_exit
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy, use_strict_bear_exit)
-            
-            ret = df_res['Cum_Strategy'].iloc[-1] - 1
-            if ret > best_ret:
-                best_ret = ret
-                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
-                best_df = df_res
-    return best_params, best_df
-
-
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
-    執行嚴謹的樣本外測試 (Walk-Forward Analysis 簡化版)
-    Split Ratio: 訓練集佔比 (預設 70%)
+    執行嚴謹的樣本外測試 (Walk-Forward Analysis - Fixed Rule Version)
+    因應 Alpha Score 策略改為固定規則，此函式主要用途轉為：
+    驗證該固定規則在「過去 (Train)」與「近期 (Test)」的表現是否一致（有無過擬合或失效）。
     """
-    # 1. 資料切割
-    total_len = len(raw_df)
+    # 1. 預先計算所有指標 (避免切割後導致 Test 集初期的均線/ATR 計算失真)
+    # Mult=3.0 為 Alpha 策略預設參考值
+    full_ind_df = calculate_indicators(raw_df, 10, 3.0, market_df)
+    
+    total_len = len(full_ind_df)
     if total_len < 100: return None # 資料過少無法驗證
     
+    # 2. 資料切割
     split_idx = int(total_len * split_ratio)
-    train_data_raw = raw_df.iloc[:split_idx].copy()
-    test_data_raw = raw_df.iloc[split_idx:].copy()
+    train_data = full_ind_df.iloc[:split_idx].copy()
+    test_data = full_ind_df.iloc[split_idx:].copy()
     
     # 確保切分後的測試集有足夠數據
-    if len(test_data_raw) < 30: return None
+    if len(test_data) < 30: return None
 
-    # 2. 訓練階段 (In-Sample): 在過去數據找最佳參數
-    # 注意：start_date 設為訓練集的第一天
-    train_start_date = train_data_raw['Date'].min()
-    best_params_train, train_res_df = run_optimization(train_data_raw, market_df, train_start_date, fee_rate, tax_rate)
-    
-    if best_params_train is None: return None
-
-    # 3. 測試階段 (Out-of-Sample): 用訓練好的參數去跑未來的數據
-    # 關鍵：這裡不能再做 run_optimization，必須固定參數
-    
-    # 先計算測試集的指標 (使用訓練集找出的最佳 Multiplier)
-    test_ind = calculate_indicators(test_data_raw, 10, best_params_train['Mult'], market_df)
-    
-    # 執行策略 (使用訓練集找出的最佳 RSI 閾值)
-    test_res_df = run_simple_strategy(test_ind, best_params_train['RSI_Buy'], fee_rate, tax_rate)
+    # 3. 執行策略 (直接套用 Alpha Score 規則)
+    # 不再需要 run_optimization，因為規則是固定的
+    train_res_df = run_alpha_strategy(train_data, fee_rate, tax_rate)
+    test_res_df = run_alpha_strategy(test_data, fee_rate, tax_rate)
     
     # 4. 績效比較與指標計算
     def get_metrics(df):
-        if df.empty: return 0, 0
+        if df.empty: return 0, 0, 0
         cum_ret = df['Cum_Strategy'].iloc[-1] - 1
         mdd = calculate_mdd(df['Cum_Strategy'])
         # 年化報酬估算
@@ -828,12 +801,13 @@ def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.0014
     test_ret, test_mdd, test_cagr = get_metrics(test_res_df)
     
     return {
-        "params": best_params_train,
+        "params": {'Mult': 3.0, 'Rule': 'Alpha Score'}, # 這裡回傳固定標籤即可
         "train": {"ret": train_ret, "mdd": train_mdd, "cagr": train_cagr, "df": train_res_df},
         "test": {"ret": test_ret, "mdd": test_mdd, "cagr": test_cagr, "df": test_res_df},
-        "split_date": test_data_raw['Date'].min()
+        "split_date": test_data['Date'].min()
     }
 
+    
 def calculate_target_hit_rate(df):
     if df is None or df.empty: return "0.0%", 0, 0
     
