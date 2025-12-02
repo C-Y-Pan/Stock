@@ -974,29 +974,30 @@ def analyze_signal(final_df):
     else: return "👀 觀望", "gray", "空手"
 
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - 客觀技術積分版
+# 5. [核心演算法] 買賣評等 (Alpha Score) - v11 黃金坑優化版
 # ==========================================
 def calculate_alpha_score(df, margin_df=None, short_df=None):
     """
-    Alpha Score v10.0 (Objective Technical Scorecard):
-    修正邏輯：分數是持有的「依據」，而非持有的「結果」。
-    完全移除持倉基本分，改以技術面 (趨勢/動能/籌碼) 為唯一評分標準。
+    Alpha Score v11.0 (Smart Panic Logic):
+    1. 客觀技術評分。
+    2. [新增] 恐慌抄底優化：
+       - 若觸發抄底訊號 且 年線(MA240)翻揚 (牛市回檔)：強制忽略所有技術面扣分，並給予強力加權 (視為黃金坑)。
+       - 若觸發抄底訊號 且 年線下彎 (熊市反彈)：維持原扣分邏輯 (視為搶反彈，風險較高)。
     """
     df = df.copy()
 
-    # 1. 基礎欄位防呆補全
+    # 1. 基礎欄位防呆與補全
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240).mean() # 確保年線存在
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     if 'Action' not in df.columns: df['Action'] = 'Hold'
     if 'Reason' not in df.columns: df['Reason'] = ''
     
-    # [新增] 乖離率與布林通道計算 (用於評分)
-    if 'BB_Upper' not in df.columns:
-        std = df['Close'].rolling(20).std()
-        df['BB_Upper'] = df['MA20'] + 2 * std
-        df['BB_Lower'] = df['MA20'] - 2 * std
+    # [新增] 計算年線斜率 (判斷牛熊背景)
+    # 使用 5 日變化量來平滑斜率，避免單日噪聲
+    df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
 
     final_scores = []
     score_details = []
@@ -1006,151 +1007,153 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         row = df.iloc[i]
         prev_row = df.iloc[i-1] if i > 0 else row
         
-        # === 初始化積分卡 (從 0 開始) ===
+        # === 初始化 ===
         score = 0
+        neg_accumulator = 0 # [新增] 負分累計器，用來記錄被扣了多少分
         reasons = [] 
         
         # ==========================================
-        # A. 趨勢面 (Trend) - 權重佔比約 50%
+        # A. 趨勢面 (Trend)
         # ==========================================
-        # 核心邏輯：股價必須在均線之上，才值得高分
-        
         close = row['Close']
         ma20 = row['MA20']
         ma60 = row['MA60']
         
-        # 1. 月線 (生命線) 檢核
+        # 1. 月線
         if close > ma20:
-            score += 20
-            reasons.append("股價 > 月線 (+20)")
+            score += 20; reasons.append("股價 > 月線 (+20)")
         else:
-            score -= 20
+            deduction = -20
+            score += deduction; neg_accumulator += deduction # 累計扣分
             reasons.append("股價破月線 (-20)")
             
-        # 2. 季線 (趨勢線) 檢核
+        # 2. 季線
         if close > ma60:
-            score += 15
-            reasons.append("股價 > 季線 (+15)")
+            score += 15; reasons.append("股價 > 季線 (+15)")
         else:
-            score -= 15
+            deduction = -15
+            score += deduction; neg_accumulator += deduction
             reasons.append("股價破季線 (-15)")
             
-        # 3. 均線排列
+        # 3. 排列
         if ma20 > ma60:
-            score += 10
-            reasons.append("均線多頭排列 (+10)")
+            score += 10; reasons.append("均線多頭排列 (+10)")
         elif ma20 < ma60:
-            score -= 5
+            deduction = -5
+            score += deduction; neg_accumulator += deduction
             reasons.append("均線空頭排列 (-5)")
 
         # ==========================================
-        # B. 動能面 (Momentum) - 權重佔比約 30%
+        # B. 動能面 (Momentum)
         # ==========================================
         rsi = row['RSI']
         
         if rsi >= 60:
-            score += 10
-            reasons.append(f"RSI 強勢區 ({int(rsi)}) (+10)")
+            score += 10; reasons.append(f"RSI 強勢區 ({int(rsi)}) (+10)")
         elif 50 <= rsi < 60:
-            score += 5
-            reasons.append(f"RSI 多方區 ({int(rsi)}) (+5)")
+            score += 5; reasons.append(f"RSI 多方區 ({int(rsi)}) (+5)")
         elif rsi < 30:
-            # 超賣區：通常是負分，除非出現背離(這裡簡化處理)
-            score -= 10
+            # 超賣通常扣分
+            deduction = -10
+            score += deduction; neg_accumulator += deduction
             reasons.append(f"RSI 超賣弱勢 ({int(rsi)}) (-10)")
         else:
-            score -= 5
+            deduction = -5
+            score += deduction; neg_accumulator += deduction
             reasons.append(f"RSI 弱勢區 ({int(rsi)}) (-5)")
             
-        # 動能方向 (與昨日相比)
-        if i > 0:
-            if rsi > prev_row['RSI']:
-                score += 5
-                reasons.append("動能增強 (+5)")
-            else:
-                reasons.append("動能衰退 (0)")
+        if i > 0 and rsi > prev_row['RSI']:
+            score += 5; reasons.append("動能增強 (+5)")
 
         # ==========================================
-        # C. 量價與結構 (Volume & Structure) - 權重佔比約 20%
+        # C. 量價與結構
         # ==========================================
         vol = row['Volume']
         vol_ma = row['Vol_MA20']
         
-        # 1. 攻擊量
         if vol > vol_ma and close > row['Open']:
-            score += 10
-            reasons.append("出量上漲 (+10)")
-        # 2. 賣壓量
+            score += 10; reasons.append("出量上漲 (+10)")
         elif vol > vol_ma and close < row['Open']:
-            score -= 10
+            deduction = -10
+            score += deduction; neg_accumulator += deduction
             reasons.append("出量下跌 (-10)")
-        # 3. 窒息量/縮量盤整
         elif vol < vol_ma * 0.6 and abs(close - row['Open']) / close < 0.005:
-            # 只有在趨勢向上時，縮量整理才是好事
             if close > ma20:
-                score += 5
-                reasons.append("多頭縮量惜售 (+5)")
+                score += 5; reasons.append("多頭縮量惜售 (+5)")
             else:
-                score -= 5
+                deduction = -5
+                score += deduction; neg_accumulator += deduction
                 reasons.append("空頭人氣退潮 (-5)")
 
         # ==========================================
-        # D. 策略訊號事件 (Signal Events)
+        # D. 策略訊號事件 (邏輯修正核心)
         # ==========================================
-        # 只有在訊號「發生當下」，給予強制加成，代表系統的強力介入
-        # 但這個加成是疊加在技術分之上的
-        
         action = row['Action']
+        reason_str = str(row['Reason'])
+        
         if action == 'Buy':
-            # 買進訊號當天，額外加分以突顯突破點
-            score += 20
-            reasons.insert(0, f"<b>🚀 策略買進訊號 ({row['Reason']}) (+20)</b>")
+            # 判斷是否為恐慌抄底 (Reason 包含 反彈 或 超賣)
+            is_panic_buy = ('反彈' in reason_str) or ('超賣' in reason_str)
+            
+            # 判斷年線趨勢 (Slope > 0 代表牛市)
+            is_bull_trend = row['MA240_Slope'] > 0
+            
+            if is_panic_buy and is_bull_trend:
+                # === [情境 A: 牛市黃金坑] ===
+                # 邏輯：雖然破線、超賣導致上面被扣了很多分，但因為年線向上，這些都是假跌破
+                # 動作：1. 加回所有扣分 (Ignored Penalties)
+                #       2. 給予強力加分 (原本+20不夠，改+40)
+                
+                penalty_restore = abs(neg_accumulator) # 取絕對值加回來
+                score += penalty_restore
+                
+                score += 40 # 強力買進加權
+                
+                reasons.insert(0, f"<b>💎 牛市黃金坑 (+40)</b>")
+                if penalty_restore > 0:
+                    reasons.insert(1, f"<span style='color:#ffeb3b'>⚡ 忽略技術扣分 (+{penalty_restore})</span>")
+                    
+            else:
+                # === [情境 B: 一般買進 或 熊市搶反彈] ===
+                score += 20 # 一般加權
+                reasons.insert(0, f"<b>🚀 策略買進訊號 ({reason_str}) (+20)</b>")
+                
         elif action == 'Sell':
-            # 賣出訊號當天，強制扣分
             score -= 30
-            reasons.insert(0, f"<b>⚡ 策略賣出訊號 ({row['Reason']}) (-30)</b>")
+            reasons.insert(0, f"<b>⚡ 策略賣出訊號 ({reason_str}) (-30)</b>")
 
         # ==========================================
         # E. 輸出格式化
         # ==========================================
-        
-        # 限制範圍 -100 ~ 100
         final_score = max(min(score, 100), -100)
         final_scores.append(final_score)
         
-        # 生成 HTML 懸停文字
         title_color = "#ff5252" if final_score > 0 else "#00e676"
-        
-        # 標頭：分數
         html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
         html_str += "<span style='color:#666; font-size:10px'>─── Technical Analysis ───</span><br>"
         
-        # 內容：詳細理由 (只顯示前 6 個重要理由，避免太長)
-        # 將理由分為正向與負向，方便閱讀
+        # 顯示理由
         pos_reasons = [r for r in reasons if "(+" in r]
-        neg_reasons = [r for r in reasons if "(-" in r or "(0)" in r]
+        neg_reasons = [r for r in reasons if "(-" in r] # 這裡不顯示被忽略的扣分
         
         if pos_reasons:
             html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
         if neg_reasons:
+            # 如果是黃金坑模式，其實 neg_accumulator 已經被加回來了，但在列表裡還是會顯示
+            # 為了讓使用者困惑，我們標註一下
             html_str += f"<span style='color:#b9f6ca'>{'<br>'.join(neg_reasons)}</span>"
             
         score_details.append(html_str)
 
-    # 寫回 DataFrame
     df['Alpha_Score'] = final_scores
     df['Score_Detail'] = score_details
     
-    # 產生簡易評語 Log
     conditions = [
         (df['Alpha_Score'] >= 60), (df['Alpha_Score'] >= 20), (df['Alpha_Score'] >= -20),
         (df['Alpha_Score'] <= -60), (df['Alpha_Score'] < -20)
     ]
     choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 震盪盤整", "⚡ 極弱勢", "📉 空頭修正"]
     df['Score_Log'] = np.select(conditions, choices, default="☁️ 觀望")
-    
-    # 輔助欄位 (推薦倉位與分數掛鉤)
-    # 分數 100 -> 100% 倉位, 分數 0 -> 50% 倉位, 分數 -100 -> 0% 倉位
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
