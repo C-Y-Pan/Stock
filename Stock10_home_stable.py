@@ -623,12 +623,11 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=60, sell_threshold=40, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略執行核心 v10.2 (Strict State Machine):
-    - [修正] 嚴格狀態機：持倉時絕對不檢查買進，空手時絕對不檢查賣出。
-    - [調整] 預設 sell_threshold 提高至 40 (動能轉弱即跑，不需等到轉空)。
-    - [視覺] Buy_Y / Sell_Y 只標記動作發生日。
+    策略執行核心 v10.3 (Trend Following):
+    - [修改] 預設 sell_threshold = 0 (只有當 Alpha Score 轉為負數時才賣出)。
+    - 這代表策略容忍多頭回檔 (分數 10~50 仍續抱)，追求完整波段。
     """
     df = data.copy()
     
@@ -636,22 +635,20 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=40, fee_rate=0.00
     if 'Alpha_Score' not in df.columns:
         df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
-    positions = []      # 記錄每日持倉狀態 (0或1)
-    actions = []        # 記錄每日動作 (Buy, Sell, Hold, Wait)
-    reasons = []        # 記錄理由
-    return_labels = []  # 記錄損益
+    positions = []      
+    actions = []        
+    reasons = []        
+    return_labels = []  
     
-    # 初始狀態
-    position = 0        # 0: 空手, 1: 持倉
-    entry_price = 0.0   # 進場成本
-    days_held = 0       # 持有天數
-    cum_div = 0.0       # 累積股利
+    position = 0        
+    entry_price = 0.0   
+    days_held = 0       
+    cum_div = 0.0       
     
     # 轉換 Numpy 加速
     alpha_scores = df['Alpha_Score'].values
     closes = df['Close'].values
-    lows = df['Low'].values
-    highs = df['High'].values
+    dates = df['Date'].values
     dividends = df['Dividends'].fillna(0).values if 'Dividends' in df.columns else np.zeros(len(df))
     
     for i in range(len(df)):
@@ -659,55 +656,53 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=40, fee_rate=0.00
         price = closes[i]
         div = dividends[i]
         
-        # 本日動作預設值
         current_action = "Wait"
         current_reason = ""
         current_ret = ""
         
         # ==========================================
-        # 狀態機邏輯 (State Machine)
+        # 狀態機邏輯
         # ==========================================
         
-        # 情境 A: 目前【持倉中】 (Position = 1) -> 只能檢查【賣出】
+        # 情境 A: 持倉中 (Position = 1) -> 只能檢查【賣出】
         if position == 1:
             days_held += 1
             if div > 0: cum_div += div
             
-            # 計算當前損益
             curr_val = price + cum_div
             pnl_pct = (curr_val - entry_price) / entry_price
             
             # --- 賣出檢查 ---
-            # 1. 硬性停損: 虧損超過 10% (縮小停損以保護本金)
+            # 1. 硬性停損: 虧損超過 10% (保命條款)
             cond_stop_loss = (pnl_pct < -0.10)
-            # 2. 評分出場: 分數低於賣出門檻 (例如低於 40 分)
+            
+            # 2. 評分出場: 分數轉負 (Alpha Score < 0)
+            # 這裡使用外部傳入的 sell_threshold (預設為 0)
             cond_score_exit = (score < sell_threshold)
             
             if cond_stop_loss:
-                position = 0  # 狀態轉為空手
+                position = 0
                 current_action = "Sell"
                 current_reason = f"硬性停損 ({pnl_pct*100:.1f}%)"
             elif cond_score_exit:
-                position = 0  # 狀態轉為空手
+                position = 0
                 current_action = "Sell"
-                current_reason = f"評分轉弱 ({int(score)}分)"
+                current_reason = f"趨勢翻空 ({int(score)}分)"
             else:
-                position = 1  # 狀態維持持倉
+                position = 1
                 current_action = "Hold"
-                current_reason = f"續抱 (Score:{int(score)})"
+                current_reason = f"續抱 ({int(score)}分)"
             
-            # 若發生賣出，結算損益
             if current_action == "Sell":
                 final_pnl = (price + cum_div - entry_price) / entry_price * 100
                 sign = "+" if final_pnl > 0 else ""
                 current_ret = f"{sign}{final_pnl:.1f}%"
 
-        # 情境 B: 目前【空手】 (Position = 0) -> 只能檢查【買進】
+        # 情境 B: 空手 (Position = 0) -> 只能檢查【買進】
         else:
             # --- 買進檢查 ---
-            # 1. 分數高於買進門檻 (例如 60 分)
             if score >= buy_threshold:
-                position = 1  # 狀態轉為持倉
+                position = 1
                 current_action = "Buy"
                 entry_price = price
                 days_held = 0
@@ -717,30 +712,26 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=40, fee_rate=0.00
                 elif score >= 60: current_reason = "🚀 趨勢確立"
                 else: current_reason = "✅ 試單買進"
             else:
-                position = 0  # 狀態維持空手
+                position = 0
                 current_action = "Wait"
                 current_reason = "觀望"
 
-        # 記錄本日結果
         positions.append(position)
         actions.append(current_action)
         reasons.append(current_reason)
         return_labels.append(current_ret)
         
-    # 寫回 DataFrame
     df['Position'] = positions
     df['Action'] = actions
     df['Reason'] = reasons
     df['Return_Label'] = return_labels
     
-    # 計算圖表座標 (只標記動作發生日)
+    # 計算圖表座標
     df['Buy_Y'] = np.where(df['Action'] == 'Buy', df['Low'] * 0.96, np.nan)
     df['Sell_Y'] = np.where(df['Action'] == 'Sell', df['High'] * 1.04, np.nan)
     
-    # 計算績效 (需 shift Position 以避免偷看未來)
-    # Real_Position = 昨天的 Position (決定今天是否在場內)
+    # 計算績效
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
-    
     df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
     df['Market_Return'] = df['Market_Return'].fillna(0)
     
@@ -754,15 +745,16 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=40, fee_rate=0.00
     
     return df
 
+
+
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    參數優化 v10.2:
+    參數優化 v10.3:
     - 優化買進門檻 (Buy Threshold)
-    - [固定] 賣出門檻設為 40 (比買進低20分作為緩衝區)，避免死抱。
+    - [固定] 賣出門檻設為 0 (只有當 Alpha Score 變為負數才賣出)。
     """
     target_start = pd.to_datetime(user_start_date)
     
-    # 預先計算分數
     df_scored = calculate_alpha_score(raw_df, pd.DataFrame(), pd.DataFrame())
     
     df_slice = df_scored[df_scored['Date'] >= target_start].copy()
@@ -773,28 +765,22 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
     best_params = {'Buy_Threshold': 60, 'Return': 0}
     best_df = df_slice.copy()
     
-    # 參數設定
-    # 買進門檻嘗試: 55, 60, 65, 70
+    # 買進門檻測試: 55, 60, 65, 70
     buy_thresholds = [55, 60, 65, 70]
     
-    # 賣出門檻固定為 40
-    # 邏輯: 60分買進，如果不強了(低於40)就走，不要等到變爛(0分)才走
-    fixed_sell_threshold = 40
+    # [設定] 賣出門檻固定為 0
+    # 這符合「Alpha 值為負時再賣出」的要求
+    fixed_sell_threshold = 0
     
     for thresh in buy_thresholds:
-        # 如果買進門檻設得太低(例如40)，賣出也是40，會導致頻繁進出(Whipsaw)
-        # 所以這裡做個簡單保護：賣出門檻至少比買進低 15 分
-        current_sell_thresh = min(fixed_sell_threshold, thresh - 15)
-        
         df_res = run_simple_strategy(
             df_slice, 
             buy_threshold=thresh, 
-            sell_threshold=current_sell_thresh,
+            sell_threshold=fixed_sell_threshold, # <--- 這裡傳入 0
             fee_rate=fee_rate, 
             tax_rate=tax_rate
         )
         
-        # 評估總報酬
         total_ret = df_res['Cum_Strategy'].iloc[-1] - 1
         
         if total_ret > best_ret:
@@ -802,11 +788,12 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
             best_params = {'Buy_Threshold': thresh, 'Return': total_ret}
             best_df = df_res
 
-    # 兼容舊版 key
     best_params['Mult'] = 0 
     best_params['RSI_Buy'] = best_params['Buy_Threshold'] 
             
     return best_params, best_df
+
+
 
 
 # 修改後：傳遞成本參數
