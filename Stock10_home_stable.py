@@ -621,46 +621,35 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 
 
 # ==========================================
-# 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
+# 3. 策略邏輯 & 輔助 (Modified for Zero-Line Crossover)
 # ==========================================
-def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001425, tax_rate=0.003):
+
+def run_simple_strategy(data, buy_threshold=5, sell_threshold=-5, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略執行核心 v10.5 (Clean Slate):
-    - [強制清洗] 計算分數前清空歷史 Action/Position，確保取得「純技術評分」。
-    - [顯示優化] 顯示小數點位，避免 -0.5 被誤認為 0 分。
-    - [嚴格執行] 只有 Score < sell_threshold (0) 才會賣出。
+    策略執行核心 v11.0 (Zero-Line Mode):
+    - 買進：Alpha Score > buy_threshold (正值，例如 0 或 5)
+    - 賣出：Alpha Score < sell_threshold (負值，例如 0 或 -5)
+    - 特色：完整持有正分區間，只有在真正翻空時才賣出。
     """
     df = data.copy()
     
-    # ==========================================
-    # 1. 強制清洗與重算 (關鍵修正)
-    # ==========================================
-    # 我們需要「純粹」的技術分數，不受上次回測的「賣出訊號(-85分)」干擾
-    # 所以先將狀態重置為「觀望」
+    # 強制清洗與重算
     df['Action'] = 'Wait'
     df['Position'] = 0
-    
-    # 重新計算 Alpha Score (基於純技術面)
     df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
 
-    # ==========================================
-    # 2. 開始回測
-    # ==========================================
-    positions = []      
-    actions = []        
-    reasons = []        
-    return_labels = []  
+    positions = []       
+    actions = []         
+    reasons = []         
+    return_labels = []   
     
     position = 0        
     entry_price = 0.0   
     days_held = 0       
     cum_div = 0.0       
     
-    # 轉換 Numpy 加速
     alpha_scores = df['Alpha_Score'].values
     closes = df['Close'].values
-    lows = df['Low'].values
-    highs = df['High'].values
     dividends = df['Dividends'].fillna(0).values if 'Dividends' in df.columns else np.zeros(len(df))
     
     for i in range(len(df)):
@@ -672,40 +661,37 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
         current_reason = ""
         current_ret = ""
         
-        # ==========================================
-        # 狀態機邏輯
-        # ==========================================
+        # --- 狀態機邏輯 ---
         
         # 情境 A: 持倉中 (Position = 1) -> 只能檢查【賣出】
         if position == 1:
             days_held += 1
             if div > 0: cum_div += div
-            
             curr_val = price + cum_div
             
-            # --- 賣出檢查 ---
-            # 條件: 分數低於門檻 (例如 < 0)
-            # 這裡我們使用浮點數比較，非常精確
+            # [修改點] 賣出條件：只有當分數變成負值 (低於 sell_threshold) 才賣出
+            # 這樣可以避免股價只是漲多拉回 (分數變小但仍為正) 就被洗出場
             cond_score_exit = (score < sell_threshold)
             
             if cond_score_exit:
                 position = 0
                 current_action = "Sell"
-                # [顯示修正] 使用 .1f 顯示小數點，避免 int(-0.5) = 0 的誤會
-                current_reason = f"趨勢翻空 ({score:.1f}分)"
+                current_reason = f"翻空確認 ({score:.0f}分)"
                 
-                # 結算損益
                 final_pnl = (curr_val - entry_price) / entry_price * 100
                 sign = "+" if final_pnl > 0 else ""
                 current_ret = f"{sign}{final_pnl:.1f}%"
             else:
                 position = 1
                 current_action = "Hold"
-                current_reason = f"續抱 ({score:.1f}分)"
+                # 顯示當前信心水準
+                if score >= 60: current_reason = f"強勢續抱 ({score:.0f}分)"
+                elif score >= 20: current_reason = f"續抱 ({score:.0f}分)"
+                else: current_reason = f"警戒續抱 ({score:.0f}分)"
 
         # 情境 B: 空手 (Position = 0) -> 只能檢查【買進】
         else:
-            # --- 買進檢查 ---
+            # [修改點] 買進條件：只要分數轉正 (高於 buy_threshold) 就買進
             if score >= buy_threshold:
                 position = 1
                 current_action = "Buy"
@@ -713,13 +699,12 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
                 days_held = 0
                 cum_div = 0.0
                 
-                if score >= 80: current_reason = "🔥 極強勢買進"
-                elif score >= 60: current_reason = "🚀 趨勢確立"
-                else: current_reason = "✅ 試單買進"
+                if score >= 60: current_reason = "🔥 強勢買進"
+                else: current_reason = "✅ 翻多買進"
             else:
                 position = 0
                 current_action = "Wait"
-                current_reason = "觀望"
+                current_reason = "觀望 (空方)"
 
         positions.append(position)
         actions.append(current_action)
@@ -749,6 +734,57 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
+
+
+def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
+    """
+    參數優化 v11.0 (Zero-Line Mode):
+    - 掃描 0~10 分作為買進門檻，尋找最佳切入點。
+    - 賣出門檻固定為 -5 (或是 0)，確保只在負值賣出。
+    """
+    target_start = pd.to_datetime(user_start_date)
+    
+    # 1. 預先計算分數
+    df_scored = calculate_alpha_score(raw_df, pd.DataFrame(), pd.DataFrame())
+    
+    df_slice = df_scored[df_scored['Date'] >= target_start].copy()
+    if df_slice.empty: 
+        return None, pd.DataFrame()
+
+    best_ret = -999
+    best_params = {'Buy_Threshold': 5, 'Return': 0}
+    best_df = df_slice.copy()
+    
+    # [修改點] 設定「負值賣出」的門檻
+    # 建議設為 -5 而不是 0，作為一個小小的緩衝區(Hysteresis)，防止在 0 附近反覆刷單(Whipsaw)
+    fixed_sell_threshold = -5 
+    
+    # [修改點] 測試的買進門檻改為低分區段
+    # 測試：只要大於 0, 5, 10 分就買進 (而不是原本的 60)
+    thresholds = [0, 5, 10, 15] 
+    
+    for thresh in thresholds:
+        df_res = run_simple_strategy(
+            df_slice, 
+            buy_threshold=thresh, 
+            sell_threshold=fixed_sell_threshold, 
+            fee_rate=fee_rate, 
+            tax_rate=tax_rate
+        )
+        
+        total_ret = df_res['Cum_Strategy'].iloc[-1] - 1
+        
+        if total_ret > best_ret:
+            best_ret = total_ret
+            best_params = {'Buy_Threshold': thresh, 'Return': total_ret}
+            best_df = df_res
+
+    # 兼容性參數
+    best_params['Mult'] = 0 
+    best_params['RSI_Buy'] = best_params['Buy_Threshold'] 
+            
+    return best_params, best_df
+
 
 
 
