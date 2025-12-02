@@ -974,156 +974,133 @@ def analyze_signal(final_df):
     else: return "👀 觀望", "gray", "空手"
 
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - 實務嚴謹版
+# 5. [核心演算法] 買賣評等 (Alpha Score) - 數位積分版
 # ==========================================
-def calculate_alpha_score(df, margin_df, short_df):
+def calculate_alpha_score(df, margin_df=None, short_df=None):
     """
-    Alpha Score v9.0 (Digital Quant):
-    基於「積木式計分」將策略邏輯數位化。
-    買賣訊號具最高權重，持倉期間則依據技術面狀態動態加減分。
+    Alpha Score v9.0 (Digital Scorecard):
+    將策略訊號與技術指標「數位化」為具體分數 (-100 ~ +100)。
+    並生成 HTML 格式的詳細評分依據 (Score_Detail)。
     """
     df = df.copy()
 
-    # 1. 確保必要欄位存在
+    # 1. 基礎欄位防呆補全
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-    if 'OBV_MA20' not in df.columns: df['OBV_MA20'] = df['OBV'].rolling(20).mean()
-    
-    # 準備 Numpy Arrays
-    close = df['Close'].values
-    ma20 = df['MA20'].fillna(0).values
-    ma60 = df['MA60'].fillna(0).values
-    rsi = df['RSI'].fillna(50).values
-    volume = df['Volume'].fillna(0).values
-    vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
-    obv = df['OBV'].fillna(0).values
-    obv_ma20 = df['OBV_MA20'].fillna(0).values
-    
-    # 策略訊號
-    actions = df['Action'].values if 'Action' in df.columns else np.array(['Wait']*len(df))
-    positions = df['Position'].values if 'Position' in df.columns else np.zeros(len(df))
-    reasons = df['Reason'].values if 'Reason' in df.columns else np.array(['']*len(df))
+    if 'Action' not in df.columns: df['Action'] = 'Hold'
+    if 'Position' not in df.columns: df['Position'] = 0
+    if 'Reason' not in df.columns: df['Reason'] = ''
 
+    # 準備列表儲存計算結果
     final_scores = []
-    detail_htmls = []
-    log_summaries = []
+    score_details = []
 
+    # 為了計算變化，取得上一日的數據 (Iterative)
+    # 雖然慢一點，但為了生成精確的文字解釋，這是必要的
     for i in range(len(df)):
+        row = df.iloc[i]
+        prev_row = df.iloc[i-1] if i > 0 else row
+        
         score = 0
-        details = [] # 用於儲存每一項得分的說明文字
+        reasons = [] # 儲存詳細加扣分理由
         
-        # ==========================================
-        # A. 訊號強制權重 (Signal Override)
-        # ==========================================
-        act = actions[i]
-        pos = positions[i]
+        # --- A. 策略訊號錨定 (Event Anchor) ---
+        action = row['Action']
+        pos = row['Position']
         
-        if act == 'Buy':
-            score = 95
-            details.append(f"🚀 <b>策略買進訊號</b> (+95)<br><span style='font-size:10px; color:#aaa'>原因: {reasons[i]}</span>")
-            status_desc = "極強勢"
-        
-        elif act == 'Sell':
-            score = -95
-            details.append(f"⚡ <b>策略賣出訊號</b> (-95)<br><span style='font-size:10px; color:#aaa'>原因: {reasons[i]}</span>")
-            status_desc = "極弱勢"
+        if action == 'Buy':
+            base = 90
+            reasons.append(f"<b>🚀 觸發買進訊號 (Base: {base})</b>")
+            reasons.append(f"<span style='color:#888; font-size:10px'>{row['Reason']}</span>")
+            score = base
             
+        elif action == 'Sell':
+            base = -90
+            reasons.append(f"<b>⚡ 觸發賣出訊號 (Base: {base})</b>")
+            reasons.append(f"<span style='color:#888; font-size:10px'>{row['Reason']}</span>")
+            score = base
+            
+        elif pos == 1:
+            base = 50
+            reasons.append(f"<b>✊ 持倉基本分 (Base: {base})</b>")
+            score = base
         else:
-            # ==========================================
-            # B. 持倉/觀望狀態的技術面評分 (Technical Scoring)
-            # ==========================================
-            
-            # 1. 基礎持倉分 (Base Position Score)
-            if pos == 1:
-                score += 30
-                details.append("✊ <b>持倉基礎分</b> (+30)")
-            else:
-                score -= 10
-                details.append("👀 <b>空手基礎分</b> (-10)")
+            base = -20
+            reasons.append(f"<b>👀 空手觀望 (Base: {base})</b>")
+            score = base
 
-            # 2. 趨勢面 (Trend)
-            if close[i] > ma60[i]:
-                score += 20
-                details.append("📈 股價 > 季線 (+20)")
+        # --- B. 技術面加權 (Technical Weighting) ---
+        # 僅在非買賣訊號當日進行波動調整 (讓持有期間分數會跳動)
+        if action not in ['Buy', 'Sell']:
+            
+            # 1. 趨勢面 (Trend)
+            close = row['Close']
+            ma20 = row['MA20']
+            ma60 = row['MA60']
+            
+            if close > ma20:
+                score += 10; reasons.append("股價 > 月線 (+10)")
             else:
-                score -= 20
-                details.append("📉 股價 < 季線 (-20)")
+                score -= 10; reasons.append("股價破月線 (-10)")
                 
-            if ma20[i] > ma60[i]:
-                score += 10
-                details.append("✅ 均線多頭排列 (+10)")
+            if ma20 > ma60:
+                score += 5; reasons.append("均線多頭排列 (+5)")
             
-            # 3. 動能面 (Momentum)
-            if rsi[i] > 50:
-                score += 10
-                details.append("🔥 RSI 強勢區 (>50) (+10)")
-            elif rsi[i] < 30:
-                 # 低檔鈍化/超賣給予一點支撐分，除非是持倉狀態且破線
-                if pos == 1 and close[i] < ma20[i]:
-                    score -= 10
-                    details.append("⚠️ RSI 低檔弱勢 (-10)")
+            # 2. 動能面 (Momentum - RSI)
+            rsi = row['RSI']
+            if rsi > 60:
+                score += 10; reasons.append(f"RSI 強勢區 ({int(rsi)}) (+10)")
+            elif rsi > 50:
+                score += 5; reasons.append(f"RSI 多方區 ({int(rsi)}) (+5)")
+            elif rsi < 30:
+                # 雖然弱勢，但如果是空手可能有反彈機會，如果是持倉則是危險
+                if pos == 1: 
+                    score -= 15; reasons.append("RSI 嚴重超賣 (-15)")
                 else:
-                    score += 5
-                    details.append("💎 RSI 超賣潛力 (+5)")
+                    score += 5; reasons.append("RSI 醞釀反彈 (+5)")
             
-            # 4. 籌碼量能面 (Volume & Chip)
-            if volume[i] > vol_ma20[i]:
-                if close[i] > close[i-1]:
-                    score += 10
-                    details.append("🔴 量增價漲 (+10)")
-                else:
-                    score -= 10
-                    details.append("🟢 量增價跌 (-10)")
-            
-            if obv[i] > obv_ma20[i]:
-                score += 10
-                details.append("💰 OBV > 均量 (+10)")
+            # RSI 趨勢 (跟昨天比)
+            if i > 0 and row['RSI'] > prev_row['RSI']:
+                score += 5; reasons.append("動能翻揚 (+5)")
 
-            # 5. 乖離修正 (Bias Penalty)
-            # 防止分數無限膨脹，當乖離過大時扣分
-            bias = (close[i] - ma20[i]) / ma20[i]
-            if bias > 0.15:
-                score -= 10
-                details.append("⚠️ 乖離過大 (-10)")
+            # 3. 量能面 (Volume)
+            vol = row['Volume']
+            vol_ma = row['Vol_MA20']
+            if vol > vol_ma and row['Close'] > row['Open']:
+                score += 5; reasons.append("量增價漲 (+5)")
+            elif vol > vol_ma * 2.5 and row['Close'] < row['Open']:
+                score -= 15; reasons.append("爆量長黑 (-15)")
 
-            # 限制分數區間 -100 ~ 100
-            score = max(min(score, 100), -100)
-            
-            # 狀態描述
-            if score >= 60: status_desc = "強勢多頭"
-            elif score >= 20: status_desc = "偏多整理"
-            elif score >= -20: status_desc = "中性震盪"
-            elif score <= -60: status_desc = "弱勢空頭"
-            else: status_desc = "偏空調整"
-
-        final_scores.append(score)
-        log_summaries.append(status_desc)
-
-        # ==========================================
-        # C. 組合 HTML Tooltip
-        # ==========================================
-        # 標題顏色
-        title_color = "#ff5252" if score > 0 else "#00e676"
+        # --- C. 分數邊界限制 (Clamping) ---
+        final_score = max(min(score, 100), -100)
+        final_scores.append(final_score)
         
-        # 組合 HTML
-        html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:16px'>{int(score)}</span></b><br>"
-        html_str += f"<span style='color:#ccc; font-size:12px'>狀態: {status_desc}</span><br>"
-        html_str += "<hr style='margin:4px 0; border-color:#444'>"
-        html_str += "<br>".join(details)
-        
-        detail_htmls.append(html_str)
+        # --- D. 生成 HTML 懸停文字 ---
+        # 根據分數決定標題顏色
+        title_color = "#ff5252" if final_score > 0 else "#00e676"
+        score_html = f"<b>Alpha Score: <span style='color:{title_color}; font-size:16px'>{int(final_score)}</span></b><br>"
+        score_html += "<span style='color:#777; font-size:10px'>───────────────</span><br>"
+        score_html += "<br>".join(reasons)
+        score_details.append(score_html)
 
+    # 寫回 DataFrame
     df['Alpha_Score'] = final_scores
-    df['Score_Detail'] = detail_htmls
-    df['Score_Log'] = log_summaries
+    df['Score_Detail'] = score_details # 這是新欄位，專門給 Plotly hover 使用
     
-    # 輔助欄位：建議倉位
+    # 產生簡易評語 Log (相容舊程式碼)
+    conditions = [
+        (df['Alpha_Score'] >= 80), (df['Alpha_Score'] >= 40), (df['Alpha_Score'] >= 0),
+        (df['Alpha_Score'] <= -80), (df['Alpha_Score'] <= -40)
+    ]
+    choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 偏多震盪", "⚡ 極弱勢", "📉 空頭修正"]
+    df['Score_Log'] = np.select(conditions, choices, default="☁️ 盤整")
+    
+    # 輔助欄位
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
-    
 
 
 def calculate_alpha_score_technical_fallback(df):
@@ -1815,17 +1792,9 @@ elif page == "📊 單股深度分析":
                 if math.isnan(final_composite_score):
                     final_composite_score = 0
                 
-                # 組合最終顯示日誌 (改為顯示最後一天的詳細 HTML，需去除 HTML 標籤以純文字顯示在 st.info)
-                import re
-                last_detail_html = final_df['Score_Detail'].iloc[-1]
-                # 簡單去除 HTML tag 方便在 st.info 閱讀
-                clean_log = re.sub('<[^<]+?>', ' ', last_detail_html).replace("Alpha Score:", "").strip()
-                # 整理格式
-                clean_log = clean_log.replace("  ", "\n").replace("狀態:", " | 狀態:")
-                score_col, log_col = st.columns([1, 3])
-                with log_col:
-                     st.info(f"**🧮 本日評分結構：**\n\n{clean_log}")
-
+                # 組合最終顯示日誌
+                full_log_text = f"{base_log} {adjustment_log}" if base_log or adjustment_log else "無顯著特徵"
+                
                 # 計算其餘指標
                 beta, vol, personality = calculate_stock_personality(final_df, market_df)
                 hit_rate, hits, total = calculate_target_hit_rate(final_df)
@@ -1863,58 +1832,25 @@ elif page == "📊 單股深度分析":
 
                 st.markdown("---")
 
-                # ==========================================
-                # 3. AI 評分區塊 (Page 2 修復版)
-                # ==========================================
+                # 3. AI 評分區塊 (維持不變，僅微調版面)
                 st.markdown("### 🏆 AI 綜合評分與決策依據")
-                
-                # 1. 定義版面
                 score_col, log_col = st.columns([1, 3])
                 
-                # 2. [關鍵] 執行評分計算，結果存入 stock_alpha_df
-                # 注意：calculate_alpha_score 會回傳一個新的 DataFrame，包含 Score_Detail 欄位
-                stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
-                
-                # 3. 取得分數
-                final_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-                
-                # 4. [修復重點] 準備詳細算式文字
-                # ❌ 錯誤寫法: last_detail_html = final_df['Score_Detail'].iloc[-1]
-                # ✅ 正確寫法: 從 stock_alpha_df 讀取，並確認欄位存在
-                
-                full_log_text = "無詳細算式數據"
-                if 'Score_Detail' in stock_alpha_df.columns:
-                    import re
-                    last_detail_html = stock_alpha_df['Score_Detail'].iloc[-1]
-                    
-                    # 使用 Regex 去除 HTML 標籤 (<b>, <br> 等) 以便在 st.info 顯示
-                    clean_log = re.sub('<[^<]+?>', ' ', str(last_detail_html))
-                    clean_log = clean_log.replace("Alpha Score:", "").strip()
-                    
-                    # 整理格式：將連續空白轉為換行
-                    full_log_text = clean_log.replace("   ", "\n").replace("  ", "\n").replace("狀態:", " | 狀態:")
-                
-                # 取得動作建議 (Action/Reason 在 final_df 裡就有，這是對的)
-                action, color, reason = analyze_signal(final_df)
-
-                # --- 左側：顯示大數字分數 ---
                 with score_col:
                     s_color = "normal"
-                    if final_score >= 60: s_color = "off" 
-                    elif final_score <= -20: s_color = "inverse"
+                    if final_composite_score >= 60: s_color = "off" 
+                    elif final_composite_score <= -20: s_color = "inverse"
                     
                     st.metric(
                         label="綜合評分 (Alpha Score)",
-                        value=f"{int(final_score)} 分",
+                        value=f"{int(final_composite_score)} 分",
                         delta=action,
                         delta_color=s_color
                     )
                 
-                # --- 右側：顯示詳細算式 ---
                 with log_col:
-                    st.info(f"**🧮 演算歷程解析 (積木計分)：**\n\n{full_log_text}")
+                    st.info(f"**🧮 演算歷程解析：**\n\n{full_log_text}")
 
-                # [後續接回原本的程式碼]
                 # 1. 計算策略績效
                 strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
                 strat_ret = best_params['Return'] * 100
@@ -2125,7 +2061,7 @@ elif page == "📊 單股深度分析":
                     if not sell_all.empty:
                         fig.add_trace(go.Scatter(x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', text=get_sell_text(sell_all), textposition="top center", textfont=dict(color='white', size=11), marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), name='賣出', hovertext=sell_all['Reason']), row=1, col=1)
 
-                    # --- Row 2: Alpha Score (Updated) ---
+                    # --- Row 2: Alpha Score (Updated with Hover Detail) ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
              
                     fig.add_trace(go.Bar(
@@ -2133,18 +2069,15 @@ elif page == "📊 單股深度分析":
                         y=final_df['Alpha_Score'], 
                         name='Alpha Score', 
                         marker_color=colors_score,
-                        
-                        # [重點 1] 綁定我們計算好的 HTML 詳細說明欄位
+                        # [關鍵修改] 綁定詳細 HTML 到 hovertext
                         hovertext=final_df['Score_Detail'],
-                        
-                        # [重點 2] 設定顯示模式
-                        # x: 顯示日期 (X軸)
-                        # text: 顯示我們自訂的 hovertext HTML 內容
-                        # 這樣可以遮蔽掉 Plotly 預設醜醜的 "Alpha Score=80" 格式
+                        # [設定] 顯示模式：只顯示我們自訂的 hovertext，加上 x 軸日期
                         hoverinfo="x+text" 
                     ), row=2, col=1)
 
+                    # 設定 Y 軸範圍固定，視覺上比較穩定
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
+
 
                     # --- Row 3: Alpha Slope ---
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
@@ -2498,7 +2431,7 @@ elif page == "🚀 科技股掃描":
                             prev_price = final_df['Close'].iloc[-2]
                             price_chg_pct = (current_price - prev_price) / prev_price
                             turnover = current_price * vol_now
-
+                            
                             res_item = {
                                 "代號": fmt_ticker.split('.')[0], 
                                 "名稱": name, 
@@ -2507,9 +2440,12 @@ elif page == "🚀 科技股掃描":
                                 "漲跌幅": price_chg_pct,
                                 "成交金額": turnover,
                                 "Alpha_Score": int(final_score), 
-                                "計算過程": display_reason,
+                                # 這裡可以使用 Score_Log，或者擷取 Score_Detail 的純文字版 (若需要)
+                                "計算過程": base_log, 
                                 "回測報酬": best_params['Return'],
-                                "板塊": current_sector
+                                "板塊": current_sector,
+                                # [新增] 如果你想在 raw data 裡保留 HTML 詳情以便除錯
+                                "評分詳情": stock_alpha_df['Score_Detail'].iloc[-1] 
                             }
                             st.session_state['scan_temp_results'].append(res_item)
 
@@ -2860,7 +2796,7 @@ elif page == "💼 持股健診與建議":
                 best_params, final_df = run_optimization(
                     raw_df, market_df, start_date, fee_input, tax_input,
                     use_chip_strategy=enable_chip_strategy,
-                    use_strict_bear_exit=enable_strict_bear_exit
+                    use_strict_bear_exit=enable_strict_bear_exit  # <--- 加入參數
                 )
                 
                 if final_df is None or final_df.empty: continue
@@ -2869,22 +2805,10 @@ elif page == "💼 持股健診與建議":
                 current_price = final_df['Close'].iloc[-1]
                 market_value = current_price * shares
                 
-                # 4. 計算 Alpha Score (取得 Score_Detail)
+                # 4. 計算 Alpha Score
                 stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
                 base_alpha_score = stock_alpha_df['Alpha_Score'].iloc[-1]
-                
-                # [修正 1] 正確獲取詳細算式 HTML
-                if 'Score_Detail' in stock_alpha_df.columns:
-                    last_detail_html = stock_alpha_df['Score_Detail'].iloc[-1]
-                else:
-                    last_detail_html = ""
-
-                # [修正 2] 將 HTML 轉為純文字 (用於表格顯示)
-                import re
-                clean_log = re.sub('<[^<]+?>', ' ', str(last_detail_html))
-                clean_log = clean_log.replace("Alpha Score:", "").strip()
-                # 整理格式: 將多餘空白轉為換行
-                clean_log_text = clean_log.replace("   ", " ").replace("  ", " ").replace("狀態:", "| 狀態:")
+                base_score_log = stock_alpha_df['Score_Log'].iloc[-1] 
                 
                 # 5. 取得技術訊號
                 action, color, tech_reason = analyze_signal(final_df)
@@ -2904,7 +2828,7 @@ elif page == "💼 持股健診與建議":
                 if action == "✊ 續抱" or action == "🚀 買進":
                     if is_rebound:
                         if current_price < final_df['MA60'].iloc[-1]: 
-                            final_score += 15; adjustment_log.append("反彈位階+15")
+                            final_score += 15; adjustment_log.append("反彈無視季線+15")
                         ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
                         if current_price > ma5: 
                             final_score += 10; adjustment_log.append("站穩MA5+10")
@@ -2940,10 +2864,12 @@ elif page == "💼 持股健診與建議":
                 else: 
                     final_advice = "👀 留意買點" if final_score > 60 else "💤 觀望"
 
-                # 8. 組合顯示理由 (基礎算式 + 修正項)
-                display_reason = clean_log_text
+                # 8. 組合顯示理由
+                display_reason = base_score_log
                 if adjustment_log:
                     display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
+                if not display_reason:
+                    display_reason = f"Alpha:{int(final_score)} | {tech_reason}"
 
                 portfolio_results.append({
                     "代號": fmt_ticker.split('.')[0], 
@@ -2963,13 +2889,14 @@ elif page == "💼 持股健診與建議":
         # ==========================================
         if enable_monitor and portfolio_results:
             
-            # 1. 建立當前快照
+            # 1. 建立當前快照 (包含分數與建議)
+            # 使用字典儲存更多資訊: {代號: {'score': 分數, 'advice': 建議}}
             current_snapshot = {
                 item['代號']: {'score': item['綜合評分'], 'advice': item['AI 建議']}
                 for item in portfolio_results
             }
             
-            # 讀取上次的快照
+            # 讀取上次的快照 (若無則為空)
             last_snapshot = st.session_state.get('last_sent_snapshot', {})
             
             # 2. 檢查是否觸發「重要條件」
@@ -2979,29 +2906,37 @@ elif page == "💼 持股健診與建議":
             for ticker, curr_info in current_snapshot.items():
                 curr_score = curr_info['score']
                 curr_advice = curr_info['advice']
+                
+                # 取得舊資料
                 prev_info = last_snapshot.get(ticker)
                 
                 is_alert_needed = False
                 change_str = f"{curr_score}"
                 
                 if prev_info is None:
+                    # A. 新加入的持股 -> 通知
                     is_alert_needed = True
                     change_str = f"<span style='color:blue'>New ({curr_score})</span>"
                 else:
                     prev_score = prev_info['score']
                     prev_advice = prev_info['advice']
                     
+                    # B. 建議改變 (例如: 續抱 -> 賣出) -> 重要！通知
                     if curr_advice != prev_advice:
                         is_alert_needed = True
                         change_str = f"{prev_score} ➜ <b>{curr_score}</b> ({prev_advice}➜{curr_advice})"
+                        
+                    # C. 分數劇烈波動 (變動 > 5 分) -> 顯著！通知
                     elif abs(curr_score - prev_score) >= 5:
                         is_alert_needed = True
                         arrow = "🔺" if curr_score > prev_score else "🔻"
                         color = "red" if curr_score > prev_score else "green"
                         change_str = f"{prev_score} <b style='color:{color}'>{arrow} {curr_score}</b>"
                 
+                # 如果符合任一條件，加入發送列表
                 if is_alert_needed:
                     should_send_email = True
+                    # 找出原始資料以便複製
                     original_item = next((x for x in portfolio_results if x['代號'] == ticker), None)
                     if original_item:
                         item_copy = original_item.copy()
@@ -3011,7 +2946,10 @@ elif page == "💼 持股健診與建議":
             # 3. 執行發送
             if should_send_email:
                 st.toast(f"⚡ 偵測到 {len(email_data_list)} 筆重要異動，發送通知...", icon="📧")
+                
                 res_df_for_email = pd.DataFrame(email_data_list)
+                
+                # 準備市場分析文字 (避免 API 頻繁呼叫，可設為簡單文字或快取)
                 try:
                     market_scored_df = calculate_alpha_score(market_df, pd.DataFrame(), pd.DataFrame())
                     analysis_html_for_email = generate_market_analysis(market_scored_df, pd.DataFrame(), pd.DataFrame())
@@ -3022,11 +2960,12 @@ elif page == "💼 持股健診與建議":
                     success = send_analysis_email(res_df_for_email, analysis_html_for_email)
                     
                 if success:
+                    # 發送成功後，更新快照
                     st.session_state['last_sent_snapshot'] = current_snapshot
                     st.toast(f"✅ 通知已發送！")
                 else:
                     st.toast("❌ Email 發送失敗", icon="⚠️")
-                                                    
+                                        
         # ==========================================
         # 顯示結果
         # ==========================================
@@ -3075,8 +3014,6 @@ elif page == "💼 持股健診與建議":
                 .format({"權重%": "{:.1f}%", "收盤價": "{:.2f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
                 use_container_width=True
             )
-
-
 
     # ==========================================
     # 4. 呼叫片段 (主程式進入點)
