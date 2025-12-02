@@ -1822,7 +1822,7 @@ elif page == "📊 單股深度分析":
                 clean_log = re.sub('<[^<]+?>', ' ', last_detail_html).replace("Alpha Score:", "").strip()
                 # 整理格式
                 clean_log = clean_log.replace("  ", "\n").replace("狀態:", " | 狀態:")
-                
+                score_col, log_col = st.columns([1, 3])
                 with log_col:
                      st.info(f"**🧮 本日評分結構：**\n\n{clean_log}")
 
@@ -1864,7 +1864,7 @@ elif page == "📊 單股深度分析":
                 st.markdown("---")
 
                 # ==========================================
-                # 3. AI 評分區塊 (修復 KeyError 版)
+                # 3. AI 評分區塊 (Page 2 修復版)
                 # ==========================================
                 st.markdown("### 🏆 AI 綜合評分與決策依據")
                 
@@ -1875,25 +1875,26 @@ elif page == "📊 單股深度分析":
                 # 注意：calculate_alpha_score 會回傳一個新的 DataFrame，包含 Score_Detail 欄位
                 stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
                 
-                # 3. 取得分數 (從新的 stock_alpha_df 取)
+                # 3. 取得分數
                 final_score = stock_alpha_df['Alpha_Score'].iloc[-1]
                 
-                # 4. [修復 KeyError] 準備 full_log_text
-                # 必須確認 'Score_Detail' 存在於 stock_alpha_df 中
-                import re
+                # 4. [修復重點] 準備詳細算式文字
+                # ❌ 錯誤寫法: last_detail_html = final_df['Score_Detail'].iloc[-1]
+                # ✅ 正確寫法: 從 stock_alpha_df 讀取，並確認欄位存在
                 
+                full_log_text = "無詳細算式數據"
                 if 'Score_Detail' in stock_alpha_df.columns:
-                    # 正確：從 stock_alpha_df 讀取
+                    import re
                     last_detail_html = stock_alpha_df['Score_Detail'].iloc[-1]
                     
-                    # 使用 Regex 去除 HTML 標籤
+                    # 使用 Regex 去除 HTML 標籤 (<b>, <br> 等) 以便在 st.info 顯示
                     clean_log = re.sub('<[^<]+?>', ' ', str(last_detail_html))
                     clean_log = clean_log.replace("Alpha Score:", "").strip()
+                    
+                    # 整理格式：將連續空白轉為換行
                     full_log_text = clean_log.replace("   ", "\n").replace("  ", "\n").replace("狀態:", " | 狀態:")
-                else:
-                    full_log_text = "⚠️ 評分詳情運算未完成 (請確認 calculate_alpha_score 函式已更新)"
-
-                # 取得動作建議 (這部分用原始 final_df 即可，因為 Action/Reason 本來就在裡面)
+                
+                # 取得動作建議 (Action/Reason 在 final_df 裡就有，這是對的)
                 action, color, reason = analyze_signal(final_df)
 
                 # --- 左側：顯示大數字分數 ---
