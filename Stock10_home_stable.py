@@ -1005,9 +1005,9 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v7.2.2 (Fix ValueError: NaN):
-    - [修復] 加入 NaN 防呆檢查，防止 int(NaN) 導致程式崩潰。
-    - [既有] 包含 Triple Bear Penalty 與 Crash Penalty。
+    Alpha Score v7.3 (Modified):
+    - [修改] 移除「買進訊號」與「空手觀望」的預設基分 (Base Score)，使其回歸 0。
+    - 分數將主要由技術面浮動因子 (Modulators) 與扣分項目決定。
     """
     df = df.copy()
 
@@ -1027,7 +1027,7 @@ def calculate_alpha_score(df, margin_df, short_df):
     
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     
-    # 準備 Raw Data Arrays (使用 ffill/bfill 盡量填補，但仍可能有 NaN)
+    # 準備 Raw Data Arrays
     action = df['Action'].values
     position = pd.Series(df['Position'].values).ffill().fillna(0).values
     close = df['Close'].values
@@ -1104,7 +1104,6 @@ def calculate_alpha_score(df, margin_df, short_df):
     reason_series = df['Reason'].fillna("").astype(str)
     
     # 特殊懲罰計算
-    # 1. 均線斜率計算 (for Triple Bear)
     ma60_slope = pd.Series(ma60).pct_change().fillna(0).values
     ma120_slope = pd.Series(ma120).pct_change().fillna(0).values
     ma240_slope = pd.Series(ma240).pct_change().fillna(0).values
@@ -1114,14 +1113,13 @@ def calculate_alpha_score(df, margin_df, short_df):
     is_price_above_all = (close > ma60) & (close > ma120) & (close > ma240)
     is_valid_reversal = (congestion_slope > 0) & is_price_above_all
     
-    # 若 (三線下彎) 且 (非有效反轉) 且 (處於買進或持倉狀態)，則觸發扣分
     triple_bear_penalty_mask = (buy_mask | (position == 1)) & is_triple_bear & (~is_valid_reversal)
 
-    # 2. 崩盤趨勢
+    # 崩盤趨勢
     is_crash_trend = ma240_slope <= -0.001
     crash_penalty_mask = (buy_mask | (position == 1)) & is_crash_trend
 
-    # 3. 其他既有 Penalty
+    # 其他既有 Penalty
     is_panic_strat = reason_series.str.contains('反彈|超賣').values
     panic_bear_penalty_mask = buy_mask & is_panic_strat & ma240_slope_neg
     
@@ -1140,7 +1138,7 @@ def calculate_alpha_score(df, margin_df, short_df):
         state_str = ""
         
         if buy_mask[i]:
-            base_val = 85
+            base_val = 0  # [修改] 移除買進訊號基分 (原為 85)
             state_str = "🔥 買進訊號"
         elif sell_mask[i]:
             base_val = -85
@@ -1149,7 +1147,7 @@ def calculate_alpha_score(df, margin_df, short_df):
             base_val = 60
             state_str = "✊ 持倉監控"
         else:
-            base_val = -30
+            base_val = 0  # [修改] 移除空手觀望基分 (原為 -30)
             state_str = "👀 空手觀望"
             
         # Event Penalties
@@ -1178,7 +1176,6 @@ def calculate_alpha_score(df, margin_df, short_df):
         penalties = score_trend_penalty[i]
         fluctuation = score_bias[i] + score_rsi[i] + score_vol[i]
         
-        # 定義 total_pen 變數
         total_pen = penalties + event_penalty
 
         total_mod = (fluctuation + bonuses + penalties) * mod_factor
@@ -1195,13 +1192,13 @@ def calculate_alpha_score(df, margin_df, short_df):
             
         final_val = np.clip(raw_score, -100, cap)
         
-        # [關鍵修正] NaN 防呆：如果 final_val 是 NaN，強制歸零
+        # NaN 防呆
         if np.isnan(final_val):
             final_val = 0.0
             
         alpha_score[i] = final_val
 
-        # HTML String (使用已防呆的 final_val)
+        # HTML String
         c_val = "#ef5350" if final_val > 0 else "#00e676"
         c_pos = "#ff8a80"
         c_neg = "#b9f6ca"
@@ -1210,7 +1207,6 @@ def calculate_alpha_score(df, margin_df, short_df):
         txt += f"<span style='color:#888'>──────────</span><br>"
         txt += f"<b>[{state_str}] 基分: {base_val}</b><br>"
         
-        # 顯示技術浮動 (若為 NaN 則不顯示或顯示0)
         if not np.isnan(fluctuation) and fluctuation != 0:
             txt += f"<b>技術浮動: {fluctuation:.1f}</b><br>"
             if not np.isnan(score_bias[i]) and score_bias[i] != 0: txt += f" • 乖離: {score_bias[i]:+.1f}<br>"
@@ -1257,6 +1253,9 @@ def calculate_alpha_score(df, margin_df, short_df):
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
     return df
+
+
+
 
 def calculate_alpha_score_technical_fallback(df):
     """
