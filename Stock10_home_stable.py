@@ -621,263 +621,190 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 
 
 # ==========================================
-# 3. 策略邏輯 & 輔助 (Modified for Zero-Line Crossover)
+# 3. 策略邏輯 & 輔助 (Modified with Confidence Score)
 # ==========================================
-
-def run_simple_strategy(data, buy_threshold=5, sell_threshold=-5, fee_rate=0.001425, tax_rate=0.003):
+def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    策略執行核心 v11.0 (Zero-Line Mode):
-    - 買進：Alpha Score > buy_threshold (正值，例如 0 或 5)
-    - 賣出：Alpha Score < sell_threshold (負值，例如 0 或 -5)
-    - 特色：完整持有正分區間，只有在真正翻空時才賣出。
+    執行策略回測 v9 (Squeeze Ban):
+    - [新增] 禁買令: 若均線糾結度 < 3% (極度壓縮)，強制禁止買入，防止遇到盤整後崩盤。
     """
     df = data.copy()
     
-    # 強制清洗與重算
-    df['Action'] = 'Wait'
-    df['Position'] = 0
-    df = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
+    if 'Dividends' not in df.columns: df['Dividends'] = 0.0
+    df['Dividends'] = df['Dividends'].fillna(0.0)
+        
+    positions = []; reasons = []; actions = []; target_prices = []
+    return_labels = []; confidences = []
+    
+    position = 0; days_held = 0; entry_price = 0.0; trade_type = 0
+    cum_div = 0.0 
+    
+    # 準備 Numpy Array
+    close = df['Close'].values; trend = df['Trend'].values; rsi = df['RSI'].values
+    bb_lower = df['BB_Lower'].values; ma20 = df['MA20'].values; ma60 = df['MA60'].values
+    
+    # 確保有 MA120 (若上游沒算，這裡需防呆)
+    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
+    
+    ma120 = df['MA120'].fillna(method='bfill').values
+    ma240 = df['MA240'].fillna(method='bfill').values
+    ma30 = df['MA30'].ffill().values
+    high_100d = df['High_100d'].fillna(0).values
+    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
+    dividends = df['Dividends'].values
+    
+    volume = df['Volume'].values; vol_ma20 = df['Vol_MA20'].values
+    obv = df['OBV'].values; obv_ma20 = df['OBV_MA20'].values
+    market_panic = df['Is_Market_Panic'].values
+    bb_width_vals = ((df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']).values
 
-    positions = []       
-    actions = []         
-    reasons = []         
-    return_labels = []   
-    
-    position = 0        
-    entry_price = 0.0   
-    days_held = 0       
-    cum_div = 0.0       
-    
-    alpha_scores = df['Alpha_Score'].values
-    closes = df['Close'].values
-    dividends = df['Dividends'].fillna(0).values if 'Dividends' in df.columns else np.zeros(len(df))
-    
+    # [新增] 預先計算「均線糾結指數」 (Rolling Congestion Index)
+    # 使用 numpy 向量化計算加速
+    ma_stack = np.vstack([ma60, ma120, ma240])
+    ma_max = np.max(ma_stack, axis=0)
+    ma_min = np.min(ma_stack, axis=0)
+    # 瞬時差距
+    raw_gap_ratio = np.divide((ma_max - ma_min), close, out=np.ones_like(close), where=close!=0)
+    # 20日平均差距 (糾結指數)
+    # 利用 pandas rolling 計算後轉回 numpy
+    congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
+
     for i in range(len(df)):
-        score = alpha_scores[i]
-        price = closes[i]
-        div = dividends[i]
-        
-        current_action = "Wait"
-        current_reason = ""
-        current_ret = ""
-        
-        # --- 狀態機邏輯 ---
-        
-        # 情境 A: 持倉中 (Position = 1) -> 只能檢查【賣出】
-        if position == 1:
-            days_held += 1
-            if div > 0: cum_div += div
-            curr_val = price + cum_div
-            
-            # [修改點] 賣出條件：只有當分數變成負值 (低於 sell_threshold) 才賣出
-            # 這樣可以避免股價只是漲多拉回 (分數變小但仍為正) 就被洗出場
-            cond_score_exit = (score < sell_threshold)
-            
-            if cond_score_exit:
-                position = 0
-                current_action = "Sell"
-                current_reason = f"翻空確認 ({score:.0f}分)"
-                
-                final_pnl = (curr_val - entry_price) / entry_price * 100
-                sign = "+" if final_pnl > 0 else ""
-                current_ret = f"{sign}{final_pnl:.1f}%"
-            else:
-                position = 1
-                current_action = "Hold"
-                # 顯示當前信心水準
-                if score >= 60: current_reason = f"強勢續抱 ({score:.0f}分)"
-                elif score >= 20: current_reason = f"續抱 ({score:.0f}分)"
-                else: current_reason = f"警戒續抱 ({score:.0f}分)"
+        signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
+        this_target = entry_price * 1.15 if position == 1 else np.nan
+        ret_label = ""; conf_score = 0
 
-        # 情境 B: 空手 (Position = 0) -> 只能檢查【買進】
-        else:
-            # [修改點] 買進條件：只要分數轉正 (高於 buy_threshold) 就買進
-            if score >= buy_threshold:
-                position = 1
-                current_action = "Buy"
-                entry_price = price
-                days_held = 0
+        # 趨勢狀態
+        is_ma240_down = False
+        is_ma60_up = False
+        if i > 0:
+            if ma240[i] < ma240[i-1]: is_ma240_down = True
+            if ma60[i] > ma60[i-1]: is_ma60_up = True
+            
+        is_price_weak = (close[i] < ma60[i]) and (close[i] < ma20[i])
+        is_strict_bear = is_ma240_down and (not is_ma60_up) and is_price_weak
+
+        # [新增] 糾結禁買判定
+        # 若糾結指數 < 3% (0.03)，禁止買入
+        is_squeeze_ban = congestion_index[i] < 0.03
+
+        # --- 進場邏輯 ---
+        if position == 0:
+            is_buy = False
+            rsi_threshold_A = 60 if is_strict_bear else 55
+            
+            # 只有在「非禁買」狀態下才檢查策略
+            if not is_squeeze_ban:
+                # 策略 A
+                if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
+                    is_buy=True; trade_type=1; reason_str="動能突破"
+                # 策略 B
+                elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
+                    is_buy=True; trade_type=1; reason_str="均線回測"
+                # 策略 C
+                elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
+                    is_buy=True; trade_type=3; reason_str="籌碼佈局"
+                # 策略 D (超賣反彈也需避開極度壓縮後的崩盤)
+                elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
+                    is_buy=True; trade_type=2; reason_str="超賣反彈"
+            
+            if is_buy:
+                signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
                 cum_div = 0.0
                 
-                if score >= 60: current_reason = "🔥 強勢買進"
-                else: current_reason = "✅ 翻多買進"
-            else:
-                position = 0
-                current_action = "Wait"
-                current_reason = "觀望 (空方)"
-
-        positions.append(position)
-        actions.append(current_action)
-        reasons.append(current_reason)
-        return_labels.append(current_ret)
+                base_score = 60
+                if is_strict_bear: base_score -= 10
+                if is_ma240_down and is_ma60_up: base_score += 5
+                if volume[i] > vol_ma20[i] * 1.5: base_score += 15
+                elif volume[i] > vol_ma20[i]: base_score += 8
+                if i > 5 and ma60[i] > ma60[i-5] and close[i] > ma60[i]: base_score += 10
+                if trade_type == 1 and 60 <= rsi[i] <= 75: base_score += 10
+                elif trade_type == 2 and rsi[i] <= 25: base_score += 10
+                if i > 3 and bb_width_vals[i-1] < 0.15: base_score += 5
+                if close[i] > ma30[i] * 1.04: base_score += 5
+                
+                weekly_ratio = close[i] / close_lag5[i] if close_lag5[i] > 0 else 1.0
+                if close[i] >= high_100d[i] and weekly_ratio < 1.27: base_score += 15
+                
+                conf_score = min(base_score, 99)
         
-    df['Position'] = positions
-    df['Action'] = actions
-    df['Reason'] = reasons
-    df['Return_Label'] = return_labels
+        # --- 出場邏輯 ---
+        elif position == 1:
+            days_held+=1
+            if dividends[i] > 0: cum_div += dividends[i]
+            adjusted_current_value = close[i] + cum_div
+            drawdown = (adjusted_current_value - entry_price) / entry_price
+            
+            if trade_type==2 and trend[i]==1: trade_type=1; reason_str="反彈轉波段"
+            if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1; reason_str="佈局完成發動"
+            
+            is_sell = False
+            stop_loss_limit = -0.10 if is_strict_bear else -0.12
+            
+            if drawdown < stop_loss_limit:
+                is_sell=True; reason_str=f"觸發停損({stop_loss_limit*100:.0f}%)"; action_code="Sell"
+            elif days_held <= (2 if is_strict_bear else 3):
+                action_code="Hold"; reason_str="鎖倉觀察"
+            else:
+                if trade_type==1 and trend[i]==-1: 
+                    if close[i] < ma20[i]:
+                        is_sell=True; reason_str="趨勢轉弱且破月線"
+                    else:
+                        action_code="Hold"; reason_str="轉弱(守月線)"
+                elif use_strict_bear_exit and is_strict_bear and close[i] < ma20[i]:
+                    is_sell=True; reason_str="長空破月線"
+                elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
+                elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
+                
+            if is_sell:
+                signal=0; action_code="Sell"
+                final_pnl_value = (close[i] + cum_div) - entry_price
+                pnl = final_pnl_value / entry_price * 100
+                sign = "+" if pnl > 0 else ""
+                ret_label = f"{sign}{pnl:.1f}%"
+
+        position=signal
+        positions.append(signal); reasons.append(reason_str); actions.append(action_code)
+        target_prices.append(this_target); return_labels.append(ret_label)
+        confidences.append(conf_score if action_code == "Buy" else 0)
+        
+    df['Position']=positions; df['Reason']=reasons; df['Action']=actions
+    df['Target_Price']=target_prices; df['Return_Label']=return_labels
+    df['Confidence'] = confidences
     
-    # 計算圖表座標
-    df['Buy_Y'] = np.where(df['Action'] == 'Buy', df['Low'] * 0.96, np.nan)
-    df['Sell_Y'] = np.where(df['Action'] == 'Sell', df['High'] * 1.04, np.nan)
-    
-    # 計算績效
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
     df['Market_Return'] = df['Market_Return'].fillna(0)
     
+    df['Strategy_Return'] = df['Real_Position'] * df['Market_Return']
     cost_series = pd.Series(0.0, index=df.index)
     cost_series[df['Action'] == 'Buy'] = fee_rate
     cost_series[df['Action'] == 'Sell'] = fee_rate + tax_rate
+    df['Strategy_Return'] = df['Strategy_Return'] - cost_series
     
-    df['Strategy_Return'] = df['Real_Position'] * df['Market_Return'] - cost_series
-    df['Cum_Strategy'] = (1 + df['Strategy_Return']).cumprod()
-    df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
-    
+    df['Cum_Strategy']=(1+df['Strategy_Return']).cumprod()
+    df['Cum_Market']=(1+df['Market_Return']).cumprod()
     return df
-
-
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
-    """
-    參數優化 v11.0 (Zero-Line Mode):
-    - 掃描 0~10 分作為買進門檻，尋找最佳切入點。
-    - 賣出門檻固定為 -5 (或是 0)，確保只在負值賣出。
-    """
-    target_start = pd.to_datetime(user_start_date)
-    
-    # 1. 預先計算分數
-    df_scored = calculate_alpha_score(raw_df, pd.DataFrame(), pd.DataFrame())
-    
-    df_slice = df_scored[df_scored['Date'] >= target_start].copy()
-    if df_slice.empty: 
-        return None, pd.DataFrame()
-
-    best_ret = -999
-    best_params = {'Buy_Threshold': 5, 'Return': 0}
-    best_df = df_slice.copy()
-    
-    # [修改點] 設定「負值賣出」的門檻
-    # 建議設為 -5 而不是 0，作為一個小小的緩衝區(Hysteresis)，防止在 0 附近反覆刷單(Whipsaw)
-    fixed_sell_threshold = -5 
-    
-    # [修改點] 測試的買進門檻改為低分區段
-    # 測試：只要大於 0, 5, 10 分就買進 (而不是原本的 60)
-    thresholds = [0, 5, 10, 15] 
-    
-    for thresh in thresholds:
-        df_res = run_simple_strategy(
-            df_slice, 
-            buy_threshold=thresh, 
-            sell_threshold=fixed_sell_threshold, 
-            fee_rate=fee_rate, 
-            tax_rate=tax_rate
-        )
-        
-        total_ret = df_res['Cum_Strategy'].iloc[-1] - 1
-        
-        if total_ret > best_ret:
-            best_ret = total_ret
-            best_params = {'Buy_Threshold': thresh, 'Return': total_ret}
-            best_df = df_res
-
-    # 兼容性參數
-    best_params['Mult'] = 0 
-    best_params['RSI_Buy'] = best_params['Buy_Threshold'] 
-            
-    return best_params, best_df
-
-
-
-
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
-    """
-    參數優化 v10.5:
-    - 強制賣出門檻為 0。
-    - 確保傳入純淨的 DataFrame。
-    """
-    target_start = pd.to_datetime(user_start_date)
-    
-    # 這裡我們不先算分，因為 run_simple_strategy 內部會清洗後重算
-    # 這樣更安全
-    df_slice = raw_df[raw_df['Date'] >= target_start].copy()
-    
-    if df_slice.empty: 
-        return None, pd.DataFrame()
-
-    best_ret = -999
-    best_params = {'Buy_Threshold': 60, 'Return': 0}
-    
-    # 預設至少回傳一個計算過的版本 (以防迴圈沒跑出更好的)
-    best_df = run_simple_strategy(df_slice, buy_threshold=60, sell_threshold=0, fee_rate=fee_rate, tax_rate=tax_rate)
-    
-    buy_thresholds = [55, 60, 65, 70]
-    fixed_sell_threshold = 0
-    
-    for thresh in buy_thresholds:
-        df_res = run_simple_strategy(
-            df_slice, 
-            buy_threshold=thresh, 
-            sell_threshold=fixed_sell_threshold, 
-            fee_rate=fee_rate, 
-            tax_rate=tax_rate
-        )
-        
-        total_ret = df_res['Cum_Strategy'].iloc[-1] - 1
-        
-        if total_ret > best_ret:
-            best_ret = total_ret
-            best_params = {'Buy_Threshold': thresh, 'Return': total_ret}
-            best_df = df_res
-
-    best_params['Mult'] = 0 
-    best_params['RSI_Buy'] = best_params['Buy_Threshold'] 
-            
-    return best_params, best_df
-
-
 
 
 # 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
-    target_start = pd.to_datetime(user_start_date)
+    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
     
-    # 1. 預先計算分數
-    df_scored = calculate_alpha_score(raw_df, pd.DataFrame(), pd.DataFrame())
-    
-    df_slice = df_scored[df_scored['Date'] >= target_start].copy()
-    if df_slice.empty: 
-        return None, pd.DataFrame()
-
-    best_ret = -999
-    best_params = {'Buy_Threshold': 60, 'Return': 0}
-    best_df = df_slice.copy()
-    
-    # 2. 測試不同的「買進門檻」
-    # 注意：賣出門檻固定設為 4 (稍微轉弱就跑，不要等到 0)
-    # 如果您想要更靈敏，可以改成 10
-    fixed_sell_threshold = 4
-    
-    thresholds = [55, 60, 65, 70]
-    
-    for thresh in thresholds:
-        df_res = run_simple_strategy(
-            df_slice, 
-            buy_threshold=thresh, 
-            sell_threshold=fixed_sell_threshold,  # <--- 設定為 20
-            fee_rate=fee_rate, 
-            tax_rate=tax_rate
-        )
-        
-        total_ret = df_res['Cum_Strategy'].iloc[-1] - 1
-        
-        if total_ret > best_ret:
-            best_ret = total_ret
-            best_params = {'Buy_Threshold': thresh, 'Return': total_ret}
-            best_df = df_res
-
-    # 兼容性參數 (防止 UI 報錯)
-    best_params['Mult'] = 0 
-    best_params['RSI_Buy'] = best_params['Buy_Threshold'] 
+    for m in [3.0, 3.5]:
+        for r in [25, 30]:
+            df_ind = calculate_indicators(raw_df, 10, m, market_df)
+            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
+            if df_slice.empty: continue
             
+            # [修改] 傳遞 use_strict_bear_exit
+            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy, use_strict_bear_exit)
+            
+            ret = df_res['Cum_Strategy'].iloc[-1] - 1
+            if ret > best_ret:
+                best_ret = ret
+                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
+                best_df = df_res
     return best_params, best_df
 
 
@@ -1051,178 +978,155 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df, short_df):
     """
-    Alpha Score v10.1 (Fix NameError):
-    修復缺少 low/high 變數定義導致的崩潰問題。
+    Alpha Score v8.0 (Analog & Signal-Synced):
+    - 買賣點精確對齊策略回測結果 (Buy=+95, Sell=-95)。
+    - 非交易日採用連續性技術指標評分，呈現類比 (Analog) 波動。
     """
     df = df.copy()
 
-    # --- 1. 基礎指標準備 ---
+    # 防呆：若無策略結果，回傳備用版
+    if 'Action' not in df.columns or 'Position' not in df.columns:
+        return calculate_alpha_score_technical_fallback(df)
+
+    # 1. 補全基礎指標 (若上游未計算)
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
-    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
-    if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240, min_periods=60).mean()
-    if 'High_100d' not in df.columns: df['High_100d'] = df['Close'].rolling(100).max()
-    if 'Close_Lag5' not in df.columns: df['Close_Lag5'] = df['Close'].shift(5)
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-    if 'OBV' not in df.columns: df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
-    if 'OBV_MA20' not in df.columns: df['OBV_MA20'] = df['OBV'].rolling(20).mean()
     
-    std = df['Close'].rolling(20).std()
-    df['BB_Lower'] = df['MA20'] - 2 * std
-    if 'SuperTrend' not in df.columns: df['SuperTrend'] = df['MA20']
-
-    # --- Numpy 加速 (變數定義區) ---
+    # 準備 Numpy Arrays 加速運算
     close = df['Close'].values
-    # [關鍵修正] 補上 high 與 low
-    high = df['High'].values
-    low = df['Low'].values
-    
-    vol = df['Volume'].fillna(0).values
-    vol_ma = df['Vol_MA20'].replace(0, 1).fillna(1).values
+    ma20 = df['MA20'].fillna(method='bfill').values
+    ma60 = df['MA60'].fillna(method='bfill').values
     rsi = df['RSI'].fillna(50).values
-    ma20 = df['MA20'].ffill().values
-    ma60 = df['MA60'].ffill().values
-    ma120 = df['MA120'].fillna(method='bfill').values
-    ma240 = df['MA240'].fillna(method='bfill').values
-    obv = df['OBV'].values
-    obv_ma = df['OBV_MA20'].values
-    bb_lower = df['BB_Lower'].values
-    supertrend = df['SuperTrend'].values
-    high_100d = df['High_100d'].fillna(0).values
-    close_lag5 = df['Close_Lag5'].fillna(close[0]).values
+    volume = df['Volume'].fillna(0).values
+    vol_ma20 = df['Vol_MA20'].replace(0, 1).fillna(1).values
     
-    is_supertrend_bull = (close > supertrend)
-    ma60_slope = pd.Series(ma60).pct_change().fillna(0).values
-    ma120_slope = pd.Series(ma120).pct_change().fillna(0).values
-    ma240_slope = pd.Series(ma240).pct_change().fillna(0).values
+    # 讀取策略訊號
+    actions = df['Action'].values
+    positions = df['Position'].values # 0=空手, 1=持倉
 
-    # --- 2. 趨勢評分 ---
+    # ==========================================
+    # A. 計算連續性技術分數 (Analog Base Score)
+    # ==========================================
+    # 範圍設計：約 -50 ~ +50，作為背景波動
+    
+    # 1. 趨勢分數 (Trend): 價格在均線之上給分
     score_trend = np.zeros(len(df))
-    score_trend += np.where(close > ma20, 5, -5)
-    score_trend += np.where(close > ma60, 10, -10)
-    score_trend += np.where(close > ma240, 5, -5)
-    score_trend += np.where(is_supertrend_bull, 15, -15)
-    is_bull_align = (ma20 > ma60) & (ma60 > ma120)
-    score_trend += np.where(is_bull_align, 5, 0)
+    score_trend += np.where(close > ma20, 15, -15)
+    score_trend += np.where(close > ma60, 15, -15)
+    score_trend += np.where(ma20 > ma60, 10, -5) # 多頭排列
 
-    # --- 3. 動能評分 ---
-    score_mom = np.zeros(len(df))
-    score_mom += np.clip((rsi - 50) * 0.5, -10, 10)
-    price_change = pd.Series(close).diff().fillna(0).values
-    vol_ratio = vol / vol_ma
-    cond_vol_bull = (price_change > 0) & (vol_ratio > 1.0)
-    cond_vol_pullback = (price_change < 0) & (vol_ratio < 0.8)
-    cond_vol_bear = (price_change < 0) & (vol_ratio > 1.2)
-    score_mom += np.where(cond_vol_bull, 5, 0)
-    score_mom += np.where(cond_vol_pullback, 3, 0)
-    score_mom += np.where(cond_vol_bear, -5, 0)
-    score_mom += np.where(obv > obv_ma, 10, -5)
-    
-    # --- 4. 策略型態加分 (Pattern) ---
-    score_pattern = np.zeros(len(df))
-    
-    # 策略 A: 動能突破
-    cond_strat_a = is_supertrend_bull & (vol > vol_ma) & (close > ma60) & (rsi > 55) & (obv > obv_ma)
-    score_pattern += np.where(cond_strat_a, 15, 0)
-    
-    # 策略 B: 均線回測 (這裡原本會報錯，因為用了 low)
-    cond_strat_b = is_supertrend_bull & (close > ma60) & (close > ma20) & (low <= ma20 * 1.02) & (vol < vol_ma) & (rsi > 45)
-    score_pattern += np.where(cond_strat_b, 15, 0)
-    
-    # 策略 C: 籌碼佈局
-    cond_strat_c = (close > ma60) & (obv > obv_ma) & (vol < vol_ma) & ((close < ma20) | (rsi < 55)) & (close > bb_lower)
-    score_pattern += np.where(cond_strat_c, 10, 0)
-    
-    # 策略 D: 超賣反彈 (放寬條件)
-    cond_rebound_rsi = (rsi < 35)
-    cond_rebound_price = (close < bb_lower)
-    cond_rebound_vol = (vol > vol_ma * 0.5) 
-    cond_strat_d = cond_rebound_rsi & cond_rebound_price & cond_rebound_vol
-    score_pattern += np.where(cond_strat_d, 45, 0)
+    # 2. 動能分數 (Momentum): RSI 的連續變化
+    # 將 RSI 50 定為 0 分，每增減 1 點貢獻 0.8 分，並限制範圍
+    score_rsi = (rsi - 50) * 1.2 
+    score_rsi = np.clip(score_rsi, -25, 25)
 
-    # 百日突破
-    weekly_ratio = np.divide(close, close_lag5, out=np.ones_like(close), where=close_lag5!=0)
-    cond_breakout = (close >= high_100d) & (weekly_ratio < 1.27)
-    score_pattern += np.where(cond_breakout, 10, 0)
+    # 3. 量能分數 (Volume): 量增價漲
+    vol_ratio = volume / vol_ma20
+    is_up = close > df['Close'].shift(1).fillna(method='bfill').values
+    score_vol = np.where((vol_ratio > 1.2) & is_up, 10, 0)
+    score_vol = np.where((vol_ratio > 1.2) & (~is_up), -10, score_vol)
 
-    # --- 5. 風險懲罰 (Risk Fix) ---
-    score_penalty = np.zeros(len(df))
+    # 4. 乖離修正 (Bias Penalty)
+    bias = (close - ma20) / ma20
+    score_bias = np.where(bias > 0.15, -10, 0) # 乖離過大扣分(避免過熱)
     
-    # A. 崩盤濾網
-    is_crash = ma240_slope <= -0.001
-    exempt_crash = cond_strat_d & (ma240_slope > -0.003)
-    score_penalty += np.where(is_crash & (~exempt_crash), -50, 0)
-    
-    # B. 高檔出貨
-    cond_distribution = (vol > vol_ma * 2.5) & (pd.Series(close).pct_change().fillna(0) < 0.005) & (rsi > 40)
-    score_penalty += np.where(cond_distribution, -20, 0)
+    # 合成背景技術分 (-60 ~ +60)
+    raw_analog = score_trend + score_rsi + score_vol + score_bias
 
-    # C. 三線空頭 (抄底豁免)
-    is_triple_bear = (ma60_slope < 0) & (ma120_slope < 0) & (ma240_slope < 0)
-    score_penalty += np.where(is_triple_bear & (~cond_strat_d), -30, 0)
-    
-    # D. 均線糾結
-    ma_stack = np.vstack([ma60, ma120, ma240])
-    congestion_idx = np.divide((np.max(ma_stack, axis=0) - np.min(ma_stack, axis=0)), close, out=np.ones_like(close), where=close!=0)
-    is_squeeze = congestion_idx < 0.03
-    score_penalty += np.where(is_squeeze, -10, 0)
-
-    # --- 6. 總分計算與 HTML ---
-    raw_score = score_trend + score_mom + score_pattern + score_penalty
-    final_score = np.clip(raw_score, -100, 100)
-    
-    final_series = pd.Series(final_score).ewm(alpha=0.6, adjust=False).mean()
-    final_score_smoothed = final_series.values
-    df['Alpha_Score'] = final_score_smoothed.astype(int)
-    
-    # HTML Tooltip
+    # ==========================================
+    # B. 訊號錨定與狀態融合 (Signal Anchoring)
+    # ==========================================
+    final_score = np.zeros(len(df))
     detail_html = []
-    log_msg = []
-    C_POS = "#ef5350"; C_NEG = "#00e676"
     
-    for i in range(len(df)):
-        s = final_score_smoothed[i]
-        txt = f"📅 <b>{df['Date'].iloc[i].strftime('%Y-%m-%d')}</b><br>"
-        txt += f"📊 <b>總分: <span style='color:{C_POS if s>0 else C_NEG}'>{int(s)}</span></b><br>"
-        txt += "────────────────<br>"
-        
-        txt += f"📉 趨勢架構: <b>{int(score_trend[i]):+d}</b><br>"
-        txt += f"🌊 動能籌碼: <b>{int(score_mom[i]):+d}</b><br>"
-        
-        if score_pattern[i] > 0:
-            txt += f"🎁 <span style='color:{C_POS}'>策略加分: +{int(score_pattern[i])}</span><br>"
-            if cond_strat_d[i]: txt += "  • 🔥 <b>超賣反彈 (+45)</b><br>"
-            if cond_strat_a[i]: txt += "  • 🚀 動能突破 (+15)<br>"
-            if cond_strat_b[i]: txt += "  • 📉 均線回測 (+15)<br>"
-            
-        if score_penalty[i] < 0:
-            txt += f"⚠️ <span style='color:{C_NEG}'>風險扣分: {int(score_penalty[i])}</span><br>"
-            if is_crash[i] and not exempt_crash[i]: txt += "  • ☠️ <b>崩盤趨勢 (-50)</b><br>"
-            if is_triple_bear[i] and not cond_strat_d[i]: txt += "  • 🐻 三線空頭 (-30)<br>"
-            if cond_distribution[i]: txt += "  • 💣 高檔出貨 (-20)<br>"
-            
-        if cond_strat_d[i] and is_triple_bear[i]:
-             txt += "<span style='color:orange; font-size:0.8em'>*觸發抄底，豁免空頭扣分</span><br>"
+    # 用於平滑的暫存變數
+    last_score = 0.0
 
-        txt += "────────────────<br>🔍 <b>關鍵數據:</b><br>"
-        txt += f"• RSI: {rsi[i]:.1f}<br>"
-        txt += f"• 年線斜率: {ma240_slope[i]:.5f}<br>"
+    for i in range(len(df)):
+        act = actions[i]
+        pos = positions[i]
+        
+        # 1. 決定目標分數 (Target Score)
+        if act == 'Buy':
+            # 買進日：強制極高分 (代表訊號觸發)
+            current_score = 95.0
+            status_desc = "🚀 策略買進"
+            c_status = "#ff1744"
+            
+        elif act == 'Sell':
+            # 賣出日：強制極低分 (代表訊號結束)
+            current_score = -95.0
+            status_desc = "⚡ 策略賣出"
+            c_status = "#00e676"
+            
+        elif pos == 1:
+            # 持倉中：以 50 分為基準，疊加技術波動
+            # 讓分數在 20 ~ 90 之間浮動，體現持股強弱
+            base = 50.0
+            current_score = base + (raw_analog[i] * 0.8) # 係數調整波動幅度
+            current_score = np.clip(current_score, 20, 90) # 限制在正值區間
+            status_desc = "✊ 持倉續抱"
+            c_status = "#ff5252"
+            
+        else:
+            # 空手/觀望：以 -30 分為基準
+            # 讓分數在 -80 ~ 10 之間浮動
+            base = -30.0
+            current_score = base + (raw_analog[i] * 0.6)
+            current_score = np.clip(current_score, -90, 10)
+            status_desc = "👀 空手觀望"
+            c_status = "#b9f6ca"
+
+        # 2. 平滑處理 (Smoothing) - 僅針對非買賣點
+        # 買賣點不平滑，確保視覺上的「乾脆」
+        if act in ['Buy', 'Sell']:
+            final_val = current_score
+        else:
+            # 使用 EMA 讓曲線圓滑 (alpha=0.6 代表新值佔 60%)
+            final_val = (last_score * 0.4) + (current_score * 0.6)
+        
+        last_score = final_val
+        final_score[i] = final_val
+
+        # 3. 生成 HTML 詳細報告 (Hover Tooltip)
+        val_int = int(final_val)
+        
+        # 顏色邏輯
+        c_score = "#ff5252" if val_int > 0 else "#00e676"
+        
+        txt = f"<b>Alpha Score: <span style='color:{c_score}; font-size:16px'>{val_int}</span></b><br>"
+        txt += f"<span style='color:#888; font-size:12px'>────── 狀態解析 ──────</span><br>"
+        txt += f"<b><span style='color:{c_status}'>{status_desc}</span></b><br>"
+        
+        if act not in ['Buy', 'Sell']:
+            txt += f"技術基底: {raw_analog[i]:.1f}<br>"
+            if score_rsi[i] != 0: txt += f" • RSI貢獻: {score_rsi[i]:+.1f}<br>"
+            if score_trend[i] != 0: txt += f" • 趨勢貢獻: {score_trend[i]:+.1f}<br>"
+            if score_vol[i] != 0: txt += f" • 量能貢獻: {score_vol[i]:+.1f}<br>"
+        else:
+            reason = df['Reason'].iloc[i]
+            txt += f"觸發原因: {reason}<br>"
 
         detail_html.append(txt)
-        
-        log = "盤整"
-        if cond_strat_d[i]: log = "💎 抄底機會"
-        elif s >= 0: log = "📈 偏多"
-        elif s < 0: log = "📉 偏空"
-        log_msg.append(log)
 
+    # 存入 DataFrame
+    df['Alpha_Score'] = np.clip(final_score, -100, 100)
     df['Score_Detail'] = detail_html
-    df['Score_Log'] = log_msg
-    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
-    return df
+    # 產生簡易評語 Log
+    conditions = [
+        (df['Alpha_Score'] >= 80), (df['Alpha_Score'] >= 40), (df['Alpha_Score'] >= 0),
+        (df['Alpha_Score'] <= -80), (df['Alpha_Score'] <= -40)
+    ]
+    choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 偏多震盪", "⚡ 極弱勢", "📉 空頭修正"]
+    df['Score_Log'] = np.select(conditions, choices, default="☁️ 盤整")
+    
+    # 輔助欄位：建議倉位 (將 -100~100 映射到 0~100%)
+    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
 
+    return df
 
 
 def calculate_alpha_score_technical_fallback(df):
@@ -2087,155 +1991,161 @@ elif page == "📊 單股深度分析":
                 tab1, tab2, tab3 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🧪 有效性驗證"])
                 
                 # [Tab 1: K線圖]
-                # [Tab 1: K線圖]
                 with tab1:
-                    # ==========================================
-                    # 1. 資料前處理 (Data Pre-processing)
-                    # ==========================================
-                    # 確保 Alpha Score 相關欄位存在
+                    # 1. 準備數據
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    final_df['Score_Detail'] = stock_alpha_df.get('Score_Detail', "") # 防呆
                     
-                    # 計算分數動能 (Slope)
+                    if 'Score_Detail' in stock_alpha_df.columns:
+                        final_df['Score_Detail'] = stock_alpha_df['Score_Detail']
+                    else:
+                        # 防呆：萬一上游沒算出來，填入空字串避免報錯
+                        final_df['Score_Detail'] = ""
+
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
                     
-                    # 確保長均線存在 (防呆)
+                    # 確保長均線存在
                     if 'MA120' not in final_df.columns: final_df['MA120'] = final_df['Close'].rolling(120).mean()
                     if 'MA240' not in final_df.columns: final_df['MA240'] = final_df['Close'].rolling(240).mean()
                     
-                    # 計算均線糾結指標 (用於呈現市場狀態)
+                    # 計算均線糾結度 (MA Congestion)
                     ma_subset = final_df[['MA60', 'MA120', 'MA240']].ffill().bfill()
                     ma_max = ma_subset.max(axis=1)
                     ma_min = ma_subset.min(axis=1)
+                    
+                    # 1. 瞬時 GAP
                     raw_gap = (ma_max - ma_min) / final_df['Close'] * 100
+                    
+                    # 2. 20日平均 GAP (糾結指數)
                     congestion_idx = raw_gap.rolling(20, min_periods=1).mean().fillna(100)
                     final_df['Congestion_Index'] = congestion_idx
+                    
+                    # [新增] 3. 糾結度斜率 (Slope) - 判斷發散或收斂
+                    # 正值 = 發散中 (趨勢加速)
+                    # 負值 = 收斂中 (進入盤整)
+                    congestion_slope = congestion_idx.diff().fillna(0)
+                    final_df['Congestion_Slope'] = congestion_slope
 
-                    # ==========================================
-                    # 2. 建立多子圖框架 (Create Subplots)
-                    # ==========================================
+                    # 2. 建立子圖 (Rows 增加為 8)
                     fig = make_subplots(
-                        rows=6, cols=1, 
+                        rows=8, cols=1, 
                         shared_xaxes=True, 
                         vertical_spacing=0.02, 
-                        row_heights=[0.35, 0.15, 0.10, 0.15, 0.15, 0.10], 
+                        # 調整高度比例
+                        row_heights=[0.30, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10], 
                         subplot_titles=(
                             "", 
                             "買賣評等 (Alpha Score)", 
                             "評分動能 (Alpha Slope)", 
-                            "成交量 & OBV", 
+                            "成交量", 
+                            "法人籌碼 (OBV)", 
                             "相對強弱指標 (RSI)",
-                            "均線糾結度"
+                            "均線糾結指數 (20MA Gap%)",
+                            "糾結度變化 (Slope)" # [新增標題]
                         )
                     )
-
-                    # ==========================================
-                    # 3. Row 1: 主圖 (K線 + 均線 + 買賣點)
-                    # ==========================================
-                    # A. K 線
+            
+                    # --- Row 1: K線 (含年線/半年線) ---
                     fig.add_trace(go.Candlestick(
                         x=final_df['Date'], open=final_df['Open'], high=final_df['High'], 
                         low=final_df['Low'], close=final_df['Close'], name='K線',
                         increasing_line_color='#ef5350', decreasing_line_color='#00bfa5' 
                     ), row=1, col=1)
                     
-                    # B. 均線
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA20'], mode='lines', line=dict(color='yellow', width=1), name='月線'), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', line=dict(color='orange', width=1.5), name='季線'), row=1, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA240'], mode='lines', line=dict(color='#e040fb', width=1.5), name='年線'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['SuperTrend'], mode='lines', line=dict(color='yellow', width=1.5), name='停損基準線'), row=1, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA60'], mode='lines', line=dict(color='rgba(255, 255, 255, 0.5)', width=1), name='季線'), row=1, col=1)
+                    if 'MA120' in final_df.columns:
+                        fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA120'], mode='lines', line=dict(color='#2979ff', width=1.5), name='半年線'), row=1, col=1)
+                    if 'MA240' in final_df.columns:
+                        fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['MA240'], mode='lines', line=dict(color='#e040fb', width=1.5), name='年線'), row=1, col=1)
 
-                    # C. 買進訊號 (Buy Markers)
-                    # [關鍵修正] 使用 Buy_Y 確保標記位置正確
-                    buy_signals = final_df[final_df['Action'] == 'Buy']
-                    if not buy_signals.empty:
-                        fig.add_trace(go.Scatter(
-                            x=buy_signals['Date'], 
-                            y=buy_signals['Buy_Y'], 
-                            mode='markers', 
-                            marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')),
-                            name='買進訊號',
-                            hovertext=buy_signals['Reason']
-                        ), row=1, col=1)
+                    # 買賣點標記
+                    final_df['Buy_Y'] = final_df['Low'] * 0.92
+                    final_df['Sell_Y'] = final_df['High'] * 1.08
+                    
+                    def get_buy_text(sub_df): return [f"<b>{int(score)}</b>" for score in sub_df['Alpha_Score']]
+                    def get_sell_text(sub_df):
+                        labels = []
+                        for idx, row in sub_df.iterrows():
+                            ret = row['Return_Label']
+                            reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
+                            labels.append(f"{ret}<br>({reason_str})")
+                        return labels
 
-                    # D. 賣出訊號 (Sell Markers)
-                    # [關鍵修正] 使用 Sell_Y 並加上 Return_Label 文字
-                    sell_signals = final_df[final_df['Action'] == 'Sell']
-                    if not sell_signals.empty:
-                        fig.add_trace(go.Scatter(
-                            x=sell_signals['Date'], 
-                            y=sell_signals['Sell_Y'], 
-                            mode='markers+text', 
-                            text=sell_signals['Return_Label'], # 顯示報酬率 (例如 +10.5%)
-                            textposition="top center",
-                            textfont=dict(color='white', size=11, family="Arial Black"),
-                            marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')),
-                            name='賣出訊號',
-                            hovertext=sell_signals['Reason']
-                        ), row=1, col=1)
+                    buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
+                    if not buy_trend.empty:
+                        fig.add_trace(go.Scatter(x=buy_trend['Date'], y=buy_trend['Buy_Y'], mode='markers+text', text=get_buy_text(buy_trend), textposition="bottom center", textfont=dict(color='#FFD700', size=11), marker=dict(symbol='triangle-up', size=14, color='#FFD700', line=dict(width=1, color='black')), name='買進 (趨勢)', hovertext=buy_trend['Reason']), row=1, col=1)
+                    
+                    buy_panic = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('反彈|超賣'))]
+                    if not buy_panic.empty:
+                        fig.add_trace(go.Scatter(x=buy_panic['Date'], y=buy_panic['Buy_Y'], mode='markers+text', text=get_buy_text(buy_panic), textposition="bottom center", textfont=dict(color='#00FFFF', size=11), marker=dict(symbol='triangle-up', size=14, color='#00FFFF', line=dict(width=1, color='black')), name='買進 (反彈)', hovertext=buy_panic['Reason']), row=1, col=1)
+                    
+                    buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
+                    if not buy_chip.empty:
+                        fig.add_trace(go.Scatter(x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text', text=get_buy_text(buy_chip), textposition="bottom center", textfont=dict(color='#DDA0DD', size=11), marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), name='買進 (籌碼)', hovertext=buy_chip['Reason']), row=1, col=1)
 
-                    # ==========================================
-                    # 4. Row 2: Alpha Score
-                    # ==========================================
-                    colors_score = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Score']]
+                    sell_all = final_df[final_df['Action'] == 'Sell']
+                    if not sell_all.empty:
+                        fig.add_trace(go.Scatter(x=sell_all['Date'], y=sell_all['Sell_Y'], mode='markers+text', text=get_sell_text(sell_all), textposition="top center", textfont=dict(color='white', size=11), marker=dict(symbol='triangle-down', size=14, color='#FF00FF', line=dict(width=1, color='black')), name='賣出', hovertext=sell_all['Reason']), row=1, col=1)
+
+                    # --- Row 2: Alpha Score ---
+                    colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
+             
                     fig.add_trace(go.Bar(
                         x=final_df['Date'], 
                         y=final_df['Alpha_Score'], 
                         name='Alpha Score', 
                         marker_color=colors_score,
-                        hovertext=final_df['Score_Detail'], # 綁定 HTML 詳細理由
+                        # [新增] 綁定詳細 HTML
+                        hovertext=final_df['Score_Detail'],
+                        # [設定] 顯示模式：x軸(日期) + 自訂文字
                         hoverinfo="x+text" 
                     ), row=2, col=1)
-                    
-                    # 畫出 60分 (買進線) 與 0分 (多空線)
-                    fig.add_hline(y=60, line_dash="dot", line_color="red", row=2, col=1, annotation_text="強力買進區")
-                    fig.add_hline(y=0, line_width=1, line_color="white", row=2, col=1)
+
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
 
-                    # ==========================================
-                    # 5. Row 3: Alpha Slope (動能變化)
-                    # ==========================================
-                    colors_slope = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Slope']]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='評分動能', marker_color=colors_slope), row=3, col=1)
+                    # --- Row 3: Alpha Slope ---
+                    colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope), row=3, col=1)
+                    fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
 
-                    # ==========================================
-                    # 6. Row 4: Volume & OBV
-                    # ==========================================
+                    # --- Row 4: 成交量 ---
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'], marker_color=colors_vol, name='成交量'), row=4, col=1)
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'] / 1000, marker_color=colors_vol, name='成交量(張)'), row=4, col=1)
                     
-                    # OBV 疊加 (使用雙軸)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='yellow', width=1), name='OBV', yaxis="y2"), row=4, col=1)
-
-                    # ==========================================
-                    # 7. Row 5: RSI
-                    # ==========================================
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=5, col=1)
-                    fig.add_hline(y=50, line_width=1, line_color="gray", row=5, col=1)
-                    fig.add_hrect(y0=70, y1=100, fillcolor="red", opacity=0.1, layer="below", row=5, col=1)
-                    fig.add_hrect(y0=0, y1=30, fillcolor="green", opacity=0.1, layer="below", row=5, col=1)
-
-                    # ==========================================
-                    # 8. Row 6: 均線糾結度
-                    # ==========================================
-                    colors_gap = ['#ef5350' if v < 5 else '#00e676' for v in final_df['Congestion_Index']]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Congestion_Index'], name='糾結度(%)', marker_color=colors_gap), row=6, col=1)
-                    fig.add_hline(y=5, line_dash="dash", line_color="red", row=6, col=1)
-
-                    # ==========================================
-                    # 9. Layout 設定
-                    # ==========================================
-                    fig.update_layout(
-                        height=1400, 
-                        template="plotly_dark", 
-                        xaxis_rangeslider_visible=False, 
-                        margin=dict(l=20, r=40, t=30, b=20),
-                        hovermode="x unified",
-                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1)
-                    )
+                    # --- Row 5: OBV ---
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['OBV'], mode='lines', line=dict(color='orange', width=1.5), name='OBV'), row=5, col=1)
                     
-                    # 設定 OBV 的副座標軸 (Row 4)
-                    fig.update_layout(yaxis4=dict(title="成交量", side="left"), yaxis7=dict(title="OBV", side="right", overlaying="y4", showgrid=False))
+                    # --- Row 6: RSI ---
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['RSI'], name='RSI', line=dict(color='cyan', width=1.5)), row=6, col=1)
+                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=6, col=1)
+                    fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
+                    
+                    # --- Row 7: 均線糾結指數 (Congestion Index) ---
+                    colors_gap = []
+                    for v in congestion_idx:
+                        if v < 5: colors_gap.append('#ef5350') # 紅色警戒 (糾結)
+                        elif v < 15: colors_gap.append('#ffd740')
+                        else: colors_gap.append('#00e676') # 綠色 (發散)
+                    
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Congestion_Index'], name='均線糾結指數(60日)', marker_color=colors_gap), row=7, col=1)
+                    fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(5%)", row=7, col=1)
 
+                    # --- [新增] Row 8: 糾結度斜率 (Slope) ---
+                    # 綠色: 發散中 (Gap變大，趨勢加速)
+                    # 紅色: 收斂中 (Gap變小，趨勢休息)
+                    colors_cong_slope = ['#00e676' if v > 0 else '#ef5350' for v in final_df['Congestion_Slope']]
+                    fig.add_trace(go.Bar(
+                        x=final_df['Date'], 
+                        y=final_df['Congestion_Slope'], 
+                        name='差距變動(Slope)', 
+                        marker_color=colors_cong_slope
+                    ), row=8, col=1)
+                    fig.add_hline(y=0, line_width=1, line_color="gray", row=8, col=1)
+
+                    # Layout
+                    fig.update_layout(height=1600, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
+                                                    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
+                    fig.update_yaxes(side='right')
                     st.plotly_chart(fig, use_container_width=True)
 
 
