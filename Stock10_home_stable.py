@@ -625,9 +625,9 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001425, tax_rate=0.003):
     """
-    策略執行核心 v10.3 (Trend Following):
-    - [修改] 預設 sell_threshold = 0 (只有當 Alpha Score 轉為負數時才賣出)。
-    - 這代表策略容忍多頭回檔 (分數 10~50 仍續抱)，追求完整波段。
+    策略執行核心 v10.4 (Pure Alpha / No Stop Loss):
+    - [移除] 硬性停損保護。現在即便虧損 50%，只要 Alpha Score >= 0 就會死抱。
+    - [嚴格] 賣出條件只有一個：Alpha Score < sell_threshold (預設為 0)。
     """
     df = data.copy()
     
@@ -648,7 +648,8 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
     # 轉換 Numpy 加速
     alpha_scores = df['Alpha_Score'].values
     closes = df['Close'].values
-    dates = df['Date'].values
+    lows = df['Low'].values
+    highs = df['High'].values
     dividends = df['Dividends'].fillna(0).values if 'Dividends' in df.columns else np.zeros(len(df))
     
     for i in range(len(df)):
@@ -670,33 +671,24 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
             if div > 0: cum_div += div
             
             curr_val = price + cum_div
-            pnl_pct = (curr_val - entry_price) / entry_price
             
             # --- 賣出檢查 ---
-            # 1. 硬性停損: 虧損超過 10% (保命條款)
-            cond_stop_loss = (pnl_pct < -0.10)
-            
-            # 2. 評分出場: 分數轉負 (Alpha Score < 0)
-            # 這裡使用外部傳入的 sell_threshold (預設為 0)
+            # [修正] 移除硬性停損，完全依賴分數
             cond_score_exit = (score < sell_threshold)
             
-            if cond_stop_loss:
-                position = 0
-                current_action = "Sell"
-                current_reason = f"硬性停損 ({pnl_pct*100:.1f}%)"
-            elif cond_score_exit:
+            if cond_score_exit:
                 position = 0
                 current_action = "Sell"
                 current_reason = f"趨勢翻空 ({int(score)}分)"
+                
+                # 結算損益
+                final_pnl = (curr_val - entry_price) / entry_price * 100
+                sign = "+" if final_pnl > 0 else ""
+                current_ret = f"{sign}{final_pnl:.1f}%"
             else:
                 position = 1
                 current_action = "Hold"
                 current_reason = f"續抱 ({int(score)}分)"
-            
-            if current_action == "Sell":
-                final_pnl = (price + cum_div - entry_price) / entry_price * 100
-                sign = "+" if final_pnl > 0 else ""
-                current_ret = f"{sign}{final_pnl:.1f}%"
 
         # 情境 B: 空手 (Position = 0) -> 只能檢查【買進】
         else:
@@ -749,9 +741,8 @@ def run_simple_strategy(data, buy_threshold=60, sell_threshold=0, fee_rate=0.001
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    參數優化 v10.3:
-    - 優化買進門檻 (Buy Threshold)
-    - [固定] 賣出門檻設為 0 (只有當 Alpha Score 變為負數才賣出)。
+    參數優化 v10.4:
+    - 固定賣出門檻為 0。
     """
     target_start = pd.to_datetime(user_start_date)
     
@@ -765,18 +756,16 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
     best_params = {'Buy_Threshold': 60, 'Return': 0}
     best_df = df_slice.copy()
     
-    # 買進門檻測試: 55, 60, 65, 70
     buy_thresholds = [55, 60, 65, 70]
     
     # [設定] 賣出門檻固定為 0
-    # 這符合「Alpha 值為負時再賣出」的要求
     fixed_sell_threshold = 0
     
     for thresh in buy_thresholds:
         df_res = run_simple_strategy(
             df_slice, 
             buy_threshold=thresh, 
-            sell_threshold=fixed_sell_threshold, # <--- 這裡傳入 0
+            sell_threshold=fixed_sell_threshold, 
             fee_rate=fee_rate, 
             tax_rate=tax_rate
         )
