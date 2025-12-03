@@ -2012,7 +2012,12 @@ elif page == "📊 單股深度分析":
             # ========================================================
             st.caption("🎯 買賣訊號門檻 (僅保留單日爆發與絕對停損)")
             
-            # 這裡原本是 st.columns(4)，現在強制改為 st.columns(2)
+            if "widget_buy_single_day" not in st.session_state:
+                st.session_state["widget_buy_single_day"] = st.session_state['strategy_params'].get('buy_single_day', 40)
+            
+            if "widget_sell_threshold" not in st.session_state:
+                st.session_state["widget_sell_threshold"] = st.session_state['strategy_params'].get('sell_threshold', -40)
+
             c1, c2 = st.columns(2)
             
             # 只保留 'buy_single_day' 和 'sell_threshold'
@@ -2317,7 +2322,7 @@ elif page == "📊 單股深度分析":
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope), row=3, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
-                    
+
                     # --- Row 4: 成交量 ---
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'] / 1000, marker_color=colors_vol, name='成交量(張)'), row=4, col=1)
