@@ -51,7 +51,7 @@ if 'strategy_params' in st.session_state:
         del st.session_state['widget_buy_consecutive_sum']
     if 'widget_sell_slope' in st.session_state:
         del st.session_state['widget_sell_slope']
-        
+
 # ==========================================
 # 資料庫管理模組 (SQLite)
 # ==========================================
@@ -2317,10 +2317,7 @@ elif page == "📊 單股深度分析":
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope), row=3, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
-                    # 顯示當前設定的崩跌警戒線
-                    current_sell_slope = st.session_state['strategy_params']['sell_slope']
-                    fig.add_hline(y=current_sell_slope, line_width=1, line_dash="dash", line_color="#e040fb", annotation_text=f"崩跌警戒({current_sell_slope})", row=3, col=1)
-
+                    
                     # --- Row 4: 成交量 ---
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Volume'] / 1000, marker_color=colors_vol, name='成交量(張)'), row=4, col=1)
