@@ -935,12 +935,13 @@ def analyze_signal(final_df):
     else: return "👀 觀望", "gray", "空手"
 
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - v13 純技術驅動版
+# 5. [核心演算法] 買賣評等 (Alpha Score) - v14 (含停損基準線扣分)
 # ==========================================
 def calculate_alpha_score(df, margin_df=None, short_df=None):
     """
-    Alpha Score v13.0:
-    完全基於技術面計算分數，不依賴 Action 欄位。
+    Alpha Score v14.0:
+    1. 純技術驅動。
+    2. [新增] 若收盤價 < SuperTrend (停損基準線)，大幅扣 30 分。
     """
     df = df.copy()
 
@@ -950,6 +951,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240).mean()
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
+    # 防呆 SuperTrend
+    if 'SuperTrend' not in df.columns: df['SuperTrend'] = 0 
     
     # 計算年線斜率 (判斷牛熊背景，用於黃金坑)
     df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
@@ -972,6 +975,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         close = row['Close']
         ma20 = row['MA20']
         ma60 = row['MA60']
+        super_trend = row['SuperTrend']
         
         # 1. 月線
         if close > ma20:
@@ -990,6 +994,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             score += 10; reasons.append("均線多頭排列 (+10)")
         elif ma20 < ma60:
             score -= 5; reasons.append("均線空頭排列 (-5)")
+
+        # 4. [新增] 停損基準線 (SuperTrend) 判定
+        # 若收盤價低於 SuperTrend，代表趨勢翻空或觸及停損，重扣 30 分
+        if close < super_trend:
+            score -= 30; reasons.append("跌破停損基準線 (-30)")
 
         # ==========================================
         # B. 動能面 (Momentum)
@@ -1028,9 +1037,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # D. 特殊情境偵測 (黃金坑)
         # ==========================================
         # 定義：RSI超賣 (<30) 但 年線向上 (牛市)
+        # 注意：即使跌破停損基準線扣了30分，如果判定為牛市黃金坑，
+        # 下面的邏輯會把負分加回來 (restore)，這是符合「誤殺/錯殺」定義的。
         if rsi < 30 and row['MA240_Slope'] > 0:
              # 強制修正分數：視為牛市黃金坑，給予極大加分
-             restore = abs(min(score, 0)) # 加回所有負分
+             restore = abs(min(score, 0)) # 加回所有負分 (包含剛剛扣的停損分)
              score += restore
              score += 40 
              reasons.append("<b>💎 牛市黃金坑 (RSI超賣+年線向上) (+40)</b>")
