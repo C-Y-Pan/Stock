@@ -749,25 +749,18 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
     """
     target_start = pd.to_datetime(user_start_date)
     
-    # 預先計算指標，避免在迴圈中重複計算 (大幅加速)
-    # 注意：這裡的 Mult=3.0 只是為了算出 SuperTrend 欄位，不影響策略邏輯
+    # 預先計算指標
     df_ind = calculate_indicators(raw_df, 10, 3.0, market_df) 
     df_slice = df_ind[df_ind['Date'] >= target_start].copy()
     
     if df_slice.empty: return None, pd.DataFrame()
 
-    # === 定義參數範圍 (符合您要求的級距 5分) ===
-    # 格式: (min, max, step)
+    # === 定義參數範圍 ===
     param_grid = {
-        # 1. 買入雙日總和 (0 ~ 100)
         'buy_consecutive_sum': (0, 100, 5),
-        # 2. 買入單日 (0 ~ 100)
         'buy_single_day': (0, 100, 5),
-        # 3. 賣出 Alpha/Slope (0 ~ -40 / 0 ~ -60)
         'sell_threshold': (-40, 0, 5),
         'sell_slope': (-60, 0, 5),
-        
-        # 4-10. 趨勢分數
         'w_price_gt_ma20': (5, 30, 5),
         'w_price_lt_ma20': (-30, -5, 5),
         'w_price_gt_ma60': (5, 30, 5),
@@ -775,63 +768,50 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
         'w_ma_bull': (5, 30, 5),
         'w_ma_bear': (-30, -5, 5),
         'w_break_supertrend': (-30, -5, 5),
-        
-        # 11-15. 動能分數
         'w_rsi_strong': (5, 30, 5),
         'w_rsi_bull': (5, 30, 5),
         'w_rsi_oversold': (-30, -5, 5),
         'w_rsi_weak': (-30, -5, 5),
         'w_momentum_up': (5, 30, 5),
-        
-        # 16. 黃金坑
         'w_golden_pit': (30, 60, 5)
     }
 
     # === 蒙地卡羅模擬 ===
-    n_trials = 200 # 模擬次數 (可依效能調整，建議 200~300)
+    n_trials = 200 
     best_ret = -999
     best_params = {}
     best_df = pd.DataFrame()
     
-    # 至少跑一次預設參數 (Baseline)
-    default_params = {k: np.mean([v[0], v[1]]) for k, v in param_grid.items()} # 用中間值當 Baseline
+    default_params = {k: np.mean([v[0], v[1]]) for k, v in param_grid.items()}
     trial_params_list = [default_params]
     
-    # 生成隨機參數組
     for _ in range(n_trials):
         p = {}
         for k, (min_v, max_v, step) in param_grid.items():
-            # 隨機產生符合 step 的整數
             steps_count = int((max_v - min_v) / step)
             rand_step = random.randint(0, steps_count)
             p[k] = min_v + (rand_step * step)
         trial_params_list.append(p)
         
-    # 開始競賽
     for params in trial_params_list:
-        # 呼叫 run_simple_strategy (它內部會呼叫 calculate_alpha_score)
-        # 並傳入當前參數 params
         res_df = run_simple_strategy(
             df_slice, 
             fee_rate=fee_rate, 
             tax_rate=tax_rate, 
             params=params
         )
-        
-        # 評估績效：累積報酬率
         ret = res_df['Cum_Strategy'].iloc[-1] - 1
         
         if ret > best_ret:
             best_ret = ret
             best_params = params
-            best_df = res_df.copy() # 必須 copy，否則會被覆蓋
+            best_df = res_df.copy()
             
-    # 將最佳報酬寫入 params 以便外部顯示
     best_params['Return'] = best_ret
     
-    # 重要：為了讓 UI 能正確顯示分數顏色和 HTML，我們需要用最佳參數
-    # 「重新」跑一次 calculate_alpha_score (這次 params 不是 None，會生成詳細 HTML)
-    # 在 run_simple_strategy 裡雖然跑過了，但為了確保 Score_Log 正確，我們再整理一次
+    # [關鍵修正] 補上相容性參數，避免 validate_strategy_robust 報錯 KeyError
+    best_params['Mult'] = 3.0 
+    best_params['RSI_Buy'] = 30 # 雖然沒用到，但補上以防萬一
     
     conditions = [
         (best_df['Alpha_Score'] >= 60), (best_df['Alpha_Score'] >= 20), (best_df['Alpha_Score'] >= -20),
@@ -847,41 +827,45 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
     執行嚴謹的樣本外測試 (Walk-Forward Analysis 簡化版)
-    Split Ratio: 訓練集佔比 (預設 70%)
     """
     # 1. 資料切割
     total_len = len(raw_df)
-    if total_len < 100: return None # 資料過少無法驗證
+    if total_len < 100: return None
     
     split_idx = int(total_len * split_ratio)
     train_data_raw = raw_df.iloc[:split_idx].copy()
     test_data_raw = raw_df.iloc[split_idx:].copy()
     
-    # 確保切分後的測試集有足夠數據
     if len(test_data_raw) < 30: return None
 
-    # 2. 訓練階段 (In-Sample): 在過去數據找最佳參數
-    # 注意：start_date 設為訓練集的第一天
+    # 2. 訓練階段 (In-Sample)
     train_start_date = train_data_raw['Date'].min()
     best_params_train, train_res_df = run_optimization(train_data_raw, market_df, train_start_date, fee_rate, tax_rate)
     
     if best_params_train is None: return None
 
-    # 3. 測試階段 (Out-of-Sample): 用訓練好的參數去跑未來的數據
-    # 關鍵：這裡不能再做 run_optimization，必須固定參數
+    # 3. 測試階段 (Out-of-Sample)
     
-    # 先計算測試集的指標 (使用訓練集找出的最佳 Multiplier)
-    test_ind = calculate_indicators(test_data_raw, 10, best_params_train['Mult'], market_df)
+    # [修正] 使用 .get() 安全獲取 Mult，避免 KeyError，預設值給 3.0
+    mult_val = best_params_train.get('Mult', 3.0)
     
-    # 執行策略 (使用訓練集找出的最佳 RSI 閾值)
-    test_res_df = run_simple_strategy(test_ind, best_params_train['RSI_Buy'], fee_rate, tax_rate)
+    # 計算指標
+    test_ind = calculate_indicators(test_data_raw, 10, mult_val, market_df)
+    
+    # [修正] 關鍵：必須將 best_params_train 傳入 params 參數
+    # 這樣測試集才會使用訓練出來的 16 個最佳參數，而不是預設值
+    test_res_df = run_simple_strategy(
+        test_ind, 
+        fee_rate=fee_rate, 
+        tax_rate=tax_rate, 
+        params=best_params_train 
+    )
     
     # 4. 績效比較與指標計算
     def get_metrics(df):
-        if df.empty: return 0, 0
+        if df.empty: return 0, 0, 0
         cum_ret = df['Cum_Strategy'].iloc[-1] - 1
         mdd = calculate_mdd(df['Cum_Strategy'])
-        # 年化報酬估算
         days = (df['Date'].max() - df['Date'].min()).days
         cagr = ((1 + cum_ret) ** (365/days) - 1) if days > 0 else 0
         return cum_ret, mdd, cagr
@@ -895,6 +879,8 @@ def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.0014
         "test": {"ret": test_ret, "mdd": test_mdd, "cagr": test_cagr, "df": test_res_df},
         "split_date": test_data_raw['Date'].min()
     }
+
+
 
 def calculate_target_hit_rate(df):
     if df is None or df.empty: return "0.0%", 0, 0
