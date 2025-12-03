@@ -1621,7 +1621,7 @@ market_df = get_market_data(start_date, end_date)
 if page == "🌍 市場總覽 (Macro)":
     draw_market_dashboard(market_df, start_date, end_date)
 
-# --- 頁面 2 (手機介面優化版): 單股深度分析 ---
+# --- 頁面 2: 單股深度分析 (修正版：使用 run_optimization) ---
 elif page == "📊 單股深度分析":
     # ==================================================
     # 1. 資料準備與搜尋清單建立
@@ -1634,7 +1634,6 @@ elif page == "📊 單股深度分析":
     # 建立搜尋清單 (代號 + 名稱)
     search_list = [f"{row['代號']} {row['名稱']}" for idx, row in df_all.iterrows()]
     base_search_list = [f"{k} {v}" for k, v in TW_STOCK_NAMES_STATIC.items()]
-    # 排序並去重，確保順序固定
     full_search_options = sorted(list(set(search_list + base_search_list)))
 
     # 確保核心變數 last_ticker 有值
@@ -1642,237 +1641,233 @@ elif page == "📊 單股深度分析":
         st.session_state['last_ticker'] = "2330"
 
     # ==================================================
-    # 2. 定義 Callback (只負責處理邏輯變數)
+    # 2. 定義 Callback (介面連動)
     # ==================================================
-    
-    # 當使用者手動選取選單時
     def on_selector_change():
         selection = st.session_state['stock_selector']
         st.session_state['last_ticker'] = selection.split(" ")[0]
 
-# 當使用者點擊按鈕時
     def on_button_click(direction):
         current_ticker = st.session_state['last_ticker']
-        
-        # [修正] 增加 try-except 防呆
         try:
-            # 嘗試找出當前 ticker 在完整清單中的位置
             current_idx = 0
             for i, opt in enumerate(full_search_options):
                 if opt.startswith(str(current_ticker)):
                     current_idx = i
                     break
         except:
-            current_idx = 0 # 若發生任何錯誤，歸零
+            current_idx = 0
         
-        # 計算新的 Index
         new_idx = (current_idx + direction) % len(full_search_options)
         new_option = full_search_options[new_idx]
-        
         st.session_state['last_ticker'] = new_option.split(" ")[0]
 
     # ==================================================
-    # 3. [核心修正] 強制介面同步 (View <-> Model Sync)
+    # 3. 介面佈局 (搜尋與導航)
     # ==================================================
-    # 在畫出選單之前，強制將選單的 State 設定為 last_ticker 對應的選項
-    # 這確保了無論是按按鈕、還是外部更新，選單顯示永遠正確
     
-    current_gui_option = full_search_options[0] # 預設值
+    # 強制同步選單顯示
+    current_gui_option = full_search_options[0]
     target_ticker = st.session_state['last_ticker']
-    
-    # 在清單中找到對應的完整字串 (例如 "2330" -> "2330 台積電")
     for opt in full_search_options:
         if opt.startswith(str(target_ticker)):
             current_gui_option = opt
             break
-    
-    # 強制寫入 Session State，讓 Selectbox 乖乖聽話
     st.session_state['stock_selector'] = current_gui_option
 
-    # ==================================================
-    # 4. 介面佈局
-    # ==================================================
-    
-    # --- Row 1: 搜尋與 Go 按鈕 ---
     with st.container():
         col_search, col_run = st.columns([3, 1])
-        
         with col_search:
-            # 這裡我們不設 index，而是依賴上方的 st.session_state['stock_selector'] 強制同步
             st.selectbox(
                 "搜尋股票 (支援代號或中文)",
                 options=full_search_options,
                 label_visibility="collapsed",
                 key="stock_selector",
-                on_change=on_selector_change # 綁定手動變更
+                on_change=on_selector_change
             )
-            
         with col_run:
             if st.button("Go", type="primary", use_container_width=True):
-                # 強制重跑
                 st.session_state['last_ticker'] = st.session_state['stock_selector'].split(" ")[0]
                 st.rerun()
 
-    # --- Row 2: 上一檔 / 下一檔 ---
     col_prev, col_next = st.columns([1, 1])
-    
     with col_prev:
         st.button("◀ 上一檔", use_container_width=True, on_click=on_button_click, args=(-1,))
-
     with col_next:
         st.button("下一檔 ▶", use_container_width=True, on_click=on_button_click, args=(1,))
 
-    # 取得最終要分析的代號
-    ticker_input = st.session_state['last_ticker']
-
-    # ==================================================
-    # 3. 確保變數同步 (最後一道防線)
-    # ==================================================
-    # 如果使用者直接改了選單但沒按 Go，自動偵測並更新
+    # 再次確認 ticker 狀態
     if st.session_state['stock_selector'].split(" ")[0] != st.session_state['last_ticker']:
          st.session_state['last_ticker'] = st.session_state['stock_selector'].split(" ")[0]
-
     ticker_input = st.session_state['last_ticker']
 
-    
     if ticker_input: 
+        # ==========================================
+        # [核心] 策略參數 Session State 初始化
+        # ==========================================
+        # 如果 session 中還沒有參數，載入預設值
+        default_strategy_params = {
+            'buy_consecutive_sum': 40, 'buy_single_day': 40, 'sell_threshold': -40, 'sell_slope': -60,
+            'w_price_gt_ma20': 20, 'w_price_lt_ma20': -20,
+            'w_price_gt_ma60': 15, 'w_price_lt_ma60': -15,
+            'w_ma_bull': 10, 'w_ma_bear': -5,
+            'w_break_supertrend': -30,
+            'w_rsi_strong': 10, 'w_rsi_bull': 5, 'w_rsi_oversold': -10, 'w_rsi_weak': -5,
+            'w_momentum_up': 5, 'w_golden_pit': 40
+        }
+        
+        if 'strategy_params' not in st.session_state:
+            st.session_state['strategy_params'] = default_strategy_params.copy()
+
+        # ==========================================
+        # [核心] 參數設定面板 (手動調校 + AI 一鍵擬合)
+        # ==========================================
+        with st.expander("⚙️ 策略參數實驗室 (手動調校 / AI 擬合)", expanded=False):
+            
+            # --- 功能按鈕區 ---
+            c_opt, c_reset = st.columns([2, 1])
+            with c_opt:
+                # 定義一鍵優化按鈕邏輯
+                if st.button("✨ AI 一鍵擬合 (尋找最佳參數)", type="primary", use_container_width=True):
+                    with st.spinner(f"正在對 {ticker_input} 進行蒙地卡羅參數演化..."):
+                        # 獲取資料 (用於優化)
+                        raw_df_opt, _ = get_stock_data(ticker_input, start_date, end_date)
+                        if not raw_df_opt.empty:
+                            current_fee = fee_input if 'fee_input' in locals() else 0.001425
+                            current_tax = tax_input if 'tax_input' in locals() else 0.003
+                            
+                            # [關鍵修正]：呼叫 run_optimization 進行擬合
+                            # 注意：這裡不傳入 n_trials，使用函數內部預設值
+                            # 這些開關參數在此模式下可能無效，但為了保持接口一致仍傳入
+                            best_p, _ = run_optimization(
+                                raw_df_opt, market_df, start_date, 
+                                current_fee, current_tax, 
+                                use_chip_strategy=False, 
+                                use_strict_bear_exit=False
+                            )
+                            
+                            # 更新 Session State
+                            if best_p:
+                                # 只更新參數鍵值
+                                for k in default_strategy_params.keys():
+                                    if k in best_p:
+                                        st.session_state['strategy_params'][k] = best_p[k]
+                                st.success(f"✅ 擬合完成！最佳回測報酬: {best_p.get('Return', 0)*100:.1f}%")
+                                st.rerun() # 強制刷新介面以顯示新參數
+            
+            with c_reset:
+                if st.button("↩️ 重置預設值", use_container_width=True):
+                    st.session_state['strategy_params'] = default_strategy_params.copy()
+                    st.rerun()
+
+            st.markdown("---")
+            
+            # --- 參數輸入區 (雙向綁定 Session State) ---
+            # 使用 callback 更新 session state，確保手動輸入即時生效
+            def update_param(key):
+                st.session_state['strategy_params'][key] = st.session_state[f"widget_{key}"]
+
+            # Group 1: 買賣門檻
+            st.caption("🎯 買賣訊號門檻")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.number_input("買入(連2日合)", -100, 200, st.session_state['strategy_params']['buy_consecutive_sum'], 5, key="widget_buy_consecutive_sum", on_change=update_param, args=('buy_consecutive_sum',))
+            with c2: st.number_input("買入(單日)", -100, 200, st.session_state['strategy_params']['buy_single_day'], 5, key="widget_buy_single_day", on_change=update_param, args=('buy_single_day',))
+            with c3: st.number_input("賣出(Alpha低於)", -200, 100, st.session_state['strategy_params']['sell_threshold'], 5, key="widget_sell_threshold", on_change=update_param, args=('sell_threshold',))
+            with c4: st.number_input("賣出(斜率低於)", -200, 100, st.session_state['strategy_params']['sell_slope'], 5, key="widget_sell_slope", on_change=update_param, args=('sell_slope',))
+
+            # Group 2: 趨勢權重
+            st.caption("⚖️ 趨勢權重 (Trend Weights)")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.number_input("股價 > 月線", -100, 100, st.session_state['strategy_params']['w_price_gt_ma20'], 5, key="widget_w_price_gt_ma20", on_change=update_param, args=('w_price_gt_ma20',))
+            with c2: st.number_input("股價 破 月線", -100, 100, st.session_state['strategy_params']['w_price_lt_ma20'], 5, key="widget_w_price_lt_ma20", on_change=update_param, args=('w_price_lt_ma20',))
+            with c3: st.number_input("股價 > 季線", -100, 100, st.session_state['strategy_params']['w_price_gt_ma60'], 5, key="widget_w_price_gt_ma60", on_change=update_param, args=('w_price_gt_ma60',))
+            with c4: st.number_input("股價 破 季線", -100, 100, st.session_state['strategy_params']['w_price_lt_ma60'], 5, key="widget_w_price_lt_ma60", on_change=update_param, args=('w_price_lt_ma60',))
+            
+            c1, c2, c3 = st.columns(3)
+            with c1: st.number_input("均線多頭", -100, 100, st.session_state['strategy_params']['w_ma_bull'], 5, key="widget_w_ma_bull", on_change=update_param, args=('w_ma_bull',))
+            with c2: st.number_input("均線空頭", -100, 100, st.session_state['strategy_params']['w_ma_bear'], 5, key="widget_w_ma_bear", on_change=update_param, args=('w_ma_bear',))
+            with c3: st.number_input("跌破停損線", -100, 100, st.session_state['strategy_params']['w_break_supertrend'], 5, key="widget_w_break_supertrend", on_change=update_param, args=('w_break_supertrend',))
+
+            # Group 3: 動能權重
+            st.caption("🌊 動能權重 (Momentum Weights)")
+            c1, c2, c3, c4 = st.columns(4)
+            with c1: st.number_input("RSI 強勢(>60)", -100, 100, st.session_state['strategy_params']['w_rsi_strong'], 5, key="widget_w_rsi_strong", on_change=update_param, args=('w_rsi_strong',))
+            with c2: st.number_input("RSI 多方(50-60)", -100, 100, st.session_state['strategy_params']['w_rsi_bull'], 5, key="widget_w_rsi_bull", on_change=update_param, args=('w_rsi_bull',))
+            with c3: st.number_input("RSI 弱勢(30-50)", -100, 100, st.session_state['strategy_params']['w_rsi_weak'], 5, key="widget_w_rsi_weak", on_change=update_param, args=('w_rsi_weak',))
+            with c4: st.number_input("RSI 超賣(<30)", -100, 100, st.session_state['strategy_params']['w_rsi_oversold'], 5, key="widget_w_rsi_oversold", on_change=update_param, args=('w_rsi_oversold',))
+            
+            c1, c2 = st.columns(2)
+            with c1: st.number_input("動能增強(RSI↑)", -100, 100, st.session_state['strategy_params']['w_momentum_up'], 5, key="widget_w_momentum_up", on_change=update_param, args=('w_momentum_up',))
+            with c2: st.number_input("💎 牛市黃金坑", -100, 100, st.session_state['strategy_params']['w_golden_pit'], 5, key="widget_w_golden_pit", on_change=update_param, args=('w_golden_pit',))
+
+        # ==========================================
+        # 4. 執行分析 (使用當前 Session Params)
+        # ==========================================
         with st.spinner(f'正在分析 {ticker_input} ...'):
             current_fee = fee_input if 'fee_input' in locals() else 0.001425
             current_tax = tax_input if 'tax_input' in locals() else 0.003
             
-            # 初始化變數，防止 NameError
-            final_df = None
-            best_params = None
-            validation_result = None
-            
-            # 1. 獲取資料
+            # A. 獲取資料
             raw_df, fmt_ticker = get_stock_data(ticker_input, start_date, end_date)
             name = get_stock_name(fmt_ticker)
             
-            # 2. 判斷資料是否獲取成功
             if raw_df.empty:
-                st.error(f"❌ 無法獲取 {ticker_input} 資料。原因可能是：\n1. 代號錯誤\n2. 該 ETF/股票剛上市，Yahoo Finance 尚未收錄\n3. 該商品無近期交易量")
+                st.error(f"❌ 無法獲取 {ticker_input} 資料。")
             else:
-                # 3. 若成功，才執行策略運算
-                best_params, final_df = run_optimization(
-                    raw_df, market_df, start_date, current_fee, current_tax, 
-                    use_chip_strategy=enable_chip_strategy,
-                    use_strict_bear_exit=enable_strict_bear_exit  # <--- 加入參數
-                )
-                validation_result = validate_strategy_robust(raw_df, market_df, 0.7, current_fee, current_tax)
-
-            # 4. 顯示結果 (檢查 final_df 是否存在且不為空)
-            if final_df is None or final_df.empty:
-                if not raw_df.empty: # 如果有原始資料但策略跑不出結果 (極少見)
-                    st.warning("⚠️ 選定區間內無足夠資料進行策略運算 (可能上市時間太短)。")
-            else:
-                # ... (以下顯示邏輯保持不變，直接沿用原本的程式碼即可) ...
-                # 為節省篇幅，請保留您原本從 `stock_alpha_df = calculate_alpha_score(...)` 開始的後續顯示程式碼
-                # 只要替換上方這段輸入控制邏輯即可
+                # B. 計算指標
+                df_ind = calculate_indicators(raw_df, 10, 3.0, market_df)
+                df_slice = df_ind[df_ind['Date'] >= pd.to_datetime(start_date)].copy()
                 
-                # [以下為原本的代碼接續點，請確認您的代碼中有這部分]
-                stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
+                # C. [核心修改] 直接呼叫 run_simple_strategy，傳入當前的 params
+                final_df = run_simple_strategy(
+                    df_slice, 
+                    fee_rate=current_fee, 
+                    tax_rate=current_tax,
+                    use_chip_strategy=enable_chip_strategy,
+                    use_strict_bear_exit=enable_strict_bear_exit,
+                    params=st.session_state['strategy_params'] # <--- 傳入參數
+                )
+                
+                # 構建 best_params (供顯示用)
+                best_params = st.session_state['strategy_params'].copy()
+                if not final_df.empty:
+                    best_params['Return'] = final_df['Cum_Strategy'].iloc[-1] - 1
+                
+                # 確保 K 線圖的 Score_Log 正常
+                conditions = [
+                    (final_df['Alpha_Score'] >= 60), (final_df['Alpha_Score'] >= 20), (final_df['Alpha_Score'] >= -20),
+                    (final_df['Alpha_Score'] <= -60), (final_df['Alpha_Score'] < -20)
+                ]
+                choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 震盪盤整", "⚡ 極弱勢", "📉 空頭修正"]
+                final_df['Score_Log'] = np.select(conditions, choices, default="☁️ 觀望")
+
+            # 5. 顯示結果
+            if final_df is None or final_df.empty:
+                if not raw_df.empty: st.warning("⚠️ 選定區間內無足夠資料進行策略運算。")
+            else:
+                # 重新計算 Alpha Score 詳細資訊 (為了 Score_Detail HTML)
+                stock_alpha_df = final_df # 直接使用
                 base_score = stock_alpha_df['Alpha_Score'].iloc[-1]
                 base_log = stock_alpha_df['Score_Log'].iloc[-1]
                 
-                # ... (後續的 Context-Aware Adjustment 與 UI 繪圖部分完全不用動) ...
-                
-                # 這裡為了完整性，我將後續關鍵變數計算補上，避免您複製貼上時斷掉
-                adjusted_score = base_score
-                adjustment_log = ""
-                current_price = final_df['Close'].iloc[-1]
-                ma20 = final_df['MA20'].iloc[-1]
-                ma60 = final_df['MA60'].iloc[-1]
-                rsi_now = final_df['RSI'].iloc[-1]
-                rsi_prev = final_df['RSI'].iloc[-2]
-                last_trade = final_df[final_df['Action'] == 'Buy'].iloc[-1] if not final_df[final_df['Action'] == 'Buy'].empty else None
-                is_rebound_strategy = False
-                if last_trade is not None:
-                    buy_reason = str(last_trade['Reason'])
-                    if any(x in buy_reason for x in ["反彈", "超賣", "回測", "低檔"]): is_rebound_strategy = True
-                
                 action, color, reason = analyze_signal(final_df)
-
-                if action == "✊ 續抱" or action == "🚀 買進":
-                    if is_rebound_strategy:
-                        if current_price < ma60: 
-                            adjusted_score += 15; adjustment_log += "[反彈位階修正+15]"
-                        if rsi_now > rsi_prev:
-                            adjusted_score += 10; adjustment_log += "[RSI翻揚+10]"
-                        ma5 = final_df['Close'].rolling(5).mean().iloc[-1]
-                        if current_price > ma5:
-                            adjusted_score += 10; adjustment_log += "[站穩MA5+10]"
-                    else:
-                        if current_price > ma20 and ma20 > ma60:
-                            adjusted_score += 10; adjustment_log += "[多頭排列+10]"
-                        if final_df['Volume'].iloc[-1] > final_df['Vol_MA20'].iloc[-1]:
-                            adjusted_score += 5; adjustment_log += "[量增+5]"
-
-                # 限制分數範圍 (-100 ~ 100)
-                final_composite_score = max(min(adjusted_score, 100), -100)
                 
-                # [關鍵修正] 防呆處理：如果分數是 NaN (無效值)，強制設為 0，避免 int() 報錯
-                import math
-                if math.isnan(final_composite_score):
-                    final_composite_score = 0
-                
-                # 組合最終顯示日誌
-                full_log_text = f"{base_log} {adjustment_log}" if base_log or adjustment_log else "無顯著特徵"
-                
-                # 計算其餘指標
-                beta, vol, personality = calculate_stock_personality(final_df, market_df)
-                hit_rate, hits, total = calculate_target_hit_rate(final_df)
-                real_win_rate, real_wins, real_total, avg_pnl = calculate_realized_win_rate(final_df)
-                risk_metrics = calculate_risk_metrics(final_df)
-                
-                # ==========================================
-                # UI 顯示部分 (已優化：新增現價顯示)
-                # ==========================================
-                
-                # [新增] 顯示 AI 最佳化結果
-                with st.expander("🧬 AI 最佳參數配置 (Monte Carlo Optimization)", expanded=False):
-                    if best_params:
-                        st.markdown(f"""
-                        **策略回測報酬率:** `{best_params.get('Return', 0)*100:.2f}%`
-                        
-                        **🎯 買賣門檻設定:**
-                        * 買入 (連續2日總和): `>= {best_params.get('buy_consecutive_sum')}` 分
-                        * 買入 (單日爆發): `>= {best_params.get('buy_single_day')}` 分
-                        * 賣出 (Alpha低於): `<= {best_params.get('sell_threshold')}` 分
-                        * 賣出 (斜率低於): `<= {best_params.get('sell_slope')}`
-                        
-                        **⚖️ 趨勢權重 (Trend):**
-                        * 站上/跌破月線: `{best_params.get('w_price_gt_ma20'):+}` / `{best_params.get('w_price_lt_ma20'):+}`
-                        * 站上/跌破季線: `{best_params.get('w_price_gt_ma60'):+}` / `{best_params.get('w_price_lt_ma60'):+}`
-                        * 均線多/空排列: `{best_params.get('w_ma_bull'):+}` / `{best_params.get('w_ma_bear'):+}`
-                        * 跌破停損線: `{best_params.get('w_break_supertrend'):+}`
-                        
-                        **🌊 動能權重 (Momentum):**
-                        * RSI (強勢/多方/弱勢/超賣): `{best_params.get('w_rsi_strong'):+}` / `{best_params.get('w_rsi_bull'):+}` / `{best_params.get('w_rsi_weak'):+}` / `{best_params.get('w_rsi_oversold'):+}`
-                        * 動能增強: `{best_params.get('w_momentum_up'):+}`
-                        * 牛市黃金坑: `{best_params.get('w_golden_pit'):+}`
-                        """)
-                    else:
-                        st.caption("使用預設參數運算")
-
                 # 1. 準備漲跌數據
                 last_close = final_df['Close'].iloc[-1]
                 prev_close = final_df['Close'].iloc[-2]
                 price_chg = last_close - prev_close
                 price_pct = (price_chg / prev_close) * 100
                 
-                # 2. 頂部資訊欄 (標題 + 現價)
-                # 使用 columns 將版面切分為 [左: 資訊, 右: 股價]
+                # 2. 頂部資訊欄
                 col_header, col_price = st.columns([3, 1])
                 
                 with col_header:
                     st.markdown(f"## {ticker_input} {name}")
-                    # 使用不同顏色區分波動率屬性
+                    beta, vol, personality = calculate_stock_personality(final_df, market_df)
                     vol_color = "red" if "高波動" in personality else ("green" if "低波動" in personality else "orange")
                     st.markdown(f"**策略邏輯**: `{reason}` | **波動屬性**: :{vol_color}[{personality}] ({vol})")
                 
                 with col_price:
-                    # 顯示大字體現價
                     st.metric(
                         label="最新現價", 
                         value=f"{last_close:.2f}", 
@@ -1882,40 +1877,46 @@ elif page == "📊 單股深度分析":
 
                 st.markdown("---")
 
-                # 3. AI 評分區塊 (維持不變，僅微調版面)
+                # 3. AI 評分區塊
                 st.markdown("### 🏆 AI 綜合評分與決策依據")
                 score_col, log_col = st.columns([1, 3])
                 
                 with score_col:
                     s_color = "normal"
-                    if final_composite_score >= 60: s_color = "off" 
-                    elif final_composite_score <= -20: s_color = "inverse"
+                    if base_score >= 60: s_color = "off" 
+                    elif base_score <= -20: s_color = "inverse"
                     
                     st.metric(
                         label="綜合評分 (Alpha Score)",
-                        value=f"{int(final_composite_score)} 分",
+                        value=f"{int(base_score)} 分",
                         delta=action,
                         delta_color=s_color
                     )
                 
                 with log_col:
-                    st.info(f"**🧮 演算歷程解析：**\n\n{full_log_text}")
+                    if 'Score_Detail' in final_df.columns:
+                        detail_html = final_df['Score_Detail'].iloc[-1]
+                        clean_html = detail_html.replace(f"<b>Alpha Score: <span style='color:{'#ff5252' if base_score>0 else '#00e676'}; font-size:18px'>{int(base_score)}</span></b><br>", "")
+                        st.markdown(clean_html, unsafe_allow_html=True)
+                    else:
+                        st.info("無詳細評分數據")
 
-                # 1. 計算策略績效
+                # 績效計算
                 strat_mdd = calculate_mdd(final_df['Cum_Strategy'])
-                strat_ret = best_params['Return'] * 100
-                
-                # 2. [新增] 計算 Buy & Hold (基準) 績效
-                # Cum_Market 是已經計算好的市場累積權益曲線 (代表該股本身)
+                strat_ret = best_params.get('Return', 0) * 100
                 bh_ret = (final_df['Cum_Market'].iloc[-1] - 1) * 100
                 bh_mdd = calculate_mdd(final_df['Cum_Market'])
-                
-                # 判斷策略是否戰勝大盤 (用於標註顏色或差異)
                 beat_market = strat_ret - bh_ret
+                
+                hit_rate, hits, total = calculate_target_hit_rate(final_df)
+                real_win_rate, real_wins, real_total, avg_pnl = calculate_realized_win_rate(final_df)
+                risk_metrics = calculate_risk_metrics(final_df)
+                pf = risk_metrics.get('Profit_Factor', 0)
+                sharpe = risk_metrics.get('Sharpe', 0)
+                try: win_rate_val = float(real_win_rate.strip('%'))
+                except: win_rate_val = 0
 
-                # ==========================================
-                # 自訂指標卡片函式 (保持不變)
-                # ==========================================
+                # KPI Cards
                 def KPI_Card(col, title, value, sub_value, is_good):
                     color = "#ff5252" if is_good else "#00e676" 
                     arrow = "▲" if is_good else "▼"
@@ -1948,123 +1949,47 @@ elif page == "📊 單股深度分析":
                         unsafe_allow_html=True
                     )
 
-                # 準備其他數據
-                pf = risk_metrics.get('Profit_Factor', 0)
-                sharpe = risk_metrics.get('Sharpe', 0)
-                try: win_rate_val = float(real_win_rate.strip('%'))
-                except: win_rate_val = 0
-                
-                # [修改] 改為 5 欄佈局
                 m1, m2, m3, m4, m5 = st.columns(5)
-                
-                # Card 1: 策略淨報酬
-                KPI_Card(
-                    m1, 
-                    "策略淨報酬 (Active)", 
-                    f"{strat_ret:+.1f}%", 
-                    f"MDD: {strat_mdd:.1f}%", 
-                    is_good=(strat_ret > 0)
-                )
-                
-                # Card 2: [新增] 買進持有
-                # 這裡的 is_good 判斷：如果是正報酬顯示紅，負報酬顯示綠
-                KPI_Card(
-                    m2, 
-                    "買進持有 (Buy & Hold)", 
-                    f"{bh_ret:+.1f}%", 
-                    f"MDD: {bh_mdd:.1f}%", 
-                    is_good=(bh_ret > 0)
-                )
-                
-                # Card 3: 實際勝率
-                KPI_Card(
-                    m3, 
-                    "實際勝率 (Win Rate)", 
-                    real_win_rate, 
-                    f"{real_wins}勝 / {real_total}總", 
-                    is_good=(win_rate_val >= 50)
-                )
-                
-                # Card 4: 目標達成率
-                KPI_Card(
-                    m4, 
-                    "目標達成率 (Target)", 
-                    hit_rate, 
-                    f"{hits}次達標 (+15%)", 
-                    is_good=(hits > 0)
-                )
-                
-                # Card 5: 盈虧因子 PF
-                KPI_Card(
-                    m5, 
-                    "盈虧因子 (PF)", 
-                    f"{pf:.2f}", 
-                    f"夏普: {sharpe:.2f}", 
-                    is_good=(pf > 1)
-                )
+                KPI_Card(m1, "策略淨報酬 (Active)", f"{strat_ret:+.1f}%", f"MDD: {strat_mdd:.1f}%", (strat_ret > 0))
+                KPI_Card(m2, "買進持有 (Buy & Hold)", f"{bh_ret:+.1f}%", f"MDD: {bh_mdd:.1f}%", (bh_ret > 0))
+                KPI_Card(m3, "實際勝率 (Win Rate)", real_win_rate, f"{real_wins}勝 / {real_total}總", (win_rate_val >= 50))
+                KPI_Card(m4, "目標達成率 (Target)", hit_rate, f"{hits}次達標 (+15%)", (hits > 0))
+                KPI_Card(m5, "盈虧因子 (PF)", f"{pf:.2f}", f"夏普: {sharpe:.2f}", (pf > 1))
                 
                 st.write("") 
-                
-                # 如果策略跑輸買進持有，給個提示
                 if beat_market < 0:
                     st.caption(f"⚠️ 注意：此策略績效落後買進持有 {abs(beat_market):.1f}%，建議直接長期持有即可。")
                 else:
                     st.caption(f"🎉 優異：此策略創造了 {beat_market:+.1f}% 的超額報酬 (Alpha)。")
 
+                # Tabs (K線圖等)
                 tab1, tab2, tab3 = st.tabs(["📈 操盤決策圖", "💰 權益曲線", "🧪 有效性驗證"])
                 
                 # [Tab 1: K線圖]
                 with tab1:
                     # 1. 準備數據
-                    final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    
-                    if 'Score_Detail' in stock_alpha_df.columns:
-                        final_df['Score_Detail'] = stock_alpha_df['Score_Detail']
-                    else:
-                        # 防呆：萬一上游沒算出來，填入空字串避免報錯
-                        final_df['Score_Detail'] = ""
-
+                    final_df['Score_Detail'] = stock_alpha_df['Score_Detail']
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
                     
-                    # 確保長均線存在
                     if 'MA120' not in final_df.columns: final_df['MA120'] = final_df['Close'].rolling(120).mean()
                     if 'MA240' not in final_df.columns: final_df['MA240'] = final_df['Close'].rolling(240).mean()
                     
-                    # 計算均線糾結度 (MA Congestion)
+                    # 計算均線糾結度
                     ma_subset = final_df[['MA60', 'MA120', 'MA240']].ffill().bfill()
                     ma_max = ma_subset.max(axis=1)
                     ma_min = ma_subset.min(axis=1)
-                    
-                    # 1. 瞬時 GAP
                     raw_gap = (ma_max - ma_min) / final_df['Close'] * 100
-                    
-                    # 2. 20日平均 GAP (糾結指數)
                     congestion_idx = raw_gap.rolling(20, min_periods=1).mean().fillna(100)
                     final_df['Congestion_Index'] = congestion_idx
-                    
-                    # [新增] 3. 糾結度斜率 (Slope) - 判斷發散或收斂
-                    # 正值 = 發散中 (趨勢加速)
-                    # 負值 = 收斂中 (進入盤整)
-                    congestion_slope = congestion_idx.diff().fillna(0)
-                    final_df['Congestion_Slope'] = congestion_slope
+                    final_df['Congestion_Slope'] = congestion_idx.diff().fillna(0)
 
-                    # 2. 建立子圖 (Rows 增加為 8)
+                    # 2. 建立子圖
                     fig = make_subplots(
                         rows=8, cols=1, 
                         shared_xaxes=True, 
                         vertical_spacing=0.02, 
-                        # 調整高度比例
                         row_heights=[0.30, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10, 0.10], 
-                        subplot_titles=(
-                            "", 
-                            "買賣評等 (Alpha Score)", 
-                            "評分動能 (Alpha Slope)", 
-                            "成交量", 
-                            "法人籌碼 (OBV)", 
-                            "相對強弱指標 (RSI)",
-                            "均線糾結指數 (20MA Gap%)",
-                            "糾結度變化 (Slope)" # [新增標題]
-                        )
+                        subplot_titles=("", "買賣評等 (Alpha Score)", "評分動能 (Alpha Slope)", "成交量", "法人籌碼 (OBV)", "相對強弱指標 (RSI)", "均線糾結指數 (20MA Gap%)", "糾結度變化 (Slope)")
                     )
             
                     # --- Row 1: K線 (含年線/半年線) ---
@@ -2091,7 +2016,6 @@ elif page == "📊 單股深度分析":
                             labels.append(f"<b>{int(score)}</b>")
                         return labels
                     
-                    # 買進訊號
                     buy_pts = final_df[final_df['Action'] == 'Buy']
                     if not buy_pts.empty:
                         fig.add_trace(go.Scatter(
@@ -2105,15 +2029,13 @@ elif page == "📊 單股深度分析":
                             hovertext=buy_pts['Reason']
                         ), row=1, col=1)
 
-                    # 賣出訊號
                     sell_pts = final_df[final_df['Action'] == 'Sell']
                     if not sell_pts.empty:
-                        # 定義賣出顏色：Alpha崩跌(紫色), 停損(紅色)
                         sell_colors = []
                         for r in sell_pts['Reason']:
-                            if "崩跌" in str(r): sell_colors.append('#e040fb') # 紫色
-                            elif "停損" in str(r): sell_colors.append('#ff1744') # 紅色
-                            else: sell_colors.append('#bdbdbd') # 灰色
+                            if "崩跌" in str(r): sell_colors.append('#e040fb') 
+                            elif "停損" in str(r): sell_colors.append('#ff1744') 
+                            else: sell_colors.append('#bdbdbd') 
 
                         fig.add_trace(go.Scatter(
                             x=sell_pts['Date'], y=sell_pts['Sell_Y'], 
@@ -2126,29 +2048,22 @@ elif page == "📊 單股深度分析":
                             hovertext=sell_pts['Reason']
                         ), row=1, col=1)
 
-                    # --- Row 2: Alpha Score (Updated with Hover Detail) ---
+                    # --- Row 2: Alpha Score ---
                     colors_score = ['#ef5350' if v > 0 else '#26a69a' for v in final_df['Alpha_Score']]
-             
                     fig.add_trace(go.Bar(
-                        x=final_df['Date'], 
-                        y=final_df['Alpha_Score'], 
-                        name='Alpha Score', 
-                        marker_color=colors_score,
-                        # [關鍵修改] 綁定詳細 HTML 到 hovertext
-                        hovertext=final_df['Score_Detail'],
-                        # [設定] 顯示模式：只顯示我們自訂的 hovertext，加上 x 軸日期
-                        hoverinfo="x+text" 
+                        x=final_df['Date'], y=final_df['Alpha_Score'], 
+                        name='Alpha Score', marker_color=colors_score,
+                        hovertext=final_df['Score_Detail'], hoverinfo="x+text" 
                     ), row=2, col=1)
-
-                    # 設定 Y 軸範圍固定，視覺上比較穩定
                     fig.update_yaxes(range=[-110, 110], row=2, col=1)
-
 
                     # --- Row 3: Alpha Slope ---
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope), row=3, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
-                    fig.add_hline(y=-60, line_width=1, line_dash="dash", line_color="#e040fb", annotation_text="崩跌警戒(-60)", row=3, col=1)
+                    # 顯示當前設定的崩跌警戒線
+                    current_sell_slope = st.session_state['strategy_params']['sell_slope']
+                    fig.add_hline(y=current_sell_slope, line_width=1, line_dash="dash", line_color="#e040fb", annotation_text=f"崩跌警戒({current_sell_slope})", row=3, col=1)
 
                     # --- Row 4: 成交量 ---
                     colors_vol = ['#ef5350' if row['Open'] < row['Close'] else '#26a69a' for idx, row in final_df.iterrows()]
@@ -2162,7 +2077,7 @@ elif page == "📊 單股深度分析":
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=30, y1=30, line=dict(color="green", dash="dot"), row=6, col=1)
                     fig.add_shape(type="line", x0=final_df['Date'].min(), x1=final_df['Date'].max(), y0=70, y1=70, line=dict(color="red", dash="dot"), row=6, col=1)
                     
-                    # --- Row 7: 均線糾結指數 (Congestion Index) ---
+                    # --- Row 7: 均線糾結指數 ---
                     colors_gap = []
                     for v in congestion_idx:
                         if v < 5: colors_gap.append('#ef5350') # 紅色警戒 (糾結)
@@ -2172,26 +2087,18 @@ elif page == "📊 單股深度分析":
                     fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Congestion_Index'], name='均線糾結指數(60日)', marker_color=colors_gap), row=7, col=1)
                     fig.add_hline(y=5, line_width=1, line_dash="dash", line_color="red", annotation_text="糾結警戒(5%)", row=7, col=1)
 
-                    # --- [新增] Row 8: 糾結度斜率 (Slope) ---
-                    # 綠色: 發散中 (Gap變大，趨勢加速)
-                    # 紅色: 收斂中 (Gap變小，趨勢休息)
+                    # --- Row 8: 糾結度斜率 ---
                     colors_cong_slope = ['#00e676' if v > 0 else '#ef5350' for v in final_df['Congestion_Slope']]
-                    fig.add_trace(go.Bar(
-                        x=final_df['Date'], 
-                        y=final_df['Congestion_Slope'], 
-                        name='差距變動(Slope)', 
-                        marker_color=colors_cong_slope
-                    ), row=8, col=1)
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Congestion_Slope'], name='差距變動(Slope)', marker_color=colors_cong_slope), row=8, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=8, col=1)
 
                     # Layout
                     fig.update_layout(height=1600, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
-                                                    legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
+                                        legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
                     fig.update_yaxes(side='right')
                     st.plotly_chart(fig, use_container_width=True)
 
-
-                # [Tab 2: 權益曲線] (保持不變)
+                # [Tab 2: 權益曲線]
                 with tab2:
                     fig_c = go.Figure()
                     fig_c.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Cum_Market'], name='買進持有 (Benchmark)', line=dict(color='gray', dash='dot')))
@@ -2206,8 +2113,8 @@ elif page == "📊 單股深度分析":
                         
                     fig_c.update_layout(template="plotly_dark", height=450, title="策略 vs 買持 績效對決", margin=dict(l=10, r=10, t=40, b=10))
                     st.plotly_chart(fig_c, use_container_width=True)
-                    
-                # [Tab 3: 因子有效性驗證] (原 Tab 4 移至此)
+                
+                # [Tab 3: 有效性驗證]
                 with tab3:
                     st.markdown("### 🧪 Alpha Score 預測力檢驗 (IC 分析)")
                     st.caption("此頁面分析歷史數據中「Alpha Score」與「未來股價表現」的統計相關性，驗證 AI 評分的預測能力。")
@@ -2274,7 +2181,8 @@ elif page == "📊 單股深度分析":
                         st.dataframe(display_table.T, use_container_width=True)
                     else:
                         st.warning("數據不足，無法進行統計驗證。")
-
+                        
+                                                
 
 
 # --- 頁面 3: 戰略雷達 (含資金流向與擴充清單) ---
