@@ -777,7 +777,7 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
     }
 
     # === 蒙地卡羅模擬 ===
-    n_trials = 200 
+    n_trials = 2000 
     best_ret = -999
     best_params = {}
     best_df = pd.DataFrame()
