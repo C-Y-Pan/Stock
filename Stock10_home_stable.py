@@ -3410,3 +3410,178 @@ elif page == "🧪 策略實驗室":
             }).applymap(color_alpha, subset=['Alpha']),
             use_container_width=True
         )
+
+# --- 頁面 6: 參數普適性研究 ---
+elif page == "🧬 參數普適性研究":
+    st.markdown("### 🧬 參數 DNA 實驗室：普適性 vs. 特異性")
+    st.caption("此模組將對多檔股票進行「深度參數擬合」，並統計各參數的分佈狀況，藉此釐清哪些邏輯是市場的鐵律（普適），哪些是需隨股性調整的變數（特異）。")
+
+    # 1. 輸入區塊
+    with st.expander("🛠️ 實驗樣本設定", expanded=True):
+        default_list = "2330 台積電\n2317 鴻海\n2454 聯發科\n2603 長榮\n1513 中興電\n3035 智原\n2382 廣達\n3231 緯創"
+        tickers_input = st.text_area("輸入股票代號 (每行一支，可含中文名稱)", value=default_list, height=150)
+        
+        c1, c2 = st.columns(2)
+        with c1:
+            start_d = st.date_input("回測開始日", value=datetime.today() - timedelta(days=365*2))
+        with c2:
+            end_d = st.date_input("回測結束日", value=datetime.today())
+
+        run_btn = st.button("🧬 啟動 DNA 定序 (多股參數優化)", type="primary")
+
+    # 2. 執行邏輯
+    if run_btn:
+        # 解析代號
+        tickers = [t.strip().split(" ")[0] for t in tickers_input.split('\n') if t.strip()]
+        
+        results_params = []
+        progress_bar = st.progress(0)
+        status_txt = st.empty()
+        
+        # 建立結果容器
+        collected_data = []
+
+        # --- 迴圈：對每一檔股票進行優化 ---
+        for i, ticker in enumerate(tickers):
+            status_txt.text(f"正在解析 ({i+1}/{len(tickers)})：{ticker} 的最佳參數基因...")
+            progress_bar.progress((i + 1) / len(tickers))
+            
+            # A. 獲取數據
+            raw_df, fmt_ticker = get_stock_data(ticker, start_d, end_d)
+            if raw_df.empty or len(raw_df) < 100:
+                continue
+                
+            name = get_stock_name(fmt_ticker)
+            
+            # B. 執行優化 (尋找該股的最佳參數)
+            # 這裡我們不開啟 Chip 策略以單純化變數，專注於 Alpha Score 的參數
+            best_p, _ = run_optimization(
+                raw_df, market_df, start_d, 
+                0.001425, 0.003, 
+                use_chip_strategy=False, 
+                use_strict_bear_exit=True
+            )
+            
+            if best_p:
+                # 記錄這檔股票的「基因」(最佳參數)
+                row = best_p.copy()
+                row['Code'] = ticker
+                row['Name'] = name
+                collected_data.append(row)
+
+        progress_bar.empty()
+        status_txt.empty()
+
+        if collected_data:
+            df_params = pd.DataFrame(collected_data)
+            
+            # 移除非參數的欄位，只保留數值型參數
+            exclude_cols = ['Code', 'Name', 'Return', 'Mult', 'RSI_Buy'] # Mult/RSI_Buy 通常固定或無用
+            param_cols = [c for c in df_params.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_params[c])]
+            
+            st.success(f"✅ 完成 {len(df_params)} 檔股票的參數定序！")
+            
+            # ==================================================
+            # 3. 視覺化分析：普適性 vs 特異性
+            # ==================================================
+            
+            # A. 參數變異數分析 (Coefficient of Variation)
+            # 變異係數 CV = 標準差 / 平均值 (取絕對值避免平均為0的問題)
+            # 我們這裡直接用 標準差 (Std) 來衡量離散程度，因為參數 Scale 大致相同 (-100~100)
+            
+            stats = df_params[param_cols].describe().T
+            stats['Std_Dev'] = stats['std']
+            stats['Range'] = stats['max'] - stats['min']
+            
+            # 定義：Std Dev < 10 為「普適參數」， > 15 為「特異參數」
+            universal_params = stats[stats['Std_Dev'] <= 10].index.tolist()
+            specific_params = stats[stats['Std_Dev'] > 10].index.tolist()
+            
+            # --- 報告區塊 ---
+            st.markdown("### 🔬 分析報告：市場定律與個股性格")
+            
+            c_uni, c_spec = st.columns(2)
+            
+            with c_uni:
+                st.info(f"🌍 **普適參數 (Universal Laws)**\n\n"
+                        f"這些參數在不同股票間差異極小，代表**市場的共同語言** (標準差 <= 10)。")
+                for p in universal_params:
+                    mean_val = stats.loc[p, 'mean']
+                    st.markdown(f"- **{p}**: 平均值 `{mean_val:.1f}`")
+            
+            with c_spec:
+                st.warning(f"🎭 **特異參數 (Idiosyncratic Factors)**\n\n"
+                           f"這些參數隨股性劇烈變化，是**區分個股性格的關鍵** (標準差 > 10)。")
+                for p in specific_params:
+                    std_val = stats.loc[p, 'std']
+                    st.markdown(f"- **{p}**: 波動程度 `{std_val:.1f}`")
+
+            st.markdown("---")
+
+            # B. 箱型圖比較 (Box Plot)
+            st.markdown("#### 📊 參數分佈箱型圖 (Box Plot Comparison)")
+            st.caption("箱子越窄 = 參數越穩定 (普適)；箱子越寬 = 參數越因股而異 (特異)")
+            
+            fig_box = go.Figure()
+            
+            # 根據平均值排序，讓圖表更整齊
+            sorted_params = stats.sort_values(by='mean', ascending=False).index
+            
+            for col in sorted_params:
+                # 區分顏色：特異參數用紅色，普適參數用綠色
+                color = '#ef5350' if col in specific_params else '#00e676'
+                
+                fig_box.add_trace(go.Box(
+                    y=df_params[col],
+                    name=col,
+                    boxpoints='all', # 顯示所有點
+                    jitter=0.3,
+                    pointpos=-1.8,
+                    marker_color=color,
+                    boxmean=True # 顯示平均線
+                ))
+            
+            fig_box.update_layout(
+                template="plotly_dark",
+                height=600,
+                xaxis_title="策略參數",
+                yaxis_title="最佳化數值 (Weight/Threshold)",
+                showlegend=False,
+                margin=dict(l=40, r=40, t=40, b=40)
+            )
+            st.plotly_chart(fig_box, use_container_width=True)
+
+            # C. 熱力圖 (Heatmap) - 讓使用者看到每一檔股票的具體數值
+            st.markdown("#### 🔥 參數基因熱力圖 (Stock-Parameter Heatmap)")
+            st.caption("縱軸為股票，橫軸為參數。顏色越紅代表正權重越高，越綠代表負權重越重。")
+            
+            # 準備熱力圖數據
+            z_data = df_params[sorted_params].values
+            x_labels = sorted_params
+            y_labels = df_params['Name'] + " (" + df_params['Code'] + ")"
+            
+            fig_heat = go.Figure(data=go.Heatmap(
+                z=z_data,
+                x=x_labels,
+                y=y_labels,
+                colorscale='RdBu_r', # 紅綠/紅藍配色，中間白
+                zmid=0, # 設定 0 為中間色
+                colorbar=dict(title="參數值")
+            ))
+            
+            fig_heat.update_layout(
+                template="plotly_dark",
+                height=max(400, len(tickers) * 30), # 自動調整高度
+                margin=dict(l=150, r=40, t=40, b=40)
+            )
+            st.plotly_chart(fig_heat, use_container_width=True)
+
+            # D. 詳細數據表
+            with st.expander("📄 查看原始數據表"):
+                st.dataframe(
+                    df_params.style.background_gradient(cmap='RdBu_r', subset=param_cols, vmin=-50, vmax=50)
+                             .format("{:.1f}", subset=param_cols),
+                    use_container_width=True
+                )
+        else:
+            st.error("無有效數據生成。")
