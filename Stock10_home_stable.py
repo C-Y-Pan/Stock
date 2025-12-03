@@ -39,15 +39,19 @@ import sqlite3
 import hashlib
 
 # ==========================================
-# [新增] 強制清理舊參數 (防止舊邏輯殘留)
+# [強制清理] 移除舊參數鍵值
 # ==========================================
 if 'strategy_params' in st.session_state:
-    # 如果這些舊 Key 還在，就把它們刪掉
-    if 'buy_consecutive_sum' in st.session_state['strategy_params']:
-        del st.session_state['strategy_params']['buy_consecutive_sum']
-    if 'sell_slope' in st.session_state['strategy_params']:
-        del st.session_state['strategy_params']['sell_slope']
-
+    # 強制刪除這兩個 Key，確保程式讀不到它們
+    st.session_state['strategy_params'].pop('buy_consecutive_sum', None)
+    st.session_state['strategy_params'].pop('sell_slope', None)
+    
+    # 也順便清理 widget 的暫存
+    if 'widget_buy_consecutive_sum' in st.session_state:
+        del st.session_state['widget_buy_consecutive_sum']
+    if 'widget_sell_slope' in st.session_state:
+        del st.session_state['widget_sell_slope']
+        
 # ==========================================
 # 資料庫管理模組 (SQLite)
 # ==========================================
@@ -717,10 +721,8 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, params=None):
     """
-    執行策略 v17 (簡化版):
-    - 移除「連兩日合」買進條件。
-    - 移除「斜率」賣出條件。
-    - 僅保留「單日爆發」買進與「絕對分值」賣出。
+    執行策略 v18 (最終淨化版):
+    已徹底移除 buy_sum_thresh (連2日) 與 sell_slope_thresh (斜率) 的所有參照。
     """
     # 1. 計算分數
     df = calculate_alpha_score(data, params=params)
@@ -728,12 +730,11 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
     if 'Dividends' not in df.columns: df['Dividends'] = 0.0
     df['Dividends'] = df['Dividends'].fillna(0.0)
     
-    # --- 預設參數 (已移除 buy_consecutive_sum 與 sell_slope) ---
+    # --- 參數讀取 (只讀取這兩項，其他完全忽略) ---
     buy_single_thresh = 40
     sell_alpha_thresh = -40
-    
-    # 讀取 params
     use_adaptive = True 
+
     if params:
         buy_single_thresh = params.get('buy_single_day', 40)
         sell_alpha_thresh = params.get('sell_threshold', -40)
@@ -759,18 +760,17 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
         ret_label = ""; conf_score = 0
         
         # --- 動態門檻計算 ---
-        # 僅調整 buy_single_thresh
         threshold_multiplier = 1.0
         if use_adaptive:
             threshold_multiplier = max(0.8, min(1.5, vol_regime[i]))
             
         current_buy_single = buy_single_thresh * threshold_multiplier
         
-        # --- 買入邏輯 (僅剩單日爆發) ---
+        # --- 買入邏輯 (只剩單日爆發) ---
         if position == 0:
             is_buy = False
             
-            # 判定：單日 Alpha >= 門檻
+            # [修正確認] 這裡絕對不能出現 cond1 (連兩日) 的判斷
             if alpha[i] >= current_buy_single:
                 is_buy = True; reason_str = f"強勢爆發 (Score>{current_buy_single:.1f})"
                 conf_score = 90
@@ -779,7 +779,7 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
                 signal = 1; entry_price = close[i]; action_code = "Buy"
                 cum_div = 0.0
         
-        # --- 賣出邏輯 (移除斜率判定) ---
+        # --- 賣出邏輯 (只剩絕對閾值) ---
         elif position == 1:
             if dividends[i] > 0: cum_div += dividends[i]
             adjusted_current_value = close[i] + cum_div
@@ -787,17 +787,15 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
             
             is_sell = False
             
-            # 1. Alpha 絕對值轉弱 (不再看 Slope)
+            # [修正確認] 這裡絕對不能有 slope 的判斷
             cond_sell_alpha = (alpha[i] <= sell_alpha_thresh)
             
-            # 2. 硬停損 (15%)
             stop_loss_limit = -0.15 
             
             if cond_sell_alpha:
                 is_sell = True; reason_str = f"Alpha轉弱 (Score<{sell_alpha_thresh})"
             elif drawdown < stop_loss_limit:
                 is_sell = True; reason_str = f"觸發硬停損({stop_loss_limit*100:.0f}%)"
-            # 3. 長空破線強制出場
             elif use_strict_bear_exit and (close[i] < ma20[i]) and (ma20[i] < ma60[i]):
                  is_sell = True; reason_str = "長空破月線"
 
@@ -2010,12 +2008,14 @@ elif page == "📊 單股深度分析":
             st.markdown("---")
 
             # ========================================================
-            # [修正重點] Group 1: 買賣門檻 (強制改為 2 欄，移除舊參數)
+            # [修正重點] Group 1: 買賣門檻 (強制改為 2 欄，徹底移除舊參數)
             # ========================================================
             st.caption("🎯 買賣訊號門檻 (僅保留單日爆發與絕對停損)")
+            
+            # 這裡原本是 st.columns(4)，現在強制改為 st.columns(2)
             c1, c2 = st.columns(2)
             
-            # 這裡只留下 'buy_single_day' 和 'sell_threshold'
+            # 只保留 'buy_single_day' 和 'sell_threshold'
             with c1: 
                 st.number_input(
                     "買入 (單日爆發 Alpha >=)", -100, 200, 
@@ -2028,7 +2028,7 @@ elif page == "📊 單股深度分析":
                     st.session_state['strategy_params'].get('sell_threshold', -40), 5, 
                     key="widget_sell_threshold", on_change=update_param, args=('sell_threshold',)
                 )
-
+                
             # Group 2: 趨勢權重 (Trend Weights) - 維持不變
             st.caption("⚖️ 趨勢權重 (Trend Weights)")
 
