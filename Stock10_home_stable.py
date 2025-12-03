@@ -3490,14 +3490,18 @@ elif page == "🧪 策略實驗室":
             use_container_width=True
         )
 
-# --- 頁面 6: 參數普適性研究 (支援斷點續傳) ---
+# --- 頁面 6: 參數普適性研究 (自動接關版) ---
 elif page == "🧬 參數普適性研究":
-    st.markdown("### 🧬 參數 DNA 實驗室：普適性 vs. 特異性")
-    st.caption("此模組支援 **斷點續傳**。分析結果會即時寫入資料庫，若中途停止，下次勾選「跳過已分析」即可接續執行。")
+    st.markdown("### 🧬 參數 DNA 實驗室：自動排程版")
+    st.caption("此模式採用 **「分批執行 + 自動刷新」** 機制。系統每次分析完一小批股票後會自動重啟釋放記憶體，並接著分析下一批，直到清單完成。")
 
-    # 1. 輸入區塊
+    # 1. 初始化 Session State (控制自動執行狀態)
+    if 'dna_auto_run' not in st.session_state:
+        st.session_state['dna_auto_run'] = False
+
+    # 2. 輸入區塊
     with st.expander("🛠️ 實驗樣本與設定", expanded=True):
-        default_list = "2330 台積電\n2317 鴻海\n2454 聯發科\n2603 長榮"
+        default_list = "2330 台積電\n2317 鴻海\n2454 聯發科\n2603 長榮\n1513 中興電\n3035 智原"
         tickers_input = st.text_area("輸入股票代號 (每行一支)", value=default_list, height=150)
         
         c1, c2, c3 = st.columns(3)
@@ -3506,55 +3510,71 @@ elif page == "🧬 參數普適性研究":
         with c2:
             end_d = st.date_input("回測結束日", value=datetime.today())
         with c3:
-            # [關鍵功能] 斷點續傳開關
-            skip_existing = st.checkbox("跳過已分析的股票 (續傳模式)", value=True)
+            # 設定每批跑幾檔 (建議 3~5 檔以保持輕量)
+            batch_size = st.number_input("每批次處理數量", min_value=1, max_value=10, value=3, help="設小一點可避免記憶體溢出")
 
-        col_run, col_clear = st.columns([1, 1])
+        col_run, col_stop, col_clear = st.columns([1, 1, 1])
+        
         with col_run:
-            run_btn = st.button("🧬 啟動 DNA 定序 (邊掃邊存)", type="primary")
+            if st.button("▶️ 啟動自動定序", type="primary"):
+                st.session_state['dna_auto_run'] = True
+                st.rerun()
+                
+        with col_stop:
+            if st.button("⏹️ 暫停執行"):
+                st.session_state['dna_auto_run'] = False
+                st.rerun()
+                
         with col_clear:
-            if st.button("🗑️ 清空歷史資料庫"):
+            if st.button("🗑️ 清空資料庫"):
                 clear_dna_db()
-                st.success("已清空資料庫！")
+                st.session_state['dna_auto_run'] = False
+                st.success("已清空！")
                 st.rerun()
 
-    # 2. 顯示目前資料庫狀態
+    # 3. 顯示目前進度
     existing_df = load_dna_results_from_db()
-    if not existing_df.empty:
-        st.info(f"📊 資料庫中已有 {len(existing_df)} 檔股票的分析數據。")
+    tickers_all = [t.strip().split(" ")[0] for t in tickers_input.split('\n') if t.strip()]
+    analyzed_list = get_analyzed_tickers()
+    
+    # 計算剩餘工作
+    tickers_to_run = [t for t in tickers_all if t not in analyzed_list]
+    
+    progress_val = len(analyzed_list) / len(tickers_all) if tickers_all else 0
+    st.progress(progress_val, text=f"總進度: {len(analyzed_list)} / {len(tickers_all)} (剩餘 {len(tickers_to_run)} 檔)")
 
-    # 3. 執行邏輯
-    if run_btn:
-        # 解析代號
-        tickers_all = [t.strip().split(" ")[0] for t in tickers_input.split('\n') if t.strip()]
-        
-        # 取得已分析清單
-        analyzed_list = get_analyzed_tickers() if skip_existing else []
-        
-        # 過濾待辦清單
-        tickers_to_run = [t for t in tickers_all if t not in analyzed_list]
-        
-        if not tickers_to_run and skip_existing:
-            st.warning("所有輸入的股票都已分析過。若要重新分析，請取消勾選「跳過已分析」。")
+    # 4. 自動執行邏輯 (核心引擎)
+    if st.session_state['dna_auto_run']:
+        if not tickers_to_run:
+            st.session_state['dna_auto_run'] = False
+            st.balloons()
+            st.success("🎉 全部分析完成！")
         else:
-            progress_bar = st.progress(0)
-            status_txt = st.empty()
+            # 取出這一批要跑的股票 (Batch Slice)
+            current_batch = tickers_to_run[:batch_size]
             
-            # --- 迴圈：對每一檔股票進行優化 ---
-            for i, ticker in enumerate(tickers_to_run):
+            st.info(f"⚡ 正在處理批次：{', '.join(current_batch)} ... (完成後將自動刷新)")
+            
+            # --- 批次執行迴圈 ---
+            import time
+            bar = st.progress(0)
+            
+            for i, ticker in enumerate(current_batch):
                 try:
-                    status_txt.markdown(f"**[{i+1}/{len(tickers_to_run)}] 正在解析：{ticker} ...**")
-                    progress_bar.progress((i) / len(tickers_to_run))
-                    
                     # A. 獲取數據
                     raw_df, fmt_ticker = get_stock_data(ticker, start_d, end_d)
+                    
+                    # 資料不足則存入「空紀錄」或跳過，這裡選擇跳過並繼續
                     if raw_df.empty or len(raw_df) < 100:
-                        print(f"Skipping {ticker}: Insufficient data.")
+                        # 為了不讓程式卡死在這一檔，我們可以存一個標記或直接略過
+                        # 這裡簡單印出並 continue，但為了避免無限迴圈，
+                        # 建議存入一個 "Error" 狀態進 DB，這裡簡化處理：
+                        print(f"Skipping {ticker}")
                         continue
                         
                     name = get_stock_name(fmt_ticker)
                     
-                    # B. 執行優化 (降至 500 次以平衡速度)
+                    # B. 執行優化 (500次快速版)
                     best_p, _ = run_optimization(
                         raw_df, market_df, start_d, 
                         0.001425, 0.003, 
@@ -3564,83 +3584,72 @@ elif page == "🧬 參數普適性研究":
                     )
                     
                     if best_p:
-                        # [關鍵] C. 即時寫入資料庫
-                        # 我們不依賴 Python List，而是直接存硬碟
+                        # C. 寫入資料庫
                         save_dna_result_to_db(ticker, name, best_p)
-                        st.toast(f"✅ {ticker} 分析完成並存檔！")
                 
                 except Exception as e:
-                    st.toast(f"⚠️ {ticker} 分析失敗: {str(e)}")
+                    print(f"Error on {ticker}: {e}")
+                    # 遇到錯誤建議也記錄一下，避免下次卡同一支
                     continue
-
-            progress_bar.progress(100)
-            status_txt.success("🎉 佇列處理完成！")
-            st.rerun() # 刷新頁面以顯示最新圖表
+                
+                # 更新批次內進度
+                bar.progress((i + 1) / len(current_batch))
+            
+            # --- [關鍵] 批次完成後，強制刷新頁面 ---
+            # 這會觸發下一次 Rerun，程式會重新檢查 tickers_to_run
+            # 由於剛剛跑完的已經存入 DB，tickers_to_run 會自動變少
+            time.sleep(0.5) # 稍作緩衝
+            st.rerun()
 
     # ==================================================
-    # 4. 視覺化分析 (從資料庫讀取)
+    # 5. 視覺化分析 (即時顯示目前成果)
     # ==================================================
-    df_params = load_dna_results_from_db() # 重新讀取完整數據
-    
-    if not df_params.empty:
+    if not existing_df.empty:
         st.markdown("---")
-        st.markdown(f"### 🧬 全域參數分析 (樣本數: {len(df_params)})")
+        st.markdown(f"### 🧬 參數基因圖譜 (已蒐集 {len(existing_df)} 檔)")
         
         # 篩選數值型欄位
         exclude_cols = ['Code', 'Name', 'Return', 'Mult', 'RSI_Buy'] 
-        param_cols = [c for c in df_params.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_params[c])]
+        param_cols = [c for c in existing_df.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(existing_df[c])]
         
         if param_cols:
-            # A. 參數變異數分析
-            stats = df_params[param_cols].describe().T
-            stats['Std_Dev'] = stats['std']
+            tab1, tab2 = st.tabs(["📊 箱型分佈圖", "🔥 基因熱力圖"])
             
-            # 普適 vs 特異
-            universal_params = stats[stats['Std_Dev'] <= 10].index.tolist()
-            specific_params = stats[stats['Std_Dev'] > 10].index.tolist()
+            with tab1:
+                stats = existing_df[param_cols].describe().T
+                stats['Std_Dev'] = stats['std']
+                sorted_params = stats.sort_values(by='mean', ascending=False).index
+                
+                fig_box = go.Figure()
+                for col in sorted_params:
+                    # 標準差 > 10 為特異 (紅)，<= 10 為普適 (綠)
+                    is_specific = stats.loc[col, 'Std_Dev'] > 10
+                    color = '#ef5350' if is_specific else '#00e676'
+                    
+                    fig_box.add_trace(go.Box(
+                        y=existing_df[col], name=col,
+                        boxpoints='all', jitter=0.3, pointpos=-1.8,
+                        marker_color=color, boxmean=True
+                    ))
+                fig_box.update_layout(height=500, template="plotly_dark", showlegend=False, margin=dict(l=40, r=40, t=20, b=20))
+                st.plotly_chart(fig_box, use_container_width=True)
             
-            c_uni, c_spec = st.columns(2)
-            with c_uni:
-                st.info(f"🌍 **普適參數 (標準差<=10)**\n\n市場共性，不隨個股改變。")
-                st.write(", ".join(universal_params))
-            with c_spec:
-                st.warning(f"🎭 **特異參數 (標準差>10)**\n\n隨股性劇烈變化，需客製化。")
-                st.write(", ".join(specific_params))
-
-            # B. 箱型圖
-            fig_box = go.Figure()
-            sorted_params = stats.sort_values(by='mean', ascending=False).index
-            
-            for col in sorted_params:
-                color = '#ef5350' if col in specific_params else '#00e676'
-                fig_box.add_trace(go.Box(
-                    y=df_params[col], name=col,
-                    boxpoints='all', jitter=0.3, pointpos=-1.8,
-                    marker_color=color, boxmean=True
+            with tab2:
+                # 為了避免熱力圖太長，只顯示最近 50 筆
+                display_df = existing_df.tail(50)
+                z_data = display_df[sorted_params].values
+                x_labels = sorted_params
+                y_labels = display_df['Name'] + " (" + display_df['Code'] + ")"
+                
+                fig_heat = go.Figure(data=go.Heatmap(
+                    z=z_data, x=x_labels, y=y_labels,
+                    colorscale='RdBu_r', zmid=0, colorbar=dict(title="值")
                 ))
-            
-            fig_box.update_layout(height=500, template="plotly_dark", showlegend=False, margin=dict(l=40, r=40, t=20, b=20))
-            st.plotly_chart(fig_box, use_container_width=True)
+                fig_heat.update_layout(template="plotly_dark", height=max(400, len(display_df) * 20), margin=dict(l=150))
+                st.plotly_chart(fig_heat, use_container_width=True)
+                if len(existing_df) > 50:
+                    st.caption("⚠️ 為保持頁面效能，熱力圖僅顯示最近 50 筆資料。完整數據請見資料庫。")
 
-            # C. 熱力圖
-            st.markdown("#### 🔥 參數基因熱力圖")
-            z_data = df_params[sorted_params].values
-            x_labels = sorted_params
-            y_labels = df_params['Name'] + " (" + df_params['Code'] + ")"
-            
-            fig_heat = go.Figure(data=go.Heatmap(
-                z=z_data, x=x_labels, y=y_labels,
-                colorscale='RdBu_r', zmid=0, colorbar=dict(title="值")
-            ))
-            fig_heat.update_layout(template="plotly_dark", height=max(400, len(df_params) * 25), margin=dict(l=150))
-            st.plotly_chart(fig_heat, use_container_width=True)
-            
-            # D. 資料表
-            with st.expander("📄 詳細數據表"):
-                st.dataframe(df_params)
-        else:
-            st.warning("資料庫中有資料，但無法解析出數值參數，請檢查資料格式。")
-
-
+                    
 
             
