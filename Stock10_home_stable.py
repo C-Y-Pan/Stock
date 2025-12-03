@@ -1974,7 +1974,7 @@ elif page == "📊 單股深度分析":
 
             st.markdown("---")
             
-# --- 參數輸入區 (雙向綁定 Session State) ---
+            # --- 參數輸入區 (雙向綁定 Session State) ---
             def update_param(key):
                 st.session_state['strategy_params'][key] = st.session_state[f"widget_{key}"]
 
@@ -1984,7 +1984,7 @@ elif page == "📊 單股深度分析":
             with c_adapt:
                 # 確保 session state 有初始值
                 if 'use_adaptive' not in st.session_state['strategy_params']:
-                    st.session_state['strategy_params']['use_adaptive'] = False
+                    st.session_state['strategy_params']['use_adaptive'] = True
                 
                 enable_adaptive = st.toggle(
                     "啟用波動率自適應門檻 (Volatility Adaptive)", 
@@ -1993,15 +1993,19 @@ elif page == "📊 單股深度分析":
                     on_change=update_param, args=('use_adaptive',)
                 )
                 if enable_adaptive:
-                    st.caption("✅ 已啟用：系統將依據 ATR 波動率自動調控買賣門檻。高波動時更保守，低波動時更積極。")
+                    st.caption("✅ 已啟用：系統將依據 ATR 波動率自動調控買賣門檻。")
                 else:
                     st.caption("⚪ 未啟用：使用下方設定的固定門檻。")
             
             st.markdown("---")
 
-            # Group 1: 買賣門檻
-            st.caption("🎯 買賣訊號門檻")
+            # ========================================================
+            # [修正重點] Group 1: 買賣門檻 (強制改為 2 欄，移除舊參數)
+            # ========================================================
+            st.caption("🎯 買賣訊號門檻 (僅保留單日爆發與絕對停損)")
             c1, c2 = st.columns(2)
+            
+            # 這裡只留下 'buy_single_day' 和 'sell_threshold'
             with c1: 
                 st.number_input(
                     "買入 (單日爆發 Alpha >=)", -100, 200, 
@@ -2014,7 +2018,11 @@ elif page == "📊 單股深度分析":
                     st.session_state['strategy_params'].get('sell_threshold', -40), 5, 
                     key="widget_sell_threshold", on_change=update_param, args=('sell_threshold',)
                 )
-                
+
+            # Group 2: 趨勢權重 (Trend Weights) - 維持不變
+            st.caption("⚖️ 趨勢權重 (Trend Weights)")
+
+
             # Group 2: 趨勢權重
             st.caption("⚖️ 趨勢權重 (Trend Weights)")
             c1, c2, c3, c4 = st.columns(4)
