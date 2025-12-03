@@ -996,16 +996,18 @@ def analyze_signal(final_df):
 
 
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - v15.1 (修正 KeyError)
+# 5. [核心演算法] 買賣評等 - v15.2 (修正懸浮顯示)
 # ==========================================
-def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
+def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, generate_detail=True):
     """
-    Alpha Score v15.1:
-    修正：補回 Recommended_Position 欄位，解決 Dashboard KeyError。
+    Alpha Score v15.2:
+    新增 generate_detail 參數。
+    - 在 UI 顯示時設為 True，生成詳細 HTML 供游標懸浮顯示。
+    - 在 AI 訓練迴圈時設為 False，加速運算。
     """
     df = df.copy()
 
-    # --- 1. 定義權重 (若無 params 則使用預設值) ---
+    # --- 1. 定義權重 ---
     weights = {
         'w_price_gt_ma20': 20, 'w_price_lt_ma20': -20,
         'w_price_gt_ma60': 15, 'w_price_lt_ma60': -15,
@@ -1047,65 +1049,81 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
     # --- 3. 評分迴圈 ---
     for i in range(len(df)):
         score = 0
-        reasons = [] 
+        
+        # 僅在需要顯示詳細資訊時才收集理由字串 (節省記憶體與時間)
+        reasons = [] if generate_detail else None
         
         # A. 趨勢面
         if close[i] > ma20[i]:
-            score += weights['w_price_gt_ma20']; reasons.append(f"股價>月線 ({weights['w_price_gt_ma20']:+})")
+            score += weights['w_price_gt_ma20']
+            if generate_detail: reasons.append(f"股價>月線 ({weights['w_price_gt_ma20']:+})")
         else:
-            score += weights['w_price_lt_ma20']; reasons.append(f"股價破月線 ({weights['w_price_lt_ma20']:+})")
+            score += weights['w_price_lt_ma20']
+            if generate_detail: reasons.append(f"股價破月線 ({weights['w_price_lt_ma20']:+})")
             
         if close[i] > ma60[i]:
-            score += weights['w_price_gt_ma60']; reasons.append(f"股價>季線 ({weights['w_price_gt_ma60']:+})")
+            score += weights['w_price_gt_ma60']
+            if generate_detail: reasons.append(f"股價>季線 ({weights['w_price_gt_ma60']:+})")
         else:
-            score += weights['w_price_lt_ma60']; reasons.append(f"股價破季線 ({weights['w_price_lt_ma60']:+})")
+            score += weights['w_price_lt_ma60']
+            if generate_detail: reasons.append(f"股價破季線 ({weights['w_price_lt_ma60']:+})")
             
         if ma20[i] > ma60[i]:
-            score += weights['w_ma_bull']; reasons.append(f"均線多頭 ({weights['w_ma_bull']:+})")
+            score += weights['w_ma_bull']
+            if generate_detail: reasons.append(f"均線多頭 ({weights['w_ma_bull']:+})")
         elif ma20[i] < ma60[i]:
-            score += weights['w_ma_bear']; reasons.append(f"均線空頭 ({weights['w_ma_bear']:+})")
+            score += weights['w_ma_bear']
+            if generate_detail: reasons.append(f"均線空頭 ({weights['w_ma_bear']:+})")
 
         if close[i] < super_trend[i]:
-            score += weights['w_break_supertrend']; reasons.append(f"跌破停損線 ({weights['w_break_supertrend']:+})")
+            score += weights['w_break_supertrend']
+            if generate_detail: reasons.append(f"跌破停損線 ({weights['w_break_supertrend']:+})")
 
         # B. 動能面
         r_val = rsi[i]
         if r_val >= 60:
-            score += weights['w_rsi_strong']; reasons.append(f"RSI強勢 ({weights['w_rsi_strong']:+})")
+            score += weights['w_rsi_strong']
+            if generate_detail: reasons.append(f"RSI強勢 ({weights['w_rsi_strong']:+})")
         elif 50 <= r_val < 60:
-            score += weights['w_rsi_bull']; reasons.append(f"RSI多方 ({weights['w_rsi_bull']:+})")
+            score += weights['w_rsi_bull']
+            if generate_detail: reasons.append(f"RSI多方 ({weights['w_rsi_bull']:+})")
         elif r_val < 30:
-            score += weights['w_rsi_oversold']; reasons.append(f"RSI超賣 ({weights['w_rsi_oversold']:+})")
+            score += weights['w_rsi_oversold']
+            if generate_detail: reasons.append(f"RSI超賣 ({weights['w_rsi_oversold']:+})")
         else: 
-            score += weights['w_rsi_weak']; reasons.append(f"RSI弱勢 ({weights['w_rsi_weak']:+})")
+            score += weights['w_rsi_weak']
+            if generate_detail: reasons.append(f"RSI弱勢 ({weights['w_rsi_weak']:+})")
             
         if i > 0 and rsi[i] > rsi[i-1]:
-            score += weights['w_momentum_up']; reasons.append(f"動能增強 ({weights['w_momentum_up']:+})")
+            score += weights['w_momentum_up']
+            if generate_detail: reasons.append(f"動能增強 ({weights['w_momentum_up']:+})")
 
-        # C. 量價 
+        # C. 量價
         if vol[i] > vol_ma[i]:
-            if close[i] > op[i]: score += 10; reasons.append("出量上漲 (+10)")
-            else: score -= 10; reasons.append("出量下跌 (-10)")
+            if close[i] > op[i]: 
+                score += 10
+                if generate_detail: reasons.append("出量上漲 (+10)")
+            else: 
+                score -= 10
+                if generate_detail: reasons.append("出量下跌 (-10)")
 
         # D. 黃金坑
         if r_val < 30 and ma240_slope[i] > 0:
              restore = abs(min(score, 0)) 
              score += restore
              score += weights['w_golden_pit']
-             reasons.append(f"<b>💎 牛市黃金坑 ({weights['w_golden_pit']:+})</b>")
+             if generate_detail: reasons.append(f"<b>💎 牛市黃金坑 ({weights['w_golden_pit']:+})</b>")
 
         # E. 輸出
         final_score = max(min(score, 100), -100)
         final_scores.append(final_score)
         
-        if params is None:
+        # [關鍵修正] 只要 generate_detail 為 True 就生成 HTML，不管有沒有 params
+        if generate_detail:
             title_color = "#ff5252" if final_score > 0 else "#00e676"
-            html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
-            formatted_reasons = []
-            for r in reasons:
-                if "(+" in r: formatted_reasons.append(f"<span style='color:#ff8a80'>{r}</span>")
-                else: formatted_reasons.append(f"<span style='color:#b9f6ca'>{r}</span>")
-            html_str += "<br>".join(formatted_reasons)
+            # 這裡使用簡單的 HTML 格式供 Plotly hover 使用
+            html_str = f"<b>Alpha Score: {int(final_score)}</b><br>"
+            html_str += "<br>".join(reasons)
             score_details.append(html_str)
         else:
             score_details.append("")
@@ -1120,10 +1138,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
     choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 震盪盤整", "⚡ 極弱勢", "📉 空頭修正"]
     df['Score_Log'] = np.select(conditions, choices, default="☁️ 觀望")
     
-    # [關鍵修正] 補回這一行：計算建議持股水位 (0~100%)
     df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
     
     return df
+
 
 
 
@@ -2181,8 +2199,8 @@ elif page == "📊 單股深度分析":
                         st.dataframe(display_table.T, use_container_width=True)
                     else:
                         st.warning("數據不足，無法進行統計驗證。")
-                        
-                                                                        
+
+
 
 
 # --- 頁面 3: 戰略雷達 (含資金流向與擴充清單) ---
