@@ -855,6 +855,78 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
     return best_params, best_df
 
 
+def analyze_parameter_personality(best_params):
+    """
+    [核心 AI 邏輯] 股性解碼器
+    根據最佳參數組合，逆向推導該股票的市場特性，並生成操作建議。
+    """
+    # 1. 定義維度得分 (初始化)
+    scores = {
+        "趨勢慣性 (Trend)": 0,    # 是否沿著均線走
+        "動能爆發 (Momentum)": 0, # 是否適合突破追價
+        "逆勢反彈 (Rebound)": 0,  # 是否適合抄底
+        "風險敏感 (Risk)": 0      # 是否需要極窄停損
+    }
+    
+    # 2. 權重解析 (將參數映射到維度)
+    # 數值正規化：將參數值映射到 0~100 的相對強度
+    
+    # A. 趨勢慣性：看均線權重
+    s_trend = (best_params.get('w_price_gt_ma20', 0) + best_params.get('w_price_gt_ma60', 0) + best_params.get('w_ma_bull', 0))
+    scores["趨勢慣性 (Trend)"] = min(100, max(0, s_trend * 1.5))
+    
+    # B. 動能爆發：看 RSI強勢區、單日買入閾值、RVOL權重
+    s_mom = (best_params.get('w_rsi_strong', 0) + best_params.get('w_momentum_up', 0) + best_params.get('w_rvol_spike', 0))
+    # 如果單日買入閾值低(好買)，代表AI傾向頻繁進出捕捉動能
+    s_mom += (100 - best_params.get('buy_single_day', 40)) * 0.5 
+    scores["動能爆發 (Momentum)"] = min(100, max(0, s_mom * 1.8))
+    
+    # C. 逆勢反彈：看黃金坑、RSI超賣
+    s_reb = (best_params.get('w_golden_pit', 0) + abs(best_params.get('w_rsi_oversold', 0)))
+    scores["逆勢反彈 (Rebound)"] = min(100, max(0, s_reb * 2.0))
+    
+    # D. 風險敏感：看賣出閾值 (閾值越高代表越快止損)、波動懲罰
+    s_risk = abs(best_params.get('w_vol_penalty', 0)) + (best_params.get('sell_threshold', -40) + 100) * 0.5
+    scores["風險敏感 (Risk)"] = min(100, max(0, s_risk))
+    
+    # 3. 判定主要性格 (Dominant Trait)
+    dominant_trait = max(scores, key=scores.get)
+    
+    # 4. 生成深度建議 (AI Advisory)
+    advice_text = ""
+    strategy_tag = ""
+    
+    if dominant_trait == "趨勢慣性 (Trend)":
+        strategy_tag = "🐂 趨勢波段型 (Trend Follower)"
+        advice_text = (
+            "此股具有極強的均線慣性，股價容易沿著月/季線波段運行。\n"
+            "• **操作建議**：不宜過度頻繁進出。最佳買點為「回測月線不破」或「均線剛發散」時。\n"
+            "• **持有心法**：只要均線多頭排列未被破壞，應採取「抱緊處理 (Buy & Hold)」策略，吃到完整魚身。"
+        )
+    elif dominant_trait == "動能爆發 (Momentum)":
+        strategy_tag = "🚀 動能狙擊型 (Momentum Sniper)"
+        advice_text = (
+            "此股股性活潑，AI 發現其對「突破」、「爆量」與「RSI高檔鈍化」反應最劇烈。\n"
+            "• **操作建議**：適合「追漲殺跌」。看到出量長紅或突破前高時，應果斷進場，不要等待回調（可能不回頭）。\n"
+            "• **持有心法**：嚴設移動停損，動能一轉弱（如量縮不漲）即刻離場，不戀戰。"
+        )
+    elif dominant_trait == "逆勢反彈 (Rebound)":
+        strategy_tag = "💎 價值反轉型 (Mean Reversion)"
+        advice_text = (
+            "此股經常出現假突破，追高容易受傷。AI 發現最佳獲利來自於「黃金坑」或「超賣」訊號。\n"
+            "• **操作建議**：絕對**禁止追高**。耐心等待股價急跌、乖離過大或 RSI < 30 時，採取「人棄我取」策略逆勢建倉。\n"
+            "• **持有心法**：獲利目標設為均線回歸（如反彈至月線）即可分批出場。"
+        )
+    else: # 風險敏感
+        strategy_tag = "🛡️ 防禦嚴謹型 (Risk Averse)"
+        advice_text = (
+            "此股波動雜訊極大（可能為妖股或主力洗盤嚴重），AI 建議採取極高標準的風控模型。\n"
+            "• **操作建議**：必須等待所有指標（量、價、籌碼）共振才出手。寧可錯過，不可做錯。\n"
+            "• **持有心法**：一有風吹草動（如跌破昨日低點）立即砍單，保本為上。"
+        )
+        
+    return scores, strategy_tag, advice_text
+
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
     """
@@ -1470,7 +1542,7 @@ def draw_market_dashboard(market_df, start_date, end_date):
     st.plotly_chart(fig, use_container_width=True)
 
 
-    
+
 def send_analysis_email(df, market_analysis_text):
     if df.empty: return False
 
@@ -1760,40 +1832,94 @@ elif page == "📊 單股深度分析":
             with c_opt:
                 # 定義一鍵優化按鈕邏輯
                 if st.button("✨ AI 一鍵擬合 (尋找最佳參數)", type="primary", use_container_width=True):
-                    with st.spinner(f"正在對 {ticker_input} 進行蒙地卡羅參數演化..."):
-                        # 獲取資料 (用於優化)
+                    with st.spinner(f"正在對 {ticker_input} 進行蒙地卡羅參數演化與股性解碼..."):
+                        # A. 獲取資料
                         raw_df_opt, _ = get_stock_data(ticker_input, start_date, end_date)
+                        
                         if not raw_df_opt.empty:
                             current_fee = fee_input if 'fee_input' in locals() else 0.001425
                             current_tax = tax_input if 'tax_input' in locals() else 0.003
                             
-                            # 執行蒙地卡羅優化
+                            # B. 執行優化
+                            # 注意：確保您的 run_optimization 函式有 return best_params
                             best_p, _ = run_optimization(
                                 raw_df_opt, market_df, start_date, 
                                 current_fee, current_tax, 
-                                use_chip_strategy=False, 
-                                use_strict_bear_exit=False
+                                use_chip_strategy=st.session_state['strategy_params'].get('use_chip_strategy', True),
+                                use_strict_bear_exit=st.session_state['strategy_params'].get('use_strict_bear_exit', True)
                             )
                             
-                            # [關鍵修正]：同步更新資料與 UI Widget 狀態
                             if best_p:
+                                # --- 關鍵步驟 1: 自動填入參數 (Session State Sync) ---
                                 for k in default_strategy_params.keys():
                                     if k in best_p:
                                         val = best_p[k]
-                                        # 1. 更新資料源
+                                        # 1. 更新後端資料
                                         st.session_state['strategy_params'][k] = val
-                                        # 2. 強制更新 Widget 的 session key，讓輸入框數字立刻變動
+                                        # 2. 更新前端 Widget (這會讓輸入框顯示新數字)
                                         st.session_state[f"widget_{k}"] = val
-                                        
-                                st.success(f"✅ 擬合完成！參數已自動填入。最佳回測報酬: {best_p.get('Return', 0)*100:.1f}%")
-                                st.rerun() # 強制刷新介面
-            
-            with c_reset:
-                if st.button("↩️ 重置預設值", use_container_width=True):
-                    for k, val in default_strategy_params.items():
-                        st.session_state['strategy_params'][k] = val
-                        st.session_state[f"widget_{k}"] = val # 同步重置 Widget
-                    st.rerun()
+                                
+                                # --- 關鍵步驟 2: AI 股性深度分析 ---
+                                scores, tag, advice = analyze_parameter_personality(best_p)
+                                
+                                # 存入 Session 以便 Rerun 後顯示
+                                st.session_state['ai_analysis_result'] = {
+                                    'scores': scores,
+                                    'tag': tag,
+                                    'advice': advice,
+                                    'return': best_p.get('Return', 0)
+                                }
+                                
+                                st.toast(f"✅ 擬合成功！最佳回測報酬: {best_p.get('Return', 0)*100:.1f}%", icon="🎉")
+                                st.rerun() # 強制刷新以顯示填入的數值
+
+            # --- 顯示 AI 分析結果 (如果有) ---
+            if 'ai_analysis_result' in st.session_state:
+                res = st.session_state['ai_analysis_result']
+                
+                st.markdown("---")
+                st.markdown(f"### 🧬 AI 股性解碼報告：{res['tag']}")
+                
+                c_chart, c_text = st.columns([1, 1])
+                
+                with c_chart:
+                    # --- 關鍵步驟 3: 繪製多維光譜雷達圖 ---
+                    categories = list(res['scores'].keys())
+                    values = list(res['scores'].values())
+                    
+                    # 閉合圖形
+                    categories = [*categories, categories[0]]
+                    values = [*values, values[0]]
+                    
+                    fig_radar = go.Figure()
+                    fig_radar.add_trace(go.Scatterpolar(
+                        r=values,
+                        theta=categories,
+                        fill='toself',
+                        name='股性光譜',
+                        line=dict(color='#00e676' if res['return'] > 0 else 'gray'),
+                        fillcolor='rgba(0, 230, 118, 0.2)'
+                    ))
+                    
+                    fig_radar.update_layout(
+                        polar=dict(
+                            radialaxis=dict(visible=True, range=[0, 100], showticklabels=False),
+                            bgcolor='rgba(0,0,0,0)'
+                        ),
+                        margin=dict(l=40, r=40, t=20, b=20),
+                        height=300,
+                        template="plotly_dark",
+                        showlegend=False
+                    )
+                    st.plotly_chart(fig_radar, use_container_width=True)
+                
+                with c_text:
+                    st.info(f"💡 **AI 操作戰略**：\n\n{res['advice']}")
+                    
+                    # 顯示最佳參數摘要
+                    st.caption("🔍 關鍵參數特徵：")
+                    dom_score = max(res['scores'], key=res['scores'].get)
+                    st.caption(f"此股在 **{dom_score}** 維度得分最高，\n這意味著策略在該方向的權重配置最為顯著。")
 
             st.markdown("---")
             
