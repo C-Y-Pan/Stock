@@ -621,27 +621,32 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 
 
 # ==========================================
-# 3. 策略邏輯 (保留原名，更新為 Alpha 規則)
+# 3. 策略邏輯 (不改名，內建參數化支援)
 # ==========================================
-def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
+def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, params=None):
     """
-    執行策略 (新版規則):
-    保留函數名稱 run_simple_strategy 以維持相容性。
-    邏輯更新為：
-    1. 買入：(連兩日 Alpha>0 且 合計>=40) 或 (單日 Alpha>=40)
-    2. 賣出：Alpha <= -40 且 Alpha Slope <= -60
-    3. 停損：維持基本停損保護
+    執行策略 v15:
+    支援 params 字典傳入自訂買賣門檻。
     """
-    # 1. 先計算 Alpha Score (這是新策略的核心)
-    # 注意：這裡呼叫 calculate_alpha_score 是為了策略運算，
-    # 但最後回傳的 df 最好也包含這些欄位，方便後續繪圖。
-    df = calculate_alpha_score(data)
+    # 1. 計算 Alpha Score (傳入 params 以計算動態權重)
+    df = calculate_alpha_score(data, params=params)
     
     if 'Dividends' not in df.columns: df['Dividends'] = 0.0
     df['Dividends'] = df['Dividends'].fillna(0.0)
     
-    # 計算 Alpha Slope (今日分數 - 昨日分數)
     df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
+    
+    # --- 定義門檻 (若無 params 則使用預設值) ---
+    buy_sum_thresh = 40
+    buy_single_thresh = 40
+    sell_alpha_thresh = -40
+    sell_slope_thresh = -60
+    
+    if params:
+        buy_sum_thresh = params.get('buy_consecutive_sum', 40)
+        buy_single_thresh = params.get('buy_single_day', 40)
+        sell_alpha_thresh = params.get('sell_threshold', -40)
+        sell_slope_thresh = params.get('sell_slope', -60)
     
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
@@ -649,14 +654,11 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
     position = 0; entry_price = 0.0
     cum_div = 0.0 
     
-    # 轉為 Numpy 加速讀取
+    # Numpy 加速
     alpha = df['Alpha_Score'].values
     slope = df['Alpha_Slope'].values
     close = df['Close'].values
     dividends = df['Dividends'].values
-    
-    # 這些參數留作風控備用
-    # ma20 = df['MA20'].values
     
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
@@ -667,19 +669,19 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
         if position == 0:
             is_buy = False
             
-            # 規則 1: 連續兩日 alpha 為正且 sum >= 40
+            # 1. 若連續2日alpha為正且該2日的alpha值相加 >= buy_sum_thresh
             cond1 = False
             if i > 0:
-                cond1 = (alpha[i] > 0) and (alpha[i-1] > 0) and ((alpha[i] + alpha[i-1]) >= 40)
+                cond1 = (alpha[i] > 0) and (alpha[i-1] > 0) and ((alpha[i] + alpha[i-1]) >= buy_sum_thresh)
             
-            # 規則 2: 當日 alpha >= 40
-            cond2 = (alpha[i] >= 40)
+            # 2. 若當日alpha值 >= buy_single_thresh
+            cond2 = (alpha[i] >= buy_single_thresh)
             
             if cond1:
-                is_buy = True; reason_str = f"Alpha動能積累 ({int(alpha[i-1])}+{int(alpha[i])})"
+                is_buy = True; reason_str = f"動能積累 (>{buy_sum_thresh})"
                 conf_score = 85
             elif cond2:
-                is_buy = True; reason_str = f"Alpha強勢爆發 ({int(alpha[i])})"
+                is_buy = True; reason_str = f"強勢爆發 (>{buy_single_thresh})"
                 conf_score = 90
             
             if is_buy:
@@ -694,19 +696,16 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
             
             is_sell = False
             
-            # 規則 3: 當日 alpha <= -40 且 slope <= -60
-            cond_sell_alpha = (alpha[i] <= -40) and (slope[i] <= -60)
+            # 3. 若當日alpha <= sell_alpha_thresh 且 slope <= sell_slope_thresh
+            cond_sell_alpha = (alpha[i] <= sell_alpha_thresh) and (slope[i] <= sell_slope_thresh)
             
-            # 額外風控：基本停損 (避免 Alpha 失靈時無底洞)
-            stop_loss_limit = -0.15 # 放寬一點給 Alpha 發揮，設為 15%
+            # 基本停損 (固定 15%，不遍歷，避免優化出無限大停損)
+            stop_loss_limit = -0.15 
             
             if cond_sell_alpha:
-                is_sell = True; reason_str = f"Alpha崩跌 ({int(alpha[i])}, Slope:{int(slope[i])})"; action_code = "Sell"
+                is_sell = True; reason_str = f"Alpha崩跌 (A<{sell_alpha_thresh}, S<{sell_slope_thresh})"; action_code = "Sell"
             elif drawdown < stop_loss_limit:
                 is_sell = True; reason_str = f"觸發硬停損({stop_loss_limit*100:.0f}%)"; action_code = "Sell"
-            
-            # (可選) 如果開啟嚴格長空出場，可以在這裡加回
-            # 但使用者指定規則優先，故這裡僅保留上述兩者
             
             if is_sell:
                 signal = 0; action_code = "Sell"
@@ -724,7 +723,7 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
     df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 計算策略報酬
+    # 計算報酬
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
     df['Market_Return'] = df['Market_Return'].fillna(0)
@@ -741,33 +740,108 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
     return df
 
 
+import random
 
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
+    """
+    更新版 optimization:
+    執行蒙地卡羅隨機搜尋 (Random Search)，尋找最佳參數組合。
+    """
     target_start = pd.to_datetime(user_start_date)
     
-    # 1. 計算基礎指標 (SuperTrend 仍需用到這些指標，必須保留)
+    # 預先計算指標，避免在迴圈中重複計算 (大幅加速)
+    # 注意：這裡的 Mult=3.0 只是為了算出 SuperTrend 欄位，不影響策略邏輯
     df_ind = calculate_indicators(raw_df, 10, 3.0, market_df) 
     df_slice = df_ind[df_ind['Date'] >= target_start].copy()
     
-    if df_slice.empty: 
-        return None, pd.DataFrame()
+    if df_slice.empty: return None, pd.DataFrame()
+
+    # === 定義參數範圍 (符合您要求的級距 5分) ===
+    # 格式: (min, max, step)
+    param_grid = {
+        # 1. 買入雙日總和 (0 ~ 100)
+        'buy_consecutive_sum': (0, 100, 5),
+        # 2. 買入單日 (0 ~ 100)
+        'buy_single_day': (0, 100, 5),
+        # 3. 賣出 Alpha/Slope (0 ~ -40 / 0 ~ -60)
+        'sell_threshold': (-40, 0, 5),
+        'sell_slope': (-60, 0, 5),
+        
+        # 4-10. 趨勢分數
+        'w_price_gt_ma20': (5, 30, 5),
+        'w_price_lt_ma20': (-30, -5, 5),
+        'w_price_gt_ma60': (5, 30, 5),
+        'w_price_lt_ma60': (-30, -5, 5),
+        'w_ma_bull': (5, 30, 5),
+        'w_ma_bear': (-30, -5, 5),
+        'w_break_supertrend': (-30, -5, 5),
+        
+        # 11-15. 動能分數
+        'w_rsi_strong': (5, 30, 5),
+        'w_rsi_bull': (5, 30, 5),
+        'w_rsi_oversold': (-30, -5, 5),
+        'w_rsi_weak': (-30, -5, 5),
+        'w_momentum_up': (5, 30, 5),
+        
+        # 16. 黃金坑
+        'w_golden_pit': (30, 60, 5)
+    }
+
+    # === 蒙地卡羅模擬 ===
+    n_trials = 200 # 模擬次數 (可依效能調整，建議 200~300)
+    best_ret = -999
+    best_params = {}
+    best_df = pd.DataFrame()
     
-    # 2. 執行更新後的 run_simple_strategy
-    # 注意：rsi_buy_thresh 等參數已無實際作用，傳入任意值即可
-    df_res = run_simple_strategy(
-        df_slice, 
-        rsi_buy_thresh=30, 
-        fee_rate=fee_rate, 
-        tax_rate=tax_rate,
-        use_chip_strategy=use_chip_strategy,
-        use_strict_bear_exit=use_strict_bear_exit
-    )
+    # 至少跑一次預設參數 (Baseline)
+    default_params = {k: np.mean([v[0], v[1]]) for k, v in param_grid.items()} # 用中間值當 Baseline
+    trial_params_list = [default_params]
     
-    # 3. 回傳格式維持不變
-    ret = df_res['Cum_Strategy'].iloc[-1] - 1
-    best_params = {'Mult': 3.0, 'RSI_Buy': 0, 'Return': ret} 
+    # 生成隨機參數組
+    for _ in range(n_trials):
+        p = {}
+        for k, (min_v, max_v, step) in param_grid.items():
+            # 隨機產生符合 step 的整數
+            steps_count = int((max_v - min_v) / step)
+            rand_step = random.randint(0, steps_count)
+            p[k] = min_v + (rand_step * step)
+        trial_params_list.append(p)
+        
+    # 開始競賽
+    for params in trial_params_list:
+        # 呼叫 run_simple_strategy (它內部會呼叫 calculate_alpha_score)
+        # 並傳入當前參數 params
+        res_df = run_simple_strategy(
+            df_slice, 
+            fee_rate=fee_rate, 
+            tax_rate=tax_rate, 
+            params=params
+        )
+        
+        # 評估績效：累積報酬率
+        ret = res_df['Cum_Strategy'].iloc[-1] - 1
+        
+        if ret > best_ret:
+            best_ret = ret
+            best_params = params
+            best_df = res_df.copy() # 必須 copy，否則會被覆蓋
+            
+    # 將最佳報酬寫入 params 以便外部顯示
+    best_params['Return'] = best_ret
     
-    return best_params, df_res
+    # 重要：為了讓 UI 能正確顯示分數顏色和 HTML，我們需要用最佳參數
+    # 「重新」跑一次 calculate_alpha_score (這次 params 不是 None，會生成詳細 HTML)
+    # 在 run_simple_strategy 裡雖然跑過了，但為了確保 Score_Log 正確，我們再整理一次
+    
+    conditions = [
+        (best_df['Alpha_Score'] >= 60), (best_df['Alpha_Score'] >= 20), (best_df['Alpha_Score'] >= -20),
+        (best_df['Alpha_Score'] <= -60), (best_df['Alpha_Score'] < -20)
+    ]
+    choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 震盪盤整", "⚡ 極弱勢", "📉 空頭修正"]
+    best_df['Score_Log'] = np.select(conditions, choices, default="☁️ 觀望")
+    
+    return best_params, best_df
+
 
 
 def validate_strategy_robust(raw_df, market_df, split_ratio=0.7, fee_rate=0.001425, tax_rate=0.003):
@@ -934,140 +1008,139 @@ def analyze_signal(final_df):
     elif last['Position']==1: return "✊ 續抱", "red", reason
     else: return "👀 觀望", "gray", "空手"
 
+
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - v14 (含停損基準線扣分)
+# 5. [核心演算法] 買賣評等 (Alpha Score) - v15 (參數化支援版)
 # ==========================================
-def calculate_alpha_score(df, margin_df=None, short_df=None):
+def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
     """
-    Alpha Score v14.0:
-    1. 純技術驅動。
-    2. [新增] 若收盤價 < SuperTrend (停損基準線)，大幅扣 30 分。
+    Alpha Score v15.0:
+    支援 params 字典傳入自訂權重。若 params 為 None，則使用預設值。
     """
     df = df.copy()
 
-    # 1. 基礎欄位防呆與補全
+    # --- 1. 定義權重 (若無 params 則使用預設值) ---
+    # 預設值取各範圍的中位數或經驗值
+    weights = {
+        'w_price_gt_ma20': 20, 'w_price_lt_ma20': -20,
+        'w_price_gt_ma60': 15, 'w_price_lt_ma60': -15,
+        'w_ma_bull': 10, 'w_ma_bear': -5,
+        'w_break_supertrend': -30,
+        'w_rsi_strong': 10, 'w_rsi_bull': 5, 'w_rsi_oversold': -10, 'w_rsi_weak': -5,
+        'w_momentum_up': 5,
+        'w_golden_pit': 40
+    }
+    
+    # 如果有傳入 params，則覆蓋預設權重
+    if params:
+        for k in weights.keys():
+            if k in params: weights[k] = params[k]
+
+    # --- 2. 基礎欄位計算 ---
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240).mean()
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-    # 防呆 SuperTrend
     if 'SuperTrend' not in df.columns: df['SuperTrend'] = 0 
     
-    # 計算年線斜率 (判斷牛熊背景，用於黃金坑)
+    # 計算年線斜率
     df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
 
+    # 轉為 Numpy Array 加速運算 (避免在迴圈中頻繁存取 DataFrame)
+    close = df['Close'].values
+    op = df['Open'].values
+    ma20 = df['MA20'].values
+    ma60 = df['MA60'].values
+    ma240_slope = df['MA240_Slope'].values
+    super_trend = df['SuperTrend'].values
+    rsi = df['RSI'].values
+    vol = df['Volume'].values
+    vol_ma = df['Vol_MA20'].values
+    
     final_scores = []
     score_details = []
 
-    # 迭代每一天進行評分
+    # --- 3. 評分迴圈 ---
     for i in range(len(df)):
-        row = df.iloc[i]
-        prev_row = df.iloc[i-1] if i > 0 else row
-        
-        # === 初始化 ===
         score = 0
         reasons = [] 
         
-        # ==========================================
-        # A. 趨勢面 (Trend)
-        # ==========================================
-        close = row['Close']
-        ma20 = row['MA20']
-        ma60 = row['MA60']
-        super_trend = row['SuperTrend']
-        
-        # 1. 月線
-        if close > ma20:
-            score += 20; reasons.append("股價 > 月線 (+20)")
+        # A. 趨勢面
+        # 4. 股價 > 月線 / 5. 股價破月線
+        if close[i] > ma20[i]:
+            score += weights['w_price_gt_ma20']; reasons.append(f"股價>月線 ({weights['w_price_gt_ma20']:+})")
         else:
-            score -= 20; reasons.append("股價破月線 (-20)")
+            score += weights['w_price_lt_ma20']; reasons.append(f"股價破月線 ({weights['w_price_lt_ma20']:+})")
             
-        # 2. 季線
-        if close > ma60:
-            score += 15; reasons.append("股價 > 季線 (+15)")
+        # 6. 股價 > 季線 / 7. 股價破季線
+        if close[i] > ma60[i]:
+            score += weights['w_price_gt_ma60']; reasons.append(f"股價>季線 ({weights['w_price_gt_ma60']:+})")
         else:
-            score -= 15; reasons.append("股價破季線 (-15)")
+            score += weights['w_price_lt_ma60']; reasons.append(f"股價破季線 ({weights['w_price_lt_ma60']:+})")
             
-        # 3. 排列
-        if ma20 > ma60:
-            score += 10; reasons.append("均線多頭排列 (+10)")
-        elif ma20 < ma60:
-            score -= 5; reasons.append("均線空頭排列 (-5)")
+        # 8. 均線多頭 / 9. 均線空頭
+        if ma20[i] > ma60[i]:
+            score += weights['w_ma_bull']; reasons.append(f"均線多頭 ({weights['w_ma_bull']:+})")
+        elif ma20[i] < ma60[i]:
+            score += weights['w_ma_bear']; reasons.append(f"均線空頭 ({weights['w_ma_bear']:+})")
 
-        # 4. [新增] 停損基準線 (SuperTrend) 判定
-        # 若收盤價低於 SuperTrend，代表趨勢翻空或觸及停損，重扣 30 分
-        if close < super_trend:
-            score -= 30; reasons.append("跌破停損基準線 (-30)")
+        # 10. 跌破停損基準線
+        if close[i] < super_trend[i]:
+            score += weights['w_break_supertrend']; reasons.append(f"跌破停損線 ({weights['w_break_supertrend']:+})")
 
-        # ==========================================
-        # B. 動能面 (Momentum)
-        # ==========================================
-        rsi = row['RSI']
-        
-        if rsi >= 60:
-            score += 10; reasons.append(f"RSI 強勢區 ({int(rsi)}) (+10)")
-        elif 50 <= rsi < 60:
-            score += 5; reasons.append(f"RSI 多方區 ({int(rsi)}) (+5)")
-        elif rsi < 30:
-            score -= 10; reasons.append(f"RSI 超賣弱勢 ({int(rsi)}) (-10)")
-        else:
-            score -= 5; reasons.append(f"RSI 弱勢區 ({int(rsi)}) (-5)")
+        # B. 動能面
+        # 11~14. RSI 區間
+        r_val = rsi[i]
+        if r_val >= 60:
+            score += weights['w_rsi_strong']; reasons.append(f"RSI強勢 ({weights['w_rsi_strong']:+})")
+        elif 50 <= r_val < 60:
+            score += weights['w_rsi_bull']; reasons.append(f"RSI多方 ({weights['w_rsi_bull']:+})")
+        elif r_val < 30:
+            score += weights['w_rsi_oversold']; reasons.append(f"RSI超賣 ({weights['w_rsi_oversold']:+})")
+        else: # 30~50
+            score += weights['w_rsi_weak']; reasons.append(f"RSI弱勢 ({weights['w_rsi_weak']:+})")
             
-        if i > 0 and rsi > prev_row['RSI']:
-            score += 5; reasons.append("動能增強 (+5)")
+        # 15. 動能增強
+        if i > 0 and rsi[i] > rsi[i-1]:
+            score += weights['w_momentum_up']; reasons.append(f"動能增強 ({weights['w_momentum_up']:+})")
 
-        # ==========================================
-        # C. 量價與結構
-        # ==========================================
-        vol = row['Volume']
-        vol_ma = row['Vol_MA20']
-        
-        if vol > vol_ma and close > row['Open']:
-            score += 10; reasons.append("出量上漲 (+10)")
-        elif vol > vol_ma and close < row['Open']:
-            score -= 10; reasons.append("出量下跌 (-10)")
-        elif vol < vol_ma * 0.6 and abs(close - row['Open']) / close < 0.005:
-            if close > ma20:
-                score += 5; reasons.append("多頭縮量惜售 (+5)")
-            else:
-                score -= 5; reasons.append("空頭人氣退潮 (-5)")
+        # C. 量價 (維持固定邏輯，不在此次參數優化範圍內，但保留)
+        if vol[i] > vol_ma[i]:
+            if close[i] > op[i]: score += 10; reasons.append("出量上漲 (+10)")
+            else: score -= 10; reasons.append("出量下跌 (-10)")
 
-        # ==========================================
-        # D. 特殊情境偵測 (黃金坑)
-        # ==========================================
-        # 定義：RSI超賣 (<30) 但 年線向上 (牛市)
-        # 注意：即使跌破停損基準線扣了30分，如果判定為牛市黃金坑，
-        # 下面的邏輯會把負分加回來 (restore)，這是符合「誤殺/錯殺」定義的。
-        if rsi < 30 and row['MA240_Slope'] > 0:
-             # 強制修正分數：視為牛市黃金坑，給予極大加分
-             restore = abs(min(score, 0)) # 加回所有負分 (包含剛剛扣的停損分)
+        # 16. 牛市黃金坑
+        if r_val < 30 and ma240_slope[i] > 0:
+             restore = abs(min(score, 0)) # 加回負分
              score += restore
-             score += 40 
-             reasons.append("<b>💎 牛市黃金坑 (RSI超賣+年線向上) (+40)</b>")
+             score += weights['w_golden_pit']
+             reasons.append(f"<b>💎 牛市黃金坑 ({weights['w_golden_pit']:+})</b>")
 
-        # ==========================================
-        # E. 輸出格式化
-        # ==========================================
+        # D. 輸出
         final_score = max(min(score, 100), -100)
         final_scores.append(final_score)
         
-        title_color = "#ff5252" if final_score > 0 else "#00e676"
-        html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
-        
-        pos_reasons = [r for r in reasons if "(+" in r]
-        neg_reasons = [r for r in reasons if "(-" in r]
-        
-        if pos_reasons:
-            html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
-        if neg_reasons:
-            html_str += f"<span style='color:#b9f6ca'>{'<br>'.join(neg_reasons)}</span>"
+        # 只有在沒有 params (代表是用戶觀看時) 才生成 HTML，優化時跳過以加速
+        if params is None:
+            title_color = "#ff5252" if final_score > 0 else "#00e676"
+            html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
             
-        score_details.append(html_str)
+            # 簡單過濾一下正負理由顏色
+            formatted_reasons = []
+            for r in reasons:
+                if "(+" in r: formatted_reasons.append(f"<span style='color:#ff8a80'>{r}</span>")
+                else: formatted_reasons.append(f"<span style='color:#b9f6ca'>{r}</span>")
+            
+            html_str += "<br>".join(formatted_reasons)
+            score_details.append(html_str)
+        else:
+            score_details.append("") # 優化過程不需要詳細 HTML
 
     df['Alpha_Score'] = final_scores
     df['Score_Detail'] = score_details
     
+    # 根據分數產生 Log
     conditions = [
         (df['Alpha_Score'] >= 60), (df['Alpha_Score'] >= 20), (df['Alpha_Score'] >= -20),
         (df['Alpha_Score'] <= -60), (df['Alpha_Score'] < -20)
@@ -1780,6 +1853,32 @@ elif page == "📊 單股深度分析":
                 # UI 顯示部分 (已優化：新增現價顯示)
                 # ==========================================
                 
+                # [新增] 顯示 AI 最佳化結果
+                with st.expander("🧬 AI 最佳參數配置 (Monte Carlo Optimization)", expanded=False):
+                    if best_params:
+                        st.markdown(f"""
+                        **策略回測報酬率:** `{best_params.get('Return', 0)*100:.2f}%`
+                        
+                        **🎯 買賣門檻設定:**
+                        * 買入 (連續2日總和): `>= {best_params.get('buy_consecutive_sum')}` 分
+                        * 買入 (單日爆發): `>= {best_params.get('buy_single_day')}` 分
+                        * 賣出 (Alpha低於): `<= {best_params.get('sell_threshold')}` 分
+                        * 賣出 (斜率低於): `<= {best_params.get('sell_slope')}`
+                        
+                        **⚖️ 趨勢權重 (Trend):**
+                        * 站上/跌破月線: `{best_params.get('w_price_gt_ma20'):+}` / `{best_params.get('w_price_lt_ma20'):+}`
+                        * 站上/跌破季線: `{best_params.get('w_price_gt_ma60'):+}` / `{best_params.get('w_price_lt_ma60'):+}`
+                        * 均線多/空排列: `{best_params.get('w_ma_bull'):+}` / `{best_params.get('w_ma_bear'):+}`
+                        * 跌破停損線: `{best_params.get('w_break_supertrend'):+}`
+                        
+                        **🌊 動能權重 (Momentum):**
+                        * RSI (強勢/多方/弱勢/超賣): `{best_params.get('w_rsi_strong'):+}` / `{best_params.get('w_rsi_bull'):+}` / `{best_params.get('w_rsi_weak'):+}` / `{best_params.get('w_rsi_oversold'):+}`
+                        * 動能增強: `{best_params.get('w_momentum_up'):+}`
+                        * 牛市黃金坑: `{best_params.get('w_golden_pit'):+}`
+                        """)
+                    else:
+                        st.caption("使用預設參數運算")
+
                 # 1. 準備漲跌數據
                 last_close = final_df['Close'].iloc[-1]
                 prev_close = final_df['Close'].iloc[-2]
