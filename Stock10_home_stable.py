@@ -39,6 +39,16 @@ import sqlite3
 import hashlib
 
 # ==========================================
+# [新增] 強制清理舊參數 (防止舊邏輯殘留)
+# ==========================================
+if 'strategy_params' in st.session_state:
+    # 如果這些舊 Key 還在，就把它們刪掉
+    if 'buy_consecutive_sum' in st.session_state['strategy_params']:
+        del st.session_state['strategy_params']['buy_consecutive_sum']
+    if 'sell_slope' in st.session_state['strategy_params']:
+        del st.session_state['strategy_params']['sell_slope']
+
+# ==========================================
 # 資料庫管理模組 (SQLite)
 # ==========================================
 DB_NAME = "invest_pro.db"
