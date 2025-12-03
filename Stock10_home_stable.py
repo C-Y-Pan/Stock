@@ -996,17 +996,16 @@ def analyze_signal(final_df):
 
 
 # ==========================================
-# 5. [核心演算法] 買賣評等 (Alpha Score) - v15 (參數化支援版)
+# 5. [核心演算法] 買賣評等 (Alpha Score) - v15.1 (修正 KeyError)
 # ==========================================
 def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
     """
-    Alpha Score v15.0:
-    支援 params 字典傳入自訂權重。若 params 為 None，則使用預設值。
+    Alpha Score v15.1:
+    修正：補回 Recommended_Position 欄位，解決 Dashboard KeyError。
     """
     df = df.copy()
 
     # --- 1. 定義權重 (若無 params 則使用預設值) ---
-    # 預設值取各範圍的中位數或經驗值
     weights = {
         'w_price_gt_ma20': 20, 'w_price_lt_ma20': -20,
         'w_price_gt_ma60': 15, 'w_price_lt_ma60': -15,
@@ -1017,7 +1016,6 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
         'w_golden_pit': 40
     }
     
-    # 如果有傳入 params，則覆蓋預設權重
     if params:
         for k in weights.keys():
             if k in params: weights[k] = params[k]
@@ -1030,10 +1028,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     if 'SuperTrend' not in df.columns: df['SuperTrend'] = 0 
     
-    # 計算年線斜率
     df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
 
-    # 轉為 Numpy Array 加速運算 (避免在迴圈中頻繁存取 DataFrame)
+    # Numpy 加速
     close = df['Close'].values
     op = df['Open'].values
     ma20 = df['MA20'].values
@@ -1053,30 +1050,25 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
         reasons = [] 
         
         # A. 趨勢面
-        # 4. 股價 > 月線 / 5. 股價破月線
         if close[i] > ma20[i]:
             score += weights['w_price_gt_ma20']; reasons.append(f"股價>月線 ({weights['w_price_gt_ma20']:+})")
         else:
             score += weights['w_price_lt_ma20']; reasons.append(f"股價破月線 ({weights['w_price_lt_ma20']:+})")
             
-        # 6. 股價 > 季線 / 7. 股價破季線
         if close[i] > ma60[i]:
             score += weights['w_price_gt_ma60']; reasons.append(f"股價>季線 ({weights['w_price_gt_ma60']:+})")
         else:
             score += weights['w_price_lt_ma60']; reasons.append(f"股價破季線 ({weights['w_price_lt_ma60']:+})")
             
-        # 8. 均線多頭 / 9. 均線空頭
         if ma20[i] > ma60[i]:
             score += weights['w_ma_bull']; reasons.append(f"均線多頭 ({weights['w_ma_bull']:+})")
         elif ma20[i] < ma60[i]:
             score += weights['w_ma_bear']; reasons.append(f"均線空頭 ({weights['w_ma_bear']:+})")
 
-        # 10. 跌破停損基準線
         if close[i] < super_trend[i]:
             score += weights['w_break_supertrend']; reasons.append(f"跌破停損線 ({weights['w_break_supertrend']:+})")
 
         # B. 動能面
-        # 11~14. RSI 區間
         r_val = rsi[i]
         if r_val >= 60:
             score += weights['w_rsi_strong']; reasons.append(f"RSI強勢 ({weights['w_rsi_strong']:+})")
@@ -1084,49 +1076,43 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
             score += weights['w_rsi_bull']; reasons.append(f"RSI多方 ({weights['w_rsi_bull']:+})")
         elif r_val < 30:
             score += weights['w_rsi_oversold']; reasons.append(f"RSI超賣 ({weights['w_rsi_oversold']:+})")
-        else: # 30~50
+        else: 
             score += weights['w_rsi_weak']; reasons.append(f"RSI弱勢 ({weights['w_rsi_weak']:+})")
             
-        # 15. 動能增強
         if i > 0 and rsi[i] > rsi[i-1]:
             score += weights['w_momentum_up']; reasons.append(f"動能增強 ({weights['w_momentum_up']:+})")
 
-        # C. 量價 (維持固定邏輯，不在此次參數優化範圍內，但保留)
+        # C. 量價 
         if vol[i] > vol_ma[i]:
             if close[i] > op[i]: score += 10; reasons.append("出量上漲 (+10)")
             else: score -= 10; reasons.append("出量下跌 (-10)")
 
-        # 16. 牛市黃金坑
+        # D. 黃金坑
         if r_val < 30 and ma240_slope[i] > 0:
-             restore = abs(min(score, 0)) # 加回負分
+             restore = abs(min(score, 0)) 
              score += restore
              score += weights['w_golden_pit']
              reasons.append(f"<b>💎 牛市黃金坑 ({weights['w_golden_pit']:+})</b>")
 
-        # D. 輸出
+        # E. 輸出
         final_score = max(min(score, 100), -100)
         final_scores.append(final_score)
         
-        # 只有在沒有 params (代表是用戶觀看時) 才生成 HTML，優化時跳過以加速
         if params is None:
             title_color = "#ff5252" if final_score > 0 else "#00e676"
             html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
-            
-            # 簡單過濾一下正負理由顏色
             formatted_reasons = []
             for r in reasons:
                 if "(+" in r: formatted_reasons.append(f"<span style='color:#ff8a80'>{r}</span>")
                 else: formatted_reasons.append(f"<span style='color:#b9f6ca'>{r}</span>")
-            
             html_str += "<br>".join(formatted_reasons)
             score_details.append(html_str)
         else:
-            score_details.append("") # 優化過程不需要詳細 HTML
+            score_details.append("")
 
     df['Alpha_Score'] = final_scores
     df['Score_Detail'] = score_details
     
-    # 根據分數產生 Log
     conditions = [
         (df['Alpha_Score'] >= 60), (df['Alpha_Score'] >= 20), (df['Alpha_Score'] >= -20),
         (df['Alpha_Score'] <= -60), (df['Alpha_Score'] < -20)
@@ -1134,7 +1120,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None):
     choices = ["🔥 極強勢", "📈 多頭格局", "⚖️ 震盪盤整", "⚡ 極弱勢", "📉 空頭修正"]
     df['Score_Log'] = np.select(conditions, choices, default="☁️ 觀望")
     
+    # [關鍵修正] 補回這一行：計算建議持股水位 (0~100%)
+    df['Recommended_Position'] = ((df['Alpha_Score'] + 100) / 2).clip(0, 100)
+    
     return df
+
 
 
 def calculate_alpha_score_technical_fallback(df):
