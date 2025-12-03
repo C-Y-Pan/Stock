@@ -522,7 +522,7 @@ def get_margin_data(start_date_str):
 def calculate_indicators(df, atr_period, multiplier, market_df):
     data = df.copy()
     
-    # 合併大盤數據
+    # --- 合併大盤數據 (維持原邏輯) ---
     if not market_df.empty:
         data['Date'] = pd.to_datetime(data['Date']).dt.normalize()
         market_df['Date'] = pd.to_datetime(market_df['Date']).dt.normalize()
@@ -530,22 +530,22 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
         
         cols_to_fill = ['Market_RSI', 'Market_MA20', 'Market_MA60', 'VIX']
         for c in cols_to_fill:
-            if c in data.columns:
-                data[c] = data[c].ffill()
+            if c in data.columns: data[c] = data[c].ffill()
         
         if 'Market_RSI' in data.columns: data['Market_RSI'] = data['Market_RSI'].fillna(50)
         if 'Market_MA20' in data.columns: data['Market_MA20'] = data['Market_MA20'].fillna(0)
         if 'VIX' in data.columns: data['VIX'] = data['VIX'].fillna(20)
     else:
-        data['Market_RSI'] = 50
-        data['Market_MA20'] = 0
-        data['VIX'] = 20
+        data['Market_RSI'] = 50; data['Market_MA20'] = 0; data['VIX'] = 20
     
-    # --- 指標計算 ---
+    # --- 基礎指標 ---
     data['OBV'] = (np.sign(data['Close'].diff()) * data['Volume']).fillna(0).cumsum()
     data['OBV_MA20'] = data['OBV'].rolling(20).mean()
     data['Vol_MA20'] = data['Volume'].rolling(20).mean().replace(0, 1).fillna(1)
     
+    # [新增] RVOL (相對量能)：當日量 / 20日均量
+    data['RVOL'] = data['Volume'] / data['Vol_MA20']
+
     data['MA20'] = data['Close'].rolling(20).mean()
     data['MA30'] = data['Close'].rolling(30).mean()
     data['MA60'] = data['Close'].rolling(60).mean()
@@ -553,55 +553,61 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['MA240'] = data['Close'].rolling(240, min_periods=60).mean()
     
     data['High_100d'] = data['Close'].rolling(100).max()
-    data['Close_Lag5'] = data['Close'].shift(5)
-
-    high = data['High']; low = data['Low']; close = data['Close']
     
-    # ATR Calculation
+    # --- ATR 與 波動率體制 (Volatility Regime) ---
+    high = data['High']; low = data['Low']; close = data['Close']
     data['tr0'] = abs(high - low)
     data['tr1'] = abs(high - close.shift(1))
     data['tr2'] = abs(low - close.shift(1))
     data['TR'] = data[['tr0', 'tr1', 'tr2']].max(axis=1)
     data['ATR'] = data['TR'].ewm(span=atr_period, adjust=False).mean()
     
-    # ============================================================
-    # [新增] 自適應波動率體制 (Vol Regime)
-    # 計算公式：當前 ATR% / 過去 60 日平均 ATR%
-    # 值 > 1.2 代表高波動 (需提高門檻)；值 < 0.8 代表低波動 (可降低門檻)
-    # ============================================================
+    # [關鍵改良] Vol_Regime 計算
+    # 邏輯：(當前ATR/價格) / (過去60日平均ATR/價格)
+    # 數值 > 1.2 代表高波動環境； < 0.8 代表低波動死魚盤
     data['ATR_Pct'] = data['ATR'] / data['Close']
     data['Vol_Regime'] = data['ATR_Pct'] / data['ATR_Pct'].rolling(60).mean()
-    data['Vol_Regime'] = data['Vol_Regime'].fillna(1.0) # 預設為正常波動
-    
-    # SuperTrend Calculation
+    data['Vol_Regime'] = data['Vol_Regime'].fillna(1.0) 
+
+    # --- SuperTrend (維持原邏輯) ---
     data['Basic_Upper'] = (high + low) / 2 + (multiplier * data['ATR'])
     data['Basic_Lower'] = (high + low) / 2 - (multiplier * data['ATR'])
     
-    final_upper = [0.0]*len(data); final_lower = [0.0]*len(data); supertrend = [0.0]*len(data); trend = [1]*len(data)
+    final_upper = np.zeros(len(data)); final_lower = np.zeros(len(data))
+    supertrend = np.zeros(len(data)); trend = np.zeros(len(data))
     
-    if len(data)>0:
-        final_upper[0]=data['Basic_Upper'].iloc[0]
-        final_lower[0]=data['Basic_Lower'].iloc[0]
-        supertrend[0]=final_lower[0]
-        
+    # 初始化
+    if len(data) > 0:
+        final_upper[0] = data['Basic_Upper'].iloc[0]
+        final_lower[0] = data['Basic_Lower'].iloc[0]
+        supertrend[0] = final_lower[0]
+        trend[0] = 1
+
+    # Numba 加速邏輯 (這裡用 Python 迴圈模擬)
+    close_arr = close.values
+    bu_arr = data['Basic_Upper'].values; bl_arr = data['Basic_Lower'].values
+    
     for i in range(1, len(data)):
-        curr_close = close.iloc[i-1]
+        curr_close = close_arr[i-1] # 昨收
         
-        if data['Basic_Upper'].iloc[i] < final_upper[i-1] or curr_close > final_upper[i-1]:
-            final_upper[i] = data['Basic_Upper'].iloc[i]
+        # Upper Band Logic
+        if bu_arr[i] < final_upper[i-1] or curr_close > final_upper[i-1]:
+            final_upper[i] = bu_arr[i]
         else:
             final_upper[i] = final_upper[i-1]
             
-        if data['Basic_Lower'].iloc[i] > final_lower[i-1] or curr_close < final_lower[i-1]:
-            final_lower[i] = data['Basic_Lower'].iloc[i]
+        # Lower Band Logic
+        if bl_arr[i] > final_lower[i-1] or curr_close < final_lower[i-1]:
+            final_lower[i] = bl_arr[i]
         else:
             final_lower[i] = final_lower[i-1]
             
+        # Trend Switch Logic
         if trend[i-1] == 1:
-            if close.iloc[i] < final_lower[i-1]: trend[i] = -1
+            if close_arr[i] < final_lower[i-1]: trend[i] = -1
             else: trend[i] = 1
         else:
-            if close.iloc[i] > final_upper[i-1]: trend[i] = 1
+            if close_arr[i] > final_upper[i-1]: trend[i] = 1
             else: trend[i] = -1
             
         supertrend[i] = final_lower[i] if trend[i] == 1 else final_upper[i]
@@ -609,13 +615,12 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['SuperTrend'] = supertrend
     data['Trend'] = trend
     
-    # RSI (個股)
+    # RSI & BBands
     delta = data['Close'].diff()
     gain = (delta.where(delta>0, 0)).rolling(14).mean()
     loss = (-delta.where(delta<0, 0)).rolling(14).mean()
     data['RSI'] = (100 - (100 / (1 + gain/loss))).fillna(50)
     
-    # Bollinger Bands
     data['BB_Mid'] = data['Close'].rolling(20).mean()
     data['BB_Std'] = data['Close'].rolling(20).std()
     data['BB_Lower'] = data['BB_Mid'] - (2.0 * data['BB_Std'])
@@ -632,32 +637,30 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, params=None):
     """
-    執行策略 v16 (自適應版):
-    支援 params 字典傳入 'use_adaptive' 參數，啟用動態門檻調整。
+    執行策略 v16 (Adaptive Thresholds):
+    使用 Vol_Regime 動態調整買入/賣出門檻。
     """
-    # 1. 計算 Alpha Score
+    # 1. 計算分數
     df = calculate_alpha_score(data, params=params)
     
     if 'Dividends' not in df.columns: df['Dividends'] = 0.0
     df['Dividends'] = df['Dividends'].fillna(0.0)
-    
     df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
     
-    # --- 參數讀取 ---
+    # --- 預設參數 ---
     buy_sum_thresh = 40
     buy_single_thresh = 40
     sell_alpha_thresh = -40
     sell_slope_thresh = -60
     
-    use_adaptive = False # 預設關閉
-
+    # 讀取 params
+    use_adaptive = True # 預設開啟自適應
     if params:
         buy_sum_thresh = params.get('buy_consecutive_sum', 40)
         buy_single_thresh = params.get('buy_single_day', 40)
         sell_alpha_thresh = params.get('sell_threshold', -40)
         sell_slope_thresh = params.get('sell_slope', -60)
-        # 讀取自適應開關
-        use_adaptive = params.get('use_adaptive', False)
+        use_adaptive = params.get('use_adaptive', True) # 支援從 UI 關閉
     
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
@@ -665,10 +668,12 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
     position = 0; entry_price = 0.0
     cum_div = 0.0 
     
-    # Numpy 加速
+    # Numpy 加速讀取
     alpha = df['Alpha_Score'].values
     slope = df['Alpha_Slope'].values
     close = df['Close'].values
+    ma20 = df['MA20'].values
+    ma60 = df['MA60'].values
     dividends = df['Dividends'].values
     vol_regime = df['Vol_Regime'].values if 'Vol_Regime' in df.columns else np.ones(len(df))
     
@@ -677,35 +682,34 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
         this_target = entry_price * 1.15 if position == 1 else np.nan
         ret_label = ""; conf_score = 0
         
-        # --- 動態門檻計算 (Adaptive Logic) ---
-        current_buy_sum = buy_sum_thresh
-        current_buy_single = buy_single_thresh
-        
+        # --- 動態門檻計算 (核心邏輯) ---
+        # 如果開啟自適應，根據波動率體制調整門檻
+        # Vol_Regime 範圍約在 0.6 ~ 2.0 之間
+        threshold_multiplier = 1.0
         if use_adaptive:
-            # 波動率調節因子 (限制在 0.8 ~ 1.5 倍之間)
-            # 波動大 -> 因子大 -> 門檻變高 (難買)
-            # 波動小 -> 因子小 -> 門檻變低 (好買)
-            v_factor = min(1.5, max(0.8, vol_regime[i]))
-            current_buy_sum = buy_sum_thresh * v_factor
-            current_buy_single = buy_single_thresh * v_factor
+            # 限制調整幅度在 0.8倍 ~ 1.5倍 之間，避免門檻過高或過低
+            threshold_multiplier = max(0.8, min(1.5, vol_regime[i]))
+            
+        current_buy_sum = buy_sum_thresh * threshold_multiplier
+        current_buy_single = buy_single_thresh * threshold_multiplier
         
         # --- 買入邏輯 ---
         if position == 0:
             is_buy = False
             
-            # 1. 連續2日 Alpha 積累
+            # 1. 動能積累 (連續2日)
             cond1 = False
             if i > 0:
                 cond1 = (alpha[i] > 0) and (alpha[i-1] > 0) and ((alpha[i] + alpha[i-1]) >= current_buy_sum)
             
-            # 2. 單日爆發
+            # 2. 強勢爆發 (單日)
             cond2 = (alpha[i] >= current_buy_single)
             
             if cond1:
-                is_buy = True; reason_str = f"動能積累 (>{current_buy_sum:.1f})"
+                is_buy = True; reason_str = f"動能積累 (Score>{current_buy_sum:.1f})"
                 conf_score = 85
             elif cond2:
-                is_buy = True; reason_str = f"強勢爆發 (>{current_buy_single:.1f})"
+                is_buy = True; reason_str = f"強勢爆發 (Score>{current_buy_single:.1f})"
                 conf_score = 90
             
             if is_buy:
@@ -720,18 +724,18 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
             
             is_sell = False
             
-            # 3. Alpha 轉弱
+            # 3. Alpha 轉弱 (維持原邏輯，不需動態調整，賣出訊號應保持敏感)
             cond_sell_alpha = (alpha[i] <= sell_alpha_thresh) and (slope[i] <= sell_slope_thresh)
             
-            # 4. 硬停損 (Fixed Stop Loss)
+            # 4. 硬停損 (15%)
             stop_loss_limit = -0.15 
             
             if cond_sell_alpha:
                 is_sell = True; reason_str = f"Alpha崩跌 (A<{sell_alpha_thresh}, S<{sell_slope_thresh})"
             elif drawdown < stop_loss_limit:
                 is_sell = True; reason_str = f"觸發硬停損({stop_loss_limit*100:.0f}%)"
-            elif use_strict_bear_exit and (close[i] < df['MA20'].values[i]) and (df['MA20'].values[i] < df['MA60'].values[i]):
-                 # [原有邏輯] 長空破月線
+            # 5. 長空破線強制出場
+            elif use_strict_bear_exit and (close[i] < ma20[i]) and (ma20[i] < ma60[i]):
                  is_sell = True; reason_str = "長空破月線"
 
             if is_sell:
@@ -750,7 +754,7 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
     df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 計算報酬
+    # 計算策略淨值
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
     df['Market_Return'] = df['Market_Return'].fillna(0)
@@ -765,6 +769,7 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
     df['Cum_Market'] = (1 + df['Market_Return']).cumprod()
     
     return df
+
 
 
 import random
@@ -1027,48 +1032,38 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, generate_detail=True):
     """
-    Alpha Score v15.2:
-    新增 generate_detail 參數。
-    - 在 UI 顯示時設為 True，生成詳細 HTML 供游標懸浮顯示。
-    - 在 AI 訓練迴圈時設為 False，加速運算。
+    Alpha Score v16.0 (Institution Upgrade):
+    加入 RVOL (相對量能) 與 Vol_Regime (波動懲罰)。
     """
     df = df.copy()
 
     # --- 1. 定義權重 ---
     weights = {
-        'w_price_gt_ma20': 20, 'w_price_lt_ma20': -20,
+        'w_price_gt_ma20': 15, 'w_price_lt_ma20': -15,
         'w_price_gt_ma60': 15, 'w_price_lt_ma60': -15,
         'w_ma_bull': 10, 'w_ma_bear': -5,
         'w_break_supertrend': -30,
         'w_rsi_strong': 10, 'w_rsi_bull': 5, 'w_rsi_oversold': -10, 'w_rsi_weak': -5,
         'w_momentum_up': 5,
-        'w_golden_pit': 40
+        'w_golden_pit': 35,
+        'w_rvol_spike': 15, # [新增] 爆量權重
+        'w_vol_penalty': -20 # [新增] 高波動懲罰
     }
     
     if params:
         for k in weights.keys():
             if k in params: weights[k] = params[k]
 
-    # --- 2. 基礎欄位計算 ---
-    if 'RSI' not in df.columns: df['RSI'] = 50
-    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
-    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
-    if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240).mean()
-    if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
-    if 'SuperTrend' not in df.columns: df['SuperTrend'] = 0 
-    
-    df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
-
-    # Numpy 加速
+    # --- 2. 準備數據 (Numpy 加速) ---
     close = df['Close'].values
     op = df['Open'].values
     ma20 = df['MA20'].values
     ma60 = df['MA60'].values
-    ma240_slope = df['MA240_Slope'].values
+    ma240_slope = df['MA240'].diff(5).fillna(0).values if 'MA240' in df.columns else np.zeros(len(df))
     super_trend = df['SuperTrend'].values
     rsi = df['RSI'].values
-    vol = df['Volume'].values
-    vol_ma = df['Vol_MA20'].values
+    rvol = df['RVOL'].values if 'RVOL' in df.columns else np.ones(len(df))
+    vol_regime = df['Vol_Regime'].values if 'Vol_Regime' in df.columns else np.ones(len(df))
     
     final_scores = []
     score_details = []
@@ -1076,11 +1071,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, genera
     # --- 3. 評分迴圈 ---
     for i in range(len(df)):
         score = 0
-        
-        # 僅在需要顯示詳細資訊時才收集理由字串 (節省記憶體與時間)
         reasons = [] if generate_detail else None
         
-        # A. 趨勢面
+        # A. 趨勢面 (Trend)
         if close[i] > ma20[i]:
             score += weights['w_price_gt_ma20']
             if generate_detail: reasons.append(f"股價>月線 ({weights['w_price_gt_ma20']:+})")
@@ -1097,58 +1090,54 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, genera
             
         if ma20[i] > ma60[i]:
             score += weights['w_ma_bull']
-            if generate_detail: reasons.append(f"均線多頭 ({weights['w_ma_bull']:+})")
         elif ma20[i] < ma60[i]:
             score += weights['w_ma_bear']
-            if generate_detail: reasons.append(f"均線空頭 ({weights['w_ma_bear']:+})")
 
         if close[i] < super_trend[i]:
             score += weights['w_break_supertrend']
             if generate_detail: reasons.append(f"跌破停損線 ({weights['w_break_supertrend']:+})")
 
-        # B. 動能面
-        r_val = rsi[i]
-        if r_val >= 60:
+        # B. 動能面 (Momentum)
+        if rsi[i] >= 60:
             score += weights['w_rsi_strong']
-            if generate_detail: reasons.append(f"RSI強勢 ({weights['w_rsi_strong']:+})")
-        elif 50 <= r_val < 60:
+        elif 50 <= rsi[i] < 60:
             score += weights['w_rsi_bull']
-            if generate_detail: reasons.append(f"RSI多方 ({weights['w_rsi_bull']:+})")
-        elif r_val < 30:
+        elif rsi[i] < 30:
             score += weights['w_rsi_oversold']
-            if generate_detail: reasons.append(f"RSI超賣 ({weights['w_rsi_oversold']:+})")
         else: 
             score += weights['w_rsi_weak']
-            if generate_detail: reasons.append(f"RSI弱勢 ({weights['w_rsi_weak']:+})")
             
         if i > 0 and rsi[i] > rsi[i-1]:
             score += weights['w_momentum_up']
-            if generate_detail: reasons.append(f"動能增強 ({weights['w_momentum_up']:+})")
 
-        # C. 量價
-        if vol[i] > vol_ma[i]:
-            if close[i] > op[i]: 
-                score += 10
-                if generate_detail: reasons.append("出量上漲 (+10)")
-            else: 
-                score -= 10
-                if generate_detail: reasons.append("出量下跌 (-10)")
+        # C. 量價結構 (Volume & Structure) - [關鍵升級]
+        # 如果 RVOL > 1.5 (量大) 且 收紅 -> 加分
+        if rvol[i] > 1.5 and close[i] > op[i]:
+            score += weights['w_rvol_spike']
+            if generate_detail: reasons.append(f"爆量長紅 (RVOL>1.5, {weights['w_rvol_spike']:+})")
+        # 如果 RVOL > 2.0 (爆量) 且 收黑 -> 扣分
+        elif rvol[i] > 2.0 and close[i] < op[i]:
+            score -= 15
+            if generate_detail: reasons.append("爆量長黑 (-15)")
 
-        # D. 黃金坑
-        if r_val < 30 and ma240_slope[i] > 0:
+        # D. 黃金坑 (Golden Pit)
+        if rsi[i] < 30 and ma240_slope[i] > 0:
              restore = abs(min(score, 0)) 
              score += restore
              score += weights['w_golden_pit']
              if generate_detail: reasons.append(f"<b>💎 牛市黃金坑 ({weights['w_golden_pit']:+})</b>")
 
-        # E. 輸出
+        # E. 波動率過濾 (Volatility Filter) - [關鍵升級]
+        # 如果波動率體制 > 1.5 (極度震盪)，扣分以減少假訊號
+        if vol_regime[i] > 1.5:
+            score += weights['w_vol_penalty']
+            if generate_detail: reasons.append(f"高波動懲罰 ({weights['w_vol_penalty']:+})")
+
+        # F. 輸出
         final_score = max(min(score, 100), -100)
         final_scores.append(final_score)
         
-        # [關鍵修正] 只要 generate_detail 為 True 就生成 HTML，不管有沒有 params
         if generate_detail:
-            title_color = "#ff5252" if final_score > 0 else "#00e676"
-            # 這裡使用簡單的 HTML 格式供 Plotly hover 使用
             html_str = f"<b>Alpha Score: {int(final_score)}</b><br>"
             html_str += "<br>".join(reasons)
             score_details.append(html_str)
@@ -1834,7 +1823,7 @@ elif page == "📊 單股深度分析":
                     st.caption("⚪ 未啟用：使用下方設定的固定門檻。")
             
             st.markdown("---")
-            
+
             # Group 1: 買賣門檻
             st.caption("🎯 買賣訊號門檻")
             c1, c2, c3, c4 = st.columns(4)
