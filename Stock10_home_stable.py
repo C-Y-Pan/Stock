@@ -54,9 +54,79 @@ def init_db():
     c.execute('''CREATE TABLE IF NOT EXISTS portfolios 
                  (username TEXT, ticker TEXT, shares INTEGER, 
                   FOREIGN KEY(username) REFERENCES users(username))''')
+    # [新增] DNA 參數研究專用表 (儲存 JSON 字串以容納動態參數)
+    c.execute('''CREATE TABLE IF NOT EXISTS dna_research 
+                 (ticker TEXT PRIMARY KEY, 
+                  name TEXT, 
+                  params_json TEXT, 
+                  updated_at TIMESTAMP)''')
+    
     conn.commit()
     conn.close()
 
+
+import json
+
+def save_dna_result_to_db(ticker, name, params_dict):
+    """將單一股票的最佳參數存入 DB"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    try:
+        # 將參數字典轉為 JSON 字串儲存
+        params_json = json.dumps(params_dict, ensure_ascii=False)
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        c.execute('INSERT OR REPLACE INTO dna_research (ticker, name, params_json, updated_at) VALUES (?, ?, ?, ?)',
+                  (ticker, name, params_json, now))
+        conn.commit()
+    except Exception as e:
+        print(f"DB Save Error: {e}")
+    finally:
+        conn.close()
+
+def load_dna_results_from_db():
+    """從 DB 讀取所有已分析的結果"""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        c = conn.cursor()
+        c.execute('SELECT ticker, name, params_json FROM dna_research')
+        rows = c.fetchall()
+        
+        results = []
+        for r in rows:
+            ticker = r[0]
+            name = r[1]
+            p = json.loads(r[2]) # 解析 JSON 回字典
+            # 合併欄位
+            row_data = p.copy()
+            row_data['Code'] = ticker
+            row_data['Name'] = name
+            results.append(row_data)
+        return pd.DataFrame(results)
+    except:
+        return pd.DataFrame()
+    finally:
+        conn.close()
+
+def get_analyzed_tickers():
+    """取得已經分析過的股票代號列表"""
+    conn = sqlite3.connect(DB_NAME)
+    try:
+        df = pd.read_sql("SELECT ticker FROM dna_research", conn)
+        return df['ticker'].tolist()
+    except:
+        return []
+    finally:
+        conn.close()
+
+def clear_dna_db():
+    """清空實驗數據"""
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute('DELETE FROM dna_research')
+    conn.commit()
+    conn.close()
+
+    
 def make_hashes(password):
     """密碼加密 (SHA256)"""
     return hashlib.sha256(str.encode(password)).hexdigest()
@@ -3416,189 +3486,157 @@ elif page == "🧪 策略實驗室":
             use_container_width=True
         )
 
-# --- 頁面 6: 參數普適性研究 ---
+# --- 頁面 6: 參數普適性研究 (支援斷點續傳) ---
 elif page == "🧬 參數普適性研究":
     st.markdown("### 🧬 參數 DNA 實驗室：普適性 vs. 特異性")
-    st.caption("此模組將對多檔股票進行「深度參數擬合」，並統計各參數的分佈狀況，藉此釐清哪些邏輯是市場的鐵律（普適），哪些是需隨股性調整的變數（特異）。")
+    st.caption("此模組支援 **斷點續傳**。分析結果會即時寫入資料庫，若中途停止，下次勾選「跳過已分析」即可接續執行。")
 
     # 1. 輸入區塊
-    with st.expander("🛠️ 實驗樣本設定", expanded=True):
-        default_list = "2330 台積電\n2317 鴻海\n2454 聯發科\n2603 長榮\n1513 中興電\n3035 智原\n2382 廣達\n3231 緯創"
-        tickers_input = st.text_area("輸入股票代號 (每行一支，可含中文名稱)", value=default_list, height=150)
+    with st.expander("🛠️ 實驗樣本與設定", expanded=True):
+        default_list = "2330 台積電\n2317 鴻海\n2454 聯發科\n2603 長榮"
+        tickers_input = st.text_area("輸入股票代號 (每行一支)", value=default_list, height=150)
         
-        c1, c2 = st.columns(2)
+        c1, c2, c3 = st.columns(3)
         with c1:
             start_d = st.date_input("回測開始日", value=datetime.today() - timedelta(days=365*2))
         with c2:
             end_d = st.date_input("回測結束日", value=datetime.today())
+        with c3:
+            # [關鍵功能] 斷點續傳開關
+            skip_existing = st.checkbox("跳過已分析的股票 (續傳模式)", value=True)
 
-        run_btn = st.button("🧬 啟動 DNA 定序 (多股參數優化)", type="primary")
+        col_run, col_clear = st.columns([1, 1])
+        with col_run:
+            run_btn = st.button("🧬 啟動 DNA 定序 (邊掃邊存)", type="primary")
+        with col_clear:
+            if st.button("🗑️ 清空歷史資料庫"):
+                clear_dna_db()
+                st.success("已清空資料庫！")
+                st.rerun()
 
-    # 2. 執行邏輯
+    # 2. 顯示目前資料庫狀態
+    existing_df = load_dna_results_from_db()
+    if not existing_df.empty:
+        st.info(f"📊 資料庫中已有 {len(existing_df)} 檔股票的分析數據。")
+
+    # 3. 執行邏輯
     if run_btn:
         # 解析代號
-        tickers = [t.strip().split(" ")[0] for t in tickers_input.split('\n') if t.strip()]
+        tickers_all = [t.strip().split(" ")[0] for t in tickers_input.split('\n') if t.strip()]
         
-        results_params = []
-        progress_bar = st.progress(0)
-        status_txt = st.empty()
-        error_log = st.empty() # 顯示錯誤訊息用
+        # 取得已分析清單
+        analyzed_list = get_analyzed_tickers() if skip_existing else []
         
-        # 建立結果容器
-        collected_data = []
-
-        # --- 迴圈：對每一檔股票進行優化 ---
-        for i, ticker in enumerate(tickers):
-            try:
-                status_txt.text(f"正在解析 ({i+1}/{len(tickers)})：{ticker} 的最佳參數基因...")
-                progress_bar.progress((i + 1) / len(tickers))
-                
-                # A. 獲取數據
-                raw_df, fmt_ticker = get_stock_data(ticker, start_d, end_d)
-                
-                # [防呆] 如果抓不到資料或資料太少，跳過
-                if raw_df.empty or len(raw_df) < 100:
-                    print(f"Skipping {ticker}: Insufficient data.")
-                    continue
+        # 過濾待辦清單
+        tickers_to_run = [t for t in tickers_all if t not in analyzed_list]
+        
+        if not tickers_to_run and skip_existing:
+            st.warning("所有輸入的股票都已分析過。若要重新分析，請取消勾選「跳過已分析」。")
+        else:
+            progress_bar = st.progress(0)
+            status_txt = st.empty()
+            
+            # --- 迴圈：對每一檔股票進行優化 ---
+            for i, ticker in enumerate(tickers_to_run):
+                try:
+                    status_txt.markdown(f"**[{i+1}/{len(tickers_to_run)}] 正在解析：{ticker} ...**")
+                    progress_bar.progress((i) / len(tickers_to_run))
                     
-                name = get_stock_name(fmt_ticker)
+                    # A. 獲取數據
+                    raw_df, fmt_ticker = get_stock_data(ticker, start_d, end_d)
+                    if raw_df.empty or len(raw_df) < 100:
+                        print(f"Skipping {ticker}: Insufficient data.")
+                        continue
+                        
+                    name = get_stock_name(fmt_ticker)
+                    
+                    # B. 執行優化 (降至 500 次以平衡速度)
+                    best_p, _ = run_optimization(
+                        raw_df, market_df, start_d, 
+                        0.001425, 0.003, 
+                        use_chip_strategy=False, 
+                        use_strict_bear_exit=True,
+                        n_trials=500 
+                    )
+                    
+                    if best_p:
+                        # [關鍵] C. 即時寫入資料庫
+                        # 我們不依賴 Python List，而是直接存硬碟
+                        save_dna_result_to_db(ticker, name, best_p)
+                        st.toast(f"✅ {ticker} 分析完成並存檔！")
                 
-                # B. 執行優化 (尋找該股的最佳參數)
-                # [關鍵修正]：將 n_trials 設為 500 (降低次數以加快批量處理速度，避免超時)
-                best_p, _ = run_optimization(
-                    raw_df, market_df, start_d, 
-                    0.001425, 0.003, 
-                    use_chip_strategy=False, 
-                    use_strict_bear_exit=True,
-                    n_trials=500  # <--- 設定為較低次數
-                )
-                
-                if best_p:
-                    # 記錄這檔股票的「基因」(最佳參數)
-                    row = best_p.copy()
-                    row['Code'] = ticker
-                    row['Name'] = name
-                    collected_data.append(row)
-            
-            except Exception as e:
-                # [防呆] 捕捉錯誤並顯示，但不中斷迴圈
-                st.toast(f"⚠️ {ticker} 分析失敗，已跳過。原因: {str(e)}")
-                print(f"Error analyzing {ticker}: {e}")
-                continue
+                except Exception as e:
+                    st.toast(f"⚠️ {ticker} 分析失敗: {str(e)}")
+                    continue
 
-        progress_bar.empty()
-        status_txt.empty()
+            progress_bar.progress(100)
+            status_txt.success("🎉 佇列處理完成！")
+            st.rerun() # 刷新頁面以顯示最新圖表
 
-        if collected_data:
-            df_params = pd.DataFrame(collected_data)
-            
-            # 移除非參數的欄位，只保留數值型參數
-            exclude_cols = ['Code', 'Name', 'Return', 'Mult', 'RSI_Buy'] # Mult/RSI_Buy 通常固定或無用
-            param_cols = [c for c in df_params.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_params[c])]
-            
-            st.success(f"✅ 完成 {len(df_params)} 檔股票的參數定序！")
-            
-            # ==================================================
-            # 3. 視覺化分析：普適性 vs 特異性
-            # ==================================================
-            
-            # A. 參數變異數分析 (Coefficient of Variation)
-            # 變異係數 CV = 標準差 / 平均值 (取絕對值避免平均為0的問題)
-            # 我們這裡直接用 標準差 (Std) 來衡量離散程度，因為參數 Scale 大致相同 (-100~100)
-            
+    # ==================================================
+    # 4. 視覺化分析 (從資料庫讀取)
+    # ==================================================
+    df_params = load_dna_results_from_db() # 重新讀取完整數據
+    
+    if not df_params.empty:
+        st.markdown("---")
+        st.markdown(f"### 🧬 全域參數分析 (樣本數: {len(df_params)})")
+        
+        # 篩選數值型欄位
+        exclude_cols = ['Code', 'Name', 'Return', 'Mult', 'RSI_Buy'] 
+        param_cols = [c for c in df_params.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_params[c])]
+        
+        if param_cols:
+            # A. 參數變異數分析
             stats = df_params[param_cols].describe().T
             stats['Std_Dev'] = stats['std']
-            stats['Range'] = stats['max'] - stats['min']
             
-            # 定義：Std Dev < 10 為「普適參數」， > 15 為「特異參數」
+            # 普適 vs 特異
             universal_params = stats[stats['Std_Dev'] <= 10].index.tolist()
             specific_params = stats[stats['Std_Dev'] > 10].index.tolist()
             
-            # --- 報告區塊 ---
-            st.markdown("### 🔬 分析報告：市場定律與個股性格")
-            
             c_uni, c_spec = st.columns(2)
-            
             with c_uni:
-                st.info(f"🌍 **普適參數 (Universal Laws)**\n\n"
-                        f"這些參數在不同股票間差異極小，代表**市場的共同語言** (標準差 <= 10)。")
-                for p in universal_params:
-                    mean_val = stats.loc[p, 'mean']
-                    st.markdown(f"- **{p}**: 平均值 `{mean_val:.1f}`")
-            
+                st.info(f"🌍 **普適參數 (標準差<=10)**\n\n市場共性，不隨個股改變。")
+                st.write(", ".join(universal_params))
             with c_spec:
-                st.warning(f"🎭 **特異參數 (Idiosyncratic Factors)**\n\n"
-                           f"這些參數隨股性劇烈變化，是**區分個股性格的關鍵** (標準差 > 10)。")
-                for p in specific_params:
-                    std_val = stats.loc[p, 'std']
-                    st.markdown(f"- **{p}**: 波動程度 `{std_val:.1f}`")
+                st.warning(f"🎭 **特異參數 (標準差>10)**\n\n隨股性劇烈變化，需客製化。")
+                st.write(", ".join(specific_params))
 
-            st.markdown("---")
-
-            # B. 箱型圖比較 (Box Plot)
-            st.markdown("#### 📊 參數分佈箱型圖 (Box Plot Comparison)")
-            st.caption("箱子越窄 = 參數越穩定 (普適)；箱子越寬 = 參數越因股而異 (特異)")
-            
+            # B. 箱型圖
             fig_box = go.Figure()
-            
-            # 根據平均值排序，讓圖表更整齊
             sorted_params = stats.sort_values(by='mean', ascending=False).index
             
             for col in sorted_params:
-                # 區分顏色：特異參數用紅色，普適參數用綠色
                 color = '#ef5350' if col in specific_params else '#00e676'
-                
                 fig_box.add_trace(go.Box(
-                    y=df_params[col],
-                    name=col,
-                    boxpoints='all', # 顯示所有點
-                    jitter=0.3,
-                    pointpos=-1.8,
-                    marker_color=color,
-                    boxmean=True # 顯示平均線
+                    y=df_params[col], name=col,
+                    boxpoints='all', jitter=0.3, pointpos=-1.8,
+                    marker_color=color, boxmean=True
                 ))
             
-            fig_box.update_layout(
-                template="plotly_dark",
-                height=600,
-                xaxis_title="策略參數",
-                yaxis_title="最佳化數值 (Weight/Threshold)",
-                showlegend=False,
-                margin=dict(l=40, r=40, t=40, b=40)
-            )
+            fig_box.update_layout(height=500, template="plotly_dark", showlegend=False, margin=dict(l=40, r=40, t=20, b=20))
             st.plotly_chart(fig_box, use_container_width=True)
 
-            # C. 熱力圖 (Heatmap) - 讓使用者看到每一檔股票的具體數值
-            st.markdown("#### 🔥 參數基因熱力圖 (Stock-Parameter Heatmap)")
-            st.caption("縱軸為股票，橫軸為參數。顏色越紅代表正權重越高，越綠代表負權重越重。")
-            
-            # 準備熱力圖數據
+            # C. 熱力圖
+            st.markdown("#### 🔥 參數基因熱力圖")
             z_data = df_params[sorted_params].values
             x_labels = sorted_params
             y_labels = df_params['Name'] + " (" + df_params['Code'] + ")"
             
             fig_heat = go.Figure(data=go.Heatmap(
-                z=z_data,
-                x=x_labels,
-                y=y_labels,
-                colorscale='RdBu_r', # 紅綠/紅藍配色，中間白
-                zmid=0, # 設定 0 為中間色
-                colorbar=dict(title="參數值")
+                z=z_data, x=x_labels, y=y_labels,
+                colorscale='RdBu_r', zmid=0, colorbar=dict(title="值")
             ))
-            
-            fig_heat.update_layout(
-                template="plotly_dark",
-                height=max(400, len(tickers) * 30), # 自動調整高度
-                margin=dict(l=150, r=40, t=40, b=40)
-            )
+            fig_heat.update_layout(template="plotly_dark", height=max(400, len(df_params) * 25), margin=dict(l=150))
             st.plotly_chart(fig_heat, use_container_width=True)
-
-            # D. 詳細數據表
-            with st.expander("📄 查看原始數據表"):
-                st.dataframe(
-                    df_params.style.background_gradient(cmap='RdBu_r', subset=param_cols, vmin=-50, vmax=50)
-                             .format("{:.1f}", subset=param_cols),
-                    use_container_width=True
-                )
+            
+            # D. 資料表
+            with st.expander("📄 詳細數據表"):
+                st.dataframe(df_params)
         else:
-            st.error("無有效數據生成。")
+            st.warning("資料庫中有資料，但無法解析出數值參數，請檢查資料格式。")
+
+            
+
+            
