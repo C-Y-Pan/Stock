@@ -1621,7 +1621,7 @@ market_df = get_market_data(start_date, end_date)
 if page == "🌍 市場總覽 (Macro)":
     draw_market_dashboard(market_df, start_date, end_date)
 
-# --- 頁面 2: 單股深度分析 (修正版：使用 run_optimization) ---
+# --- 頁面 2: 單股深度分析 (修正版：AI 結果自動填入輸入框) ---
 elif page == "📊 單股深度分析":
     # ==================================================
     # 1. 資料準備與搜尋清單建立
@@ -1705,7 +1705,6 @@ elif page == "📊 單股深度分析":
         # ==========================================
         # [核心] 策略參數 Session State 初始化
         # ==========================================
-        # 如果 session 中還沒有參數，載入預設值
         default_strategy_params = {
             'buy_consecutive_sum': 40, 'buy_single_day': 40, 'sell_threshold': -40, 'sell_slope': -60,
             'w_price_gt_ma20': 20, 'w_price_lt_ma20': -20,
@@ -1736,9 +1735,7 @@ elif page == "📊 單股深度分析":
                             current_fee = fee_input if 'fee_input' in locals() else 0.001425
                             current_tax = tax_input if 'tax_input' in locals() else 0.003
                             
-                            # [關鍵修正]：呼叫 run_optimization 進行擬合
-                            # 注意：這裡不傳入 n_trials，使用函數內部預設值
-                            # 這些開關參數在此模式下可能無效，但為了保持接口一致仍傳入
+                            # 執行蒙地卡羅優化
                             best_p, _ = run_optimization(
                                 raw_df_opt, market_df, start_date, 
                                 current_fee, current_tax, 
@@ -1746,24 +1743,29 @@ elif page == "📊 單股深度分析":
                                 use_strict_bear_exit=False
                             )
                             
-                            # 更新 Session State
+                            # [關鍵修正]：同步更新資料與 UI Widget 狀態
                             if best_p:
-                                # 只更新參數鍵值
                                 for k in default_strategy_params.keys():
                                     if k in best_p:
-                                        st.session_state['strategy_params'][k] = best_p[k]
-                                st.success(f"✅ 擬合完成！最佳回測報酬: {best_p.get('Return', 0)*100:.1f}%")
-                                st.rerun() # 強制刷新介面以顯示新參數
+                                        val = best_p[k]
+                                        # 1. 更新資料源
+                                        st.session_state['strategy_params'][k] = val
+                                        # 2. 強制更新 Widget 的 session key，讓輸入框數字立刻變動
+                                        st.session_state[f"widget_{k}"] = val
+                                        
+                                st.success(f"✅ 擬合完成！參數已自動填入。最佳回測報酬: {best_p.get('Return', 0)*100:.1f}%")
+                                st.rerun() # 強制刷新介面
             
             with c_reset:
                 if st.button("↩️ 重置預設值", use_container_width=True):
-                    st.session_state['strategy_params'] = default_strategy_params.copy()
+                    for k, val in default_strategy_params.items():
+                        st.session_state['strategy_params'][k] = val
+                        st.session_state[f"widget_{k}"] = val # 同步重置 Widget
                     st.rerun()
 
             st.markdown("---")
             
             # --- 參數輸入區 (雙向綁定 Session State) ---
-            # 使用 callback 更新 session state，確保手動輸入即時生效
             def update_param(key):
                 st.session_state['strategy_params'][key] = st.session_state[f"widget_{key}"]
 
@@ -1818,17 +1820,16 @@ elif page == "📊 單股深度分析":
                 df_ind = calculate_indicators(raw_df, 10, 3.0, market_df)
                 df_slice = df_ind[df_ind['Date'] >= pd.to_datetime(start_date)].copy()
                 
-                # C. [核心修改] 直接呼叫 run_simple_strategy，傳入當前的 params
+                # C. 直接呼叫策略 (單次執行)
                 final_df = run_simple_strategy(
                     df_slice, 
                     fee_rate=current_fee, 
                     tax_rate=current_tax,
                     use_chip_strategy=enable_chip_strategy,
                     use_strict_bear_exit=enable_strict_bear_exit,
-                    params=st.session_state['strategy_params'] # <--- 傳入參數
+                    params=st.session_state['strategy_params'] # 使用當前參數
                 )
                 
-                # 構建 best_params (供顯示用)
                 best_params = st.session_state['strategy_params'].copy()
                 if not final_df.empty:
                     best_params['Return'] = final_df['Cum_Strategy'].iloc[-1] - 1
@@ -1845,8 +1846,7 @@ elif page == "📊 單股深度分析":
             if final_df is None or final_df.empty:
                 if not raw_df.empty: st.warning("⚠️ 選定區間內無足夠資料進行策略運算。")
             else:
-                # 重新計算 Alpha Score 詳細資訊 (為了 Score_Detail HTML)
-                stock_alpha_df = final_df # 直接使用
+                stock_alpha_df = final_df 
                 base_score = stock_alpha_df['Alpha_Score'].iloc[-1]
                 base_log = stock_alpha_df['Score_Log'].iloc[-1]
                 
@@ -2182,7 +2182,7 @@ elif page == "📊 單股深度分析":
                     else:
                         st.warning("數據不足，無法進行統計驗證。")
                         
-                                                
+                                                                        
 
 
 # --- 頁面 3: 戰略雷達 (含資金流向與擴充清單) ---
