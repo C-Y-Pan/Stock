@@ -547,15 +547,13 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['Vol_MA20'] = data['Volume'].rolling(20).mean().replace(0, 1).fillna(1)
     
     data['MA20'] = data['Close'].rolling(20).mean()
-    # [新增] MA30 用於乖離判斷
     data['MA30'] = data['Close'].rolling(30).mean()
     data['MA60'] = data['Close'].rolling(60).mean()
     data['MA120'] = data['Close'].rolling(120).mean() 
     data['MA240'] = data['Close'].rolling(240, min_periods=60).mean()
     
-    # [新增] 100日新高 與 週漲幅參考價
     data['High_100d'] = data['Close'].rolling(100).max()
-    data['Close_Lag5'] = data['Close'].shift(5) # 5天前價格，計算週漲幅用
+    data['Close_Lag5'] = data['Close'].shift(5)
 
     high = data['High']; low = data['Low']; close = data['Close']
     
@@ -565,6 +563,15 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
     data['tr2'] = abs(low - close.shift(1))
     data['TR'] = data[['tr0', 'tr1', 'tr2']].max(axis=1)
     data['ATR'] = data['TR'].ewm(span=atr_period, adjust=False).mean()
+    
+    # ============================================================
+    # [新增] 自適應波動率體制 (Vol Regime)
+    # 計算公式：當前 ATR% / 過去 60 日平均 ATR%
+    # 值 > 1.2 代表高波動 (需提高門檻)；值 < 0.8 代表低波動 (可降低門檻)
+    # ============================================================
+    data['ATR_Pct'] = data['ATR'] / data['Close']
+    data['Vol_Regime'] = data['ATR_Pct'] / data['ATR_Pct'].rolling(60).mean()
+    data['Vol_Regime'] = data['Vol_Regime'].fillna(1.0) # 預設為正常波動
     
     # SuperTrend Calculation
     data['Basic_Upper'] = (high + low) / 2 + (multiplier * data['ATR'])
@@ -623,12 +630,12 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 # 3. 策略邏輯 (不改名，內建參數化支援)
 # ==========================================
-def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, params=None):
+def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, params=None):
     """
-    執行策略 v15:
-    支援 params 字典傳入自訂買賣門檻。
+    執行策略 v16 (自適應版):
+    支援 params 字典傳入 'use_adaptive' 參數，啟用動態門檻調整。
     """
-    # 1. 計算 Alpha Score (傳入 params 以計算動態權重)
+    # 1. 計算 Alpha Score
     df = calculate_alpha_score(data, params=params)
     
     if 'Dividends' not in df.columns: df['Dividends'] = 0.0
@@ -636,17 +643,21 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
     
     df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
     
-    # --- 定義門檻 (若無 params 則使用預設值) ---
+    # --- 參數讀取 ---
     buy_sum_thresh = 40
     buy_single_thresh = 40
     sell_alpha_thresh = -40
     sell_slope_thresh = -60
     
+    use_adaptive = False # 預設關閉
+
     if params:
         buy_sum_thresh = params.get('buy_consecutive_sum', 40)
         buy_single_thresh = params.get('buy_single_day', 40)
         sell_alpha_thresh = params.get('sell_threshold', -40)
         sell_slope_thresh = params.get('sell_slope', -60)
+        # 讀取自適應開關
+        use_adaptive = params.get('use_adaptive', False)
     
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
@@ -659,29 +670,42 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
     slope = df['Alpha_Slope'].values
     close = df['Close'].values
     dividends = df['Dividends'].values
+    vol_regime = df['Vol_Regime'].values if 'Vol_Regime' in df.columns else np.ones(len(df))
     
     for i in range(len(df)):
         signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
         this_target = entry_price * 1.15 if position == 1 else np.nan
         ret_label = ""; conf_score = 0
         
+        # --- 動態門檻計算 (Adaptive Logic) ---
+        current_buy_sum = buy_sum_thresh
+        current_buy_single = buy_single_thresh
+        
+        if use_adaptive:
+            # 波動率調節因子 (限制在 0.8 ~ 1.5 倍之間)
+            # 波動大 -> 因子大 -> 門檻變高 (難買)
+            # 波動小 -> 因子小 -> 門檻變低 (好買)
+            v_factor = min(1.5, max(0.8, vol_regime[i]))
+            current_buy_sum = buy_sum_thresh * v_factor
+            current_buy_single = buy_single_thresh * v_factor
+        
         # --- 買入邏輯 ---
         if position == 0:
             is_buy = False
             
-            # 1. 若連續2日alpha為正且該2日的alpha值相加 >= buy_sum_thresh
+            # 1. 連續2日 Alpha 積累
             cond1 = False
             if i > 0:
-                cond1 = (alpha[i] > 0) and (alpha[i-1] > 0) and ((alpha[i] + alpha[i-1]) >= buy_sum_thresh)
+                cond1 = (alpha[i] > 0) and (alpha[i-1] > 0) and ((alpha[i] + alpha[i-1]) >= current_buy_sum)
             
-            # 2. 若當日alpha值 >= buy_single_thresh
-            cond2 = (alpha[i] >= buy_single_thresh)
+            # 2. 單日爆發
+            cond2 = (alpha[i] >= current_buy_single)
             
             if cond1:
-                is_buy = True; reason_str = f"動能積累 (>{buy_sum_thresh})"
+                is_buy = True; reason_str = f"動能積累 (>{current_buy_sum:.1f})"
                 conf_score = 85
             elif cond2:
-                is_buy = True; reason_str = f"強勢爆發 (>{buy_single_thresh})"
+                is_buy = True; reason_str = f"強勢爆發 (>{current_buy_single:.1f})"
                 conf_score = 90
             
             if is_buy:
@@ -696,17 +720,20 @@ def run_simple_strategy(data, rsi_buy_thresh=30, fee_rate=0.001425, tax_rate=0.0
             
             is_sell = False
             
-            # 3. 若當日alpha <= sell_alpha_thresh 且 slope <= sell_slope_thresh
+            # 3. Alpha 轉弱
             cond_sell_alpha = (alpha[i] <= sell_alpha_thresh) and (slope[i] <= sell_slope_thresh)
             
-            # 基本停損 (固定 15%，不遍歷，避免優化出無限大停損)
+            # 4. 硬停損 (Fixed Stop Loss)
             stop_loss_limit = -0.15 
             
             if cond_sell_alpha:
-                is_sell = True; reason_str = f"Alpha崩跌 (A<{sell_alpha_thresh}, S<{sell_slope_thresh})"; action_code = "Sell"
+                is_sell = True; reason_str = f"Alpha崩跌 (A<{sell_alpha_thresh}, S<{sell_slope_thresh})"
             elif drawdown < stop_loss_limit:
-                is_sell = True; reason_str = f"觸發硬停損({stop_loss_limit*100:.0f}%)"; action_code = "Sell"
-            
+                is_sell = True; reason_str = f"觸發硬停損({stop_loss_limit*100:.0f}%)"
+            elif use_strict_bear_exit and (close[i] < df['MA20'].values[i]) and (df['MA20'].values[i] < df['MA60'].values[i]):
+                 # [原有邏輯] 長空破月線
+                 is_sell = True; reason_str = "長空破月線"
+
             if is_sell:
                 signal = 0; action_code = "Sell"
                 final_pnl_value = (close[i] + cum_div) - entry_price
@@ -1783,10 +1810,31 @@ elif page == "📊 單股深度分析":
 
             st.markdown("---")
             
-            # --- 參數輸入區 (雙向綁定 Session State) ---
+# --- 參數輸入區 (雙向綁定 Session State) ---
             def update_param(key):
                 st.session_state['strategy_params'][key] = st.session_state[f"widget_{key}"]
 
+            # [新增] 自適應模式開關
+            st.markdown("##### 🧠 自適應演算法 (Adaptive Logic)")
+            c_adapt, c_void = st.columns([2, 2])
+            with c_adapt:
+                # 確保 session state 有初始值
+                if 'use_adaptive' not in st.session_state['strategy_params']:
+                    st.session_state['strategy_params']['use_adaptive'] = False
+                
+                enable_adaptive = st.toggle(
+                    "啟用波動率自適應門檻 (Volatility Adaptive)", 
+                    value=st.session_state['strategy_params']['use_adaptive'],
+                    key="widget_use_adaptive",
+                    on_change=update_param, args=('use_adaptive',)
+                )
+                if enable_adaptive:
+                    st.caption("✅ 已啟用：系統將依據 ATR 波動率自動調控買賣門檻。高波動時更保守，低波動時更積極。")
+                else:
+                    st.caption("⚪ 未啟用：使用下方設定的固定門檻。")
+            
+            st.markdown("---")
+            
             # Group 1: 買賣門檻
             st.caption("🎯 買賣訊號門檻")
             c1, c2, c3, c4 = st.columns(4)
