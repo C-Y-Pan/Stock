@@ -1032,8 +1032,8 @@ def analyze_signal(final_df):
 # ==========================================
 def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, generate_detail=True):
     """
-    Alpha Score v16.0 (Institution Upgrade):
-    加入 RVOL (相對量能) 與 Vol_Regime (波動懲罰)。
+    Alpha Score v16.1 (Fix KeyError):
+    加入欄位檢查防呆機制，防止因缺少 SuperTrend/RVOL 導致崩潰。
     """
     df = df.copy()
 
@@ -1046,24 +1046,33 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, genera
         'w_rsi_strong': 10, 'w_rsi_bull': 5, 'w_rsi_oversold': -10, 'w_rsi_weak': -5,
         'w_momentum_up': 5,
         'w_golden_pit': 35,
-        'w_rvol_spike': 15, # [新增] 爆量權重
-        'w_vol_penalty': -20 # [新增] 高波動懲罰
+        'w_rvol_spike': 15,
+        'w_vol_penalty': -20
     }
     
     if params:
         for k in weights.keys():
             if k in params: weights[k] = params[k]
 
-    # --- 2. 準備數據 (Numpy 加速) ---
+    # --- 2. 準備數據 (加入防呆預設值) ---
+    # 若缺少欄位，則自動補上預設值，避免 KeyError
+    if 'SuperTrend' not in df.columns: df['SuperTrend'] = 0
+    if 'RVOL' not in df.columns: df['RVOL'] = 1.0
+    if 'Vol_Regime' not in df.columns: df['Vol_Regime'] = 1.0
+    if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
+    if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    if 'RSI' not in df.columns: df['RSI'] = 50
+
+    # Numpy 加速
     close = df['Close'].values
     op = df['Open'].values
-    ma20 = df['MA20'].values
-    ma60 = df['MA60'].values
+    ma20 = df['MA20'].fillna(0).values
+    ma60 = df['MA60'].fillna(0).values
     ma240_slope = df['MA240'].diff(5).fillna(0).values if 'MA240' in df.columns else np.zeros(len(df))
     super_trend = df['SuperTrend'].values
-    rsi = df['RSI'].values
-    rvol = df['RVOL'].values if 'RVOL' in df.columns else np.ones(len(df))
-    vol_regime = df['Vol_Regime'].values if 'Vol_Regime' in df.columns else np.ones(len(df))
+    rsi = df['RSI'].fillna(50).values
+    rvol = df['RVOL'].fillna(1.0).values
+    vol_regime = df['Vol_Regime'].fillna(1.0).values
     
     final_scores = []
     score_details = []
@@ -1073,7 +1082,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, genera
         score = 0
         reasons = [] if generate_detail else None
         
-        # A. 趨勢面 (Trend)
+        # A. 趨勢面
         if close[i] > ma20[i]:
             score += weights['w_price_gt_ma20']
             if generate_detail: reasons.append(f"股價>月線 ({weights['w_price_gt_ma20']:+})")
@@ -1097,7 +1106,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, genera
             score += weights['w_break_supertrend']
             if generate_detail: reasons.append(f"跌破停損線 ({weights['w_break_supertrend']:+})")
 
-        # B. 動能面 (Momentum)
+        # B. 動能面
         if rsi[i] >= 60:
             score += weights['w_rsi_strong']
         elif 50 <= rsi[i] < 60:
@@ -1110,25 +1119,22 @@ def calculate_alpha_score(df, margin_df=None, short_df=None, params=None, genera
         if i > 0 and rsi[i] > rsi[i-1]:
             score += weights['w_momentum_up']
 
-        # C. 量價結構 (Volume & Structure) - [關鍵升級]
-        # 如果 RVOL > 1.5 (量大) 且 收紅 -> 加分
+        # C. 量價結構
         if rvol[i] > 1.5 and close[i] > op[i]:
             score += weights['w_rvol_spike']
             if generate_detail: reasons.append(f"爆量長紅 (RVOL>1.5, {weights['w_rvol_spike']:+})")
-        # 如果 RVOL > 2.0 (爆量) 且 收黑 -> 扣分
         elif rvol[i] > 2.0 and close[i] < op[i]:
             score -= 15
             if generate_detail: reasons.append("爆量長黑 (-15)")
 
-        # D. 黃金坑 (Golden Pit)
+        # D. 黃金坑
         if rsi[i] < 30 and ma240_slope[i] > 0:
              restore = abs(min(score, 0)) 
              score += restore
              score += weights['w_golden_pit']
              if generate_detail: reasons.append(f"<b>💎 牛市黃金坑 ({weights['w_golden_pit']:+})</b>")
 
-        # E. 波動率過濾 (Volatility Filter) - [關鍵升級]
-        # 如果波動率體制 > 1.5 (極度震盪)，扣分以減少假訊號
+        # E. 波動率過濾
         if vol_regime[i] > 1.5:
             score += weights['w_vol_penalty']
             if generate_detail: reasons.append(f"高波動懲罰 ({weights['w_vol_penalty']:+})")
@@ -1342,27 +1348,23 @@ def draw_market_dashboard(market_df, start_date, end_date):
     """
     st.markdown("### 🌍 總體市場戰情 (Macro)")
     target_start = pd.to_datetime(start_date)
-    plot_df = market_df[market_df['Date'] >= target_start].copy()
     
-    if plot_df.empty: 
+    # [關鍵修正]：先計算技術指標，確保有 SuperTrend / RVOL / Vol_Regime
+    # 因為是大盤本身，不需要跟另一個 market_df 合併，所以最後一個參數傳空 DataFrame
+    if not market_df.empty:
+        plot_df = calculate_indicators(market_df, 10, 3.0, pd.DataFrame())
+    else:
         st.error("無大盤數據")
         return
+
+    # 篩選日期
+    plot_df = plot_df[plot_df['Date'] >= target_start].copy()
     
-    # =========================================================
-    # 1. 資料準備
-    # =========================================================
-    if 'Market_RSI' in plot_df.columns: plot_df['RSI'] = plot_df['Market_RSI']
-    else: plot_df['RSI'] = 50 
-
-    if 'Market_MA20' in plot_df.columns: plot_df['MA20'] = plot_df['Market_MA20']
-    if 'Market_MA60' in plot_df.columns: plot_df['MA60'] = plot_df['Market_MA60']
-
-    if 'Volume' in plot_df.columns:
-        plot_df['Vol_MA20'] = plot_df['Volume'].rolling(20).mean()
-
-    # =========================================================
-    # 2. 籌碼數據
-    # =========================================================
+    if plot_df.empty: 
+        st.error("選定區間無數據")
+        return
+    
+    # 2. 籌碼數據 (維持原樣)
     margin_df_raw = get_margin_data(start_date.strftime('%Y-%m-%d'))
     margin_df = pd.DataFrame(); short_df = pd.DataFrame()
     if not margin_df_raw.empty:
@@ -1370,45 +1372,44 @@ def draw_market_dashboard(market_df, start_date, end_date):
         margin_df = sliced[sliced['name'] == 'MarginPurchaseMoney']
         short_df = sliced[sliced['name'] == 'ShortSale']
     
-    # =========================================================
-    # 3. 核心運算
-    # =========================================================
+    # 3. 核心運算 (現在 plot_df 已經有指標了，計算 Alpha Score 不會報錯)
     plot_df = calculate_alpha_score(plot_df, margin_df, short_df)
     
     last = plot_df.iloc[-1]
     score = last['Alpha_Score']
-    vix = last['VIX']
+    vix = last['VIX'] if 'VIX' in last else 20
     close = last['Close']
-    ma60 = last['MA60'] if 'MA60' in last else close
+    ma60 = last['MA60']
     
-    # 判斷體制 (用於 Metrics 標籤)
-    bias = (close - ma60) / ma60
-    is_panic_regime = (vix > 25) or (last['RSI'] < 30) or (bias < -0.10)
+    # 判斷體制
+    bias = (close - ma60) / ma60 if ma60 != 0 else 0
+    # [新增] 納入 Vol_Regime 判斷
+    vol_regime_val = last['Vol_Regime'] if 'Vol_Regime' in last else 1.0
+    
+    is_panic_regime = (vix > 25) or (last['RSI'] < 30) or (bias < -0.10) or (vol_regime_val > 1.2)
     regime_label = "🐻 空頭/恐慌體制" if is_panic_regime else "🐂 多頭/正常體制"
 
     # 生成 Alpha Score 評語
     txt = "中性觀望"; c_score = "gray"
     if score >= 60: 
         txt = "💎 危機入市" if is_panic_regime else "🚀 強力趨勢買進"
-        c_score = "#ff5252" # 紅
+        c_score = "#ff5252"
     elif score >= 20: 
         txt = "分批承接" if is_panic_regime else "偏多操作"
-        c_score = "#ff8a80" # 淺紅
+        c_score = "#ff8a80"
     elif score <= -60: 
         txt = "崩盤迴避" if is_panic_regime else "強力賣出"
-        c_score = "#69f0ae" # 綠
+        c_score = "#69f0ae"
     elif score <= -20: 
         txt = "保守觀望" if is_panic_regime else "偏空調節"
-        c_score = "#b9f6ca" # 淺綠
+        c_score = "#b9f6ca"
 
     vix_st = "極度恐慌" if vix>30 else ("恐慌警戒" if vix>20 else ("樂觀貪婪" if vix<15 else "正常波動"))
 
-    # =========================================================
     # 4. 顯示 Metrics
-    # =========================================================
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("加權指數 / 體制", f"{last['Close']:.0f}", regime_label, delta_color="off")
-    c2.metric("市場情緒 (RSI)", f"{last['Market_RSI']:.1f}", "區間: 0~100", delta_color="off")
+    c2.metric("市場情緒 (RSI)", f"{last['RSI']:.1f}", "區間: 0~100", delta_color="off")
     c3.metric("恐慌指數 (VIX)", f"{vix:.2f}", vix_st, delta_color="inverse" if vix > 25 else "off")
     
     c4.markdown(
@@ -1422,22 +1423,14 @@ def draw_market_dashboard(market_df, start_date, end_date):
         unsafe_allow_html=True
     )
 
-    # =========================================================
-    # 5. [修改] 顯示 HTML 前瞻分析報告
-    # =========================================================
+    # 5. 顯示 HTML 前瞻分析報告
     st.write("")
     st.markdown("### 📋 AI 戰情室前瞻分析")
-    
-    # 取得 HTML 字串
     analysis_html = generate_market_analysis(plot_df, margin_df, short_df)
-    
-    # 直接渲染 HTML
     with st.container():
         st.markdown(analysis_html, unsafe_allow_html=True)
 
-    # =========================================================
     # 6. Plotly 圖表
-    # =========================================================
     st.write("")
     fig = make_subplots(rows=8, cols=1, shared_xaxes=True, vertical_spacing=0.03, 
                         row_heights=[0.3, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1],
@@ -1447,6 +1440,10 @@ def draw_market_dashboard(market_df, start_date, end_date):
     fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA20'], name='月線', line=dict(color='yellow', width=1)), row=1, col=1)
     fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['MA60'], name='季線', line=dict(color='rgba(255, 255, 255, 0.5)', width=1)), row=1, col=1)
     
+    # 顯示 SuperTrend (如果有的話)
+    if 'SuperTrend' in plot_df.columns:
+        fig.add_trace(go.Scatter(x=plot_df['Date'], y=plot_df['SuperTrend'], name='SuperTrend', line=dict(color='red', width=1, dash='dot')), row=1, col=1)
+
     colors_score = ['#ff5252' if v > 0 else '#69f0ae' for v in plot_df['Alpha_Score']]
     fig.add_trace(go.Bar(x=plot_df['Date'], y=plot_df['Alpha_Score'], name='評等', marker_color=colors_score), row=2, col=1)
     
@@ -1473,6 +1470,7 @@ def draw_market_dashboard(market_df, start_date, end_date):
     st.plotly_chart(fig, use_container_width=True)
 
 
+    
 def send_analysis_email(df, market_analysis_text):
     if df.empty: return False
 
