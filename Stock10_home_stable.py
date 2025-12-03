@@ -774,7 +774,8 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
 
 import random
 
-def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
+# [修改] 增加 n_trials 參數，預設為 2000
+def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, n_trials=2000):
     """
     更新版 optimization:
     執行蒙地卡羅隨機搜尋 (Random Search)，尋找最佳參數組合。
@@ -805,11 +806,14 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
         'w_rsi_oversold': (-30, -5, 5),
         'w_rsi_weak': (-30, -5, 5),
         'w_momentum_up': (5, 30, 5),
-        'w_golden_pit': (30, 60, 5)
+        'w_golden_pit': (30, 60, 5),
+        'w_rvol_spike': (10, 30, 5),  # [新增參數]
+        'w_vol_penalty': (-30, -10, 5) # [新增參數]
     }
 
     # === 蒙地卡羅模擬 ===
-    n_trials = 2000 
+    # [修改] 這裡不再寫死 2000，而是使用傳入的參數
+    # n_trials = 2000 
     best_ret = -999
     best_params = {}
     best_df = pd.DataFrame()
@@ -841,9 +845,9 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
             
     best_params['Return'] = best_ret
     
-    # [關鍵修正] 補上相容性參數，避免 validate_strategy_robust 報錯 KeyError
+    # 補上相容性參數
     best_params['Mult'] = 3.0 
-    best_params['RSI_Buy'] = 30 # 雖然沒用到，但補上以防萬一
+    best_params['RSI_Buy'] = 30 
     
     conditions = [
         (best_df['Alpha_Score'] >= 60), (best_df['Alpha_Score'] >= 20), (best_df['Alpha_Score'] >= -20),
@@ -853,6 +857,7 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
     best_df['Score_Log'] = np.select(conditions, choices, default="☁️ 觀望")
     
     return best_params, best_df
+
 
 
 def analyze_parameter_personality(best_params):
@@ -3437,37 +3442,49 @@ elif page == "🧬 參數普適性研究":
         results_params = []
         progress_bar = st.progress(0)
         status_txt = st.empty()
+        error_log = st.empty() # 顯示錯誤訊息用
         
         # 建立結果容器
         collected_data = []
 
         # --- 迴圈：對每一檔股票進行優化 ---
         for i, ticker in enumerate(tickers):
-            status_txt.text(f"正在解析 ({i+1}/{len(tickers)})：{ticker} 的最佳參數基因...")
-            progress_bar.progress((i + 1) / len(tickers))
-            
-            # A. 獲取數據
-            raw_df, fmt_ticker = get_stock_data(ticker, start_d, end_d)
-            if raw_df.empty or len(raw_df) < 100:
-                continue
+            try:
+                status_txt.text(f"正在解析 ({i+1}/{len(tickers)})：{ticker} 的最佳參數基因...")
+                progress_bar.progress((i + 1) / len(tickers))
                 
-            name = get_stock_name(fmt_ticker)
+                # A. 獲取數據
+                raw_df, fmt_ticker = get_stock_data(ticker, start_d, end_d)
+                
+                # [防呆] 如果抓不到資料或資料太少，跳過
+                if raw_df.empty or len(raw_df) < 100:
+                    print(f"Skipping {ticker}: Insufficient data.")
+                    continue
+                    
+                name = get_stock_name(fmt_ticker)
+                
+                # B. 執行優化 (尋找該股的最佳參數)
+                # [關鍵修正]：將 n_trials 設為 500 (降低次數以加快批量處理速度，避免超時)
+                best_p, _ = run_optimization(
+                    raw_df, market_df, start_d, 
+                    0.001425, 0.003, 
+                    use_chip_strategy=False, 
+                    use_strict_bear_exit=True,
+                    n_trials=500  # <--- 設定為較低次數
+                )
+                
+                if best_p:
+                    # 記錄這檔股票的「基因」(最佳參數)
+                    row = best_p.copy()
+                    row['Code'] = ticker
+                    row['Name'] = name
+                    collected_data.append(row)
             
-            # B. 執行優化 (尋找該股的最佳參數)
-            # 這裡我們不開啟 Chip 策略以單純化變數，專注於 Alpha Score 的參數
-            best_p, _ = run_optimization(
-                raw_df, market_df, start_d, 
-                0.001425, 0.003, 
-                use_chip_strategy=False, 
-                use_strict_bear_exit=True
-            )
-            
-            if best_p:
-                # 記錄這檔股票的「基因」(最佳參數)
-                row = best_p.copy()
-                row['Code'] = ticker
-                row['Name'] = name
-                collected_data.append(row)
+            except Exception as e:
+                # [防呆] 捕捉錯誤並顯示，但不中斷迴圈
+                st.toast(f"⚠️ {ticker} 分析失敗，已跳過。原因: {str(e)}")
+                print(f"Error analyzing {ticker}: {e}")
+                continue
 
         progress_bar.empty()
         status_txt.empty()
