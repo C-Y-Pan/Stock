@@ -707,30 +707,27 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, params=None):
     """
-    執行策略 v16 (Adaptive Thresholds):
-    使用 Vol_Regime 動態調整買入/賣出門檻。
+    執行策略 v17 (簡化版):
+    - 移除「連兩日合」買進條件。
+    - 移除「斜率」賣出條件。
+    - 僅保留「單日爆發」買進與「絕對分值」賣出。
     """
     # 1. 計算分數
     df = calculate_alpha_score(data, params=params)
     
     if 'Dividends' not in df.columns: df['Dividends'] = 0.0
     df['Dividends'] = df['Dividends'].fillna(0.0)
-    df['Alpha_Slope'] = df['Alpha_Score'].diff().fillna(0)
     
-    # --- 預設參數 ---
-    buy_sum_thresh = 40
+    # --- 預設參數 (已移除 buy_consecutive_sum 與 sell_slope) ---
     buy_single_thresh = 40
     sell_alpha_thresh = -40
-    sell_slope_thresh = -60
     
     # 讀取 params
-    use_adaptive = True # 預設開啟自適應
+    use_adaptive = True 
     if params:
-        buy_sum_thresh = params.get('buy_consecutive_sum', 40)
         buy_single_thresh = params.get('buy_single_day', 40)
         sell_alpha_thresh = params.get('sell_threshold', -40)
-        sell_slope_thresh = params.get('sell_slope', -60)
-        use_adaptive = params.get('use_adaptive', True) # 支援從 UI 關閉
+        use_adaptive = params.get('use_adaptive', True)
     
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
@@ -740,7 +737,6 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
     
     # Numpy 加速讀取
     alpha = df['Alpha_Score'].values
-    slope = df['Alpha_Slope'].values
     close = df['Close'].values
     ma20 = df['MA20'].values
     ma60 = df['MA60'].values
@@ -752,33 +748,20 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
         this_target = entry_price * 1.15 if position == 1 else np.nan
         ret_label = ""; conf_score = 0
         
-        # --- 動態門檻計算 (核心邏輯) ---
-        # 如果開啟自適應，根據波動率體制調整門檻
-        # Vol_Regime 範圍約在 0.6 ~ 2.0 之間
+        # --- 動態門檻計算 ---
+        # 僅調整 buy_single_thresh
         threshold_multiplier = 1.0
         if use_adaptive:
-            # 限制調整幅度在 0.8倍 ~ 1.5倍 之間，避免門檻過高或過低
             threshold_multiplier = max(0.8, min(1.5, vol_regime[i]))
             
-        current_buy_sum = buy_sum_thresh * threshold_multiplier
         current_buy_single = buy_single_thresh * threshold_multiplier
         
-        # --- 買入邏輯 ---
+        # --- 買入邏輯 (僅剩單日爆發) ---
         if position == 0:
             is_buy = False
             
-            # 1. 動能積累 (連續2日)
-            cond1 = False
-            if i > 0:
-                cond1 = (alpha[i] > 0) and (alpha[i-1] > 0) and ((alpha[i] + alpha[i-1]) >= current_buy_sum)
-            
-            # 2. 強勢爆發 (單日)
-            cond2 = (alpha[i] >= current_buy_single)
-            
-            if cond1:
-                is_buy = True; reason_str = f"動能積累 (Score>{current_buy_sum:.1f})"
-                conf_score = 85
-            elif cond2:
+            # 判定：單日 Alpha >= 門檻
+            if alpha[i] >= current_buy_single:
                 is_buy = True; reason_str = f"強勢爆發 (Score>{current_buy_single:.1f})"
                 conf_score = 90
             
@@ -786,7 +769,7 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
                 signal = 1; entry_price = close[i]; action_code = "Buy"
                 cum_div = 0.0
         
-        # --- 賣出邏輯 ---
+        # --- 賣出邏輯 (移除斜率判定) ---
         elif position == 1:
             if dividends[i] > 0: cum_div += dividends[i]
             adjusted_current_value = close[i] + cum_div
@@ -794,17 +777,17 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
             
             is_sell = False
             
-            # 3. Alpha 轉弱 (維持原邏輯，不需動態調整，賣出訊號應保持敏感)
-            cond_sell_alpha = (alpha[i] <= sell_alpha_thresh) and (slope[i] <= sell_slope_thresh)
+            # 1. Alpha 絕對值轉弱 (不再看 Slope)
+            cond_sell_alpha = (alpha[i] <= sell_alpha_thresh)
             
-            # 4. 硬停損 (15%)
+            # 2. 硬停損 (15%)
             stop_loss_limit = -0.15 
             
             if cond_sell_alpha:
-                is_sell = True; reason_str = f"Alpha崩跌 (A<{sell_alpha_thresh}, S<{sell_slope_thresh})"
+                is_sell = True; reason_str = f"Alpha轉弱 (Score<{sell_alpha_thresh})"
             elif drawdown < stop_loss_limit:
                 is_sell = True; reason_str = f"觸發硬停損({stop_loss_limit*100:.0f}%)"
-            # 5. 長空破線強制出場
+            # 3. 長空破線強制出場
             elif use_strict_bear_exit and (close[i] < ma20[i]) and (ma20[i] < ma60[i]):
                  is_sell = True; reason_str = "長空破月線"
 
@@ -824,7 +807,7 @@ def run_simple_strategy(data, fee_rate=0.001425, tax_rate=0.003, use_chip_strate
     df['Target_Price'] = target_prices; df['Return_Label'] = return_labels
     df['Confidence'] = confidences
     
-    # 計算策略淨值
+    # 計算報酬
     df['Real_Position'] = df['Position'].shift(1).fillna(0)
     df['Market_Return'] = (df['Close'] - df['Close'].shift(1) + df['Dividends'].fillna(0)) / df['Close'].shift(1)
     df['Market_Return'] = df['Market_Return'].fillna(0)
@@ -847,23 +830,21 @@ import random
 # [修改] 增加 n_trials 參數，預設為 2000
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True, n_trials=2000):
     """
-    更新版 optimization:
-    執行蒙地卡羅隨機搜尋 (Random Search)，尋找最佳參數組合。
+    更新版 optimization (簡化版):
+    移除已廢棄的參數搜尋。
     """
     target_start = pd.to_datetime(user_start_date)
     
-    # 預先計算指標
     df_ind = calculate_indicators(raw_df, 10, 3.0, market_df) 
     df_slice = df_ind[df_ind['Date'] >= target_start].copy()
     
     if df_slice.empty: return None, pd.DataFrame()
 
-    # === 定義參數範圍 ===
+    # === 定義參數範圍 (已移除 buy_consecutive_sum 與 sell_slope) ===
     param_grid = {
-        'buy_consecutive_sum': (0, 100, 5),
         'buy_single_day': (0, 100, 5),
         'sell_threshold': (-40, 0, 5),
-        'sell_slope': (-60, 0, 5),
+        # --- 權重參數保持不變 ---
         'w_price_gt_ma20': (5, 30, 5),
         'w_price_lt_ma20': (-30, -5, 5),
         'w_price_gt_ma60': (5, 30, 5),
@@ -877,13 +858,10 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
         'w_rsi_weak': (-30, -5, 5),
         'w_momentum_up': (5, 30, 5),
         'w_golden_pit': (30, 60, 5),
-        'w_rvol_spike': (10, 30, 5),  # [新增參數]
-        'w_vol_penalty': (-30, -10, 5) # [新增參數]
+        'w_rvol_spike': (10, 30, 5),
+        'w_vol_penalty': (-30, -10, 5)
     }
 
-    # === 蒙地卡羅模擬 ===
-    # [修改] 這裡不再寫死 2000，而是使用傳入的參數
-    # n_trials = 2000 
     best_ret = -999
     best_params = {}
     best_df = pd.DataFrame()
@@ -914,8 +892,6 @@ def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_
             best_df = res_df.copy()
             
     best_params['Return'] = best_ret
-    
-    # 補上相容性參數
     best_params['Mult'] = 3.0 
     best_params['RSI_Buy'] = 30 
     
@@ -1885,7 +1861,7 @@ elif page == "📊 單股深度分析":
         # [核心] 策略參數 Session State 初始化
         # ==========================================
         default_strategy_params = {
-            'buy_consecutive_sum': 40, 'buy_single_day': 40, 'sell_threshold': -40, 'sell_slope': -60,
+            'buy_single_day': 40, 'sell_threshold': -40,
             'w_price_gt_ma20': 20, 'w_price_lt_ma20': -20,
             'w_price_gt_ma60': 15, 'w_price_lt_ma60': -15,
             'w_ma_bull': 10, 'w_ma_bear': -5,
@@ -2025,12 +2001,20 @@ elif page == "📊 單股深度分析":
 
             # Group 1: 買賣門檻
             st.caption("🎯 買賣訊號門檻")
-            c1, c2, c3, c4 = st.columns(4)
-            with c1: st.number_input("買入(連2日合)", -100, 200, st.session_state['strategy_params']['buy_consecutive_sum'], 5, key="widget_buy_consecutive_sum", on_change=update_param, args=('buy_consecutive_sum',))
-            with c2: st.number_input("買入(單日)", -100, 200, st.session_state['strategy_params']['buy_single_day'], 5, key="widget_buy_single_day", on_change=update_param, args=('buy_single_day',))
-            with c3: st.number_input("賣出(Alpha低於)", -200, 100, st.session_state['strategy_params']['sell_threshold'], 5, key="widget_sell_threshold", on_change=update_param, args=('sell_threshold',))
-            with c4: st.number_input("賣出(斜率低於)", -200, 100, st.session_state['strategy_params']['sell_slope'], 5, key="widget_sell_slope", on_change=update_param, args=('sell_slope',))
-
+            c1, c2 = st.columns(2)
+            with c1: 
+                st.number_input(
+                    "買入 (單日爆發 Alpha >=)", -100, 200, 
+                    st.session_state['strategy_params'].get('buy_single_day', 40), 5, 
+                    key="widget_buy_single_day", on_change=update_param, args=('buy_single_day',)
+                )
+            with c2: 
+                st.number_input(
+                    "賣出 (Alpha 轉弱 <=)", -200, 100, 
+                    st.session_state['strategy_params'].get('sell_threshold', -40), 5, 
+                    key="widget_sell_threshold", on_change=update_param, args=('sell_threshold',)
+                )
+                
             # Group 2: 趨勢權重
             st.caption("⚖️ 趨勢權重 (Trend Weights)")
             c1, c2, c3, c4 = st.columns(4)
@@ -3637,6 +3621,6 @@ elif page == "🧬 參數普適性研究":
         else:
             st.warning("資料庫中有資料，但無法解析出數值參數，請檢查資料格式。")
 
-            
+
 
             
