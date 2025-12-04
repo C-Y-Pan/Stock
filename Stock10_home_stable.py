@@ -1221,8 +1221,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         neg_reasons = []
         
         for r in reasons:
-            # 嘗試提取分數 (例如 (+15) 或 (-5))
-            match = re.search(r'\(([+-]?\d+)\)', r)
+            # [修正] 嚴格匹配帶有正負號的括號數字，例如 (+15) 或 (-5)
+            # 避免匹配到像 "RSI (34)" 這樣不帶正負號的參數說明
+            match = re.search(r'\(([+-]\d+)\)', r)
             if match:
                 score_val = int(match.group(1))
                 if score_val > 0:
@@ -1230,14 +1231,14 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
                 elif score_val < 0:
                     neg_reasons.append(r)
             else:
-                # 如果沒有分數標記，根據內容猜測 (通常包含文字描述)
+                # 如果沒有標準分數標記，根據文字內容猜測
                 if "(+" in r:
                     pos_reasons.append(r)
                 elif "(-" in r:
                     neg_reasons.append(r)
                 else:
                     # 如果完全沒有正負號，當作中性或提示信息
-                    pos_reasons.append(r) # 默認放在上面
+                    pass 
         
         if pos_reasons:
             html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
