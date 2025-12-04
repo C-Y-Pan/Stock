@@ -1346,7 +1346,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             rsi_position_signal = smooth_sigmoid(40 - rsi, inflection=0, steepness=0.2)  # 越低分數越高（超賣反彈）
         
         # 綜合評分（加權平均）
-        breakout_score = (
+        # 注意：起漲點信號應總是加分或至少不扣分
+        raw_score = (
             breakthrough_signal * 0.25 +  # 突破均線
             vol_signal * 0.20 +            # 量能放大
             momentum_signal * 0.20 +       # 價格動量
@@ -1354,6 +1355,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             rsi_turn_signal * 0.10 +      # RSI翻揚
             rsi_position_signal * 0.10    # RSI位置
         ) * 40  # 最高 +40 分
+        
+        # 確保起漲點信號不會扣分（至少為0）
+        # 如果計算出來是負分，表示不是起漲點，設為0
+        breakout_score = max(raw_score, 0)
         
         return breakout_score
     
@@ -1768,8 +1773,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 3. 洗盤識別（根據持倉狀態調整）
         # 判斷是否持有中（通過 Action 字段判斷）
+        # 注意：賣出當日應視為持有狀態（因為當日還在持有中）
         action = row['Action'] if 'Action' in row else 'Hold'
-        is_holding = (action == 'Hold' or action == 'Buy')
+        is_holding = (action == 'Hold' or action == 'Buy' or action == 'Sell')
         
         consolidation_score = detect_consolidation_signal(ma_dict, close, vol, vol_ma, volatility, price_change, is_holding)
         score += consolidation_score
