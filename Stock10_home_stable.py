@@ -635,11 +635,19 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     df['Dividends'] = df['Dividends'].fillna(0.0)
     
     # 先計算 Alpha Score（不依賴 Action，用於買賣判斷）
-    # 注意：這裡使用空手狀態計算，因為進場時是空手，出場時主要看分數正負號
+    # 為了保證判斷一致性，我們分別計算空手狀態和持有狀態的分數
+    
+    # 1. 空手狀態下的分數（用於進場判斷）
     df['Action'] = 'Wait'  # 空手狀態
     df['Reason'] = ''
-    df_with_alpha = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
-    alpha_scores = df_with_alpha['Alpha_Score'].values
+    df_with_alpha_wait = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
+    alpha_scores_wait = df_with_alpha_wait['Alpha_Score'].values
+
+    # 2. 持有狀態下的分數（用於出場判斷）
+    # 持有狀態下，震盪洗盤信號會加分，避免輕易被洗出
+    df['Action'] = 'Hold' # 持有狀態
+    df_with_alpha_hold = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
+    alpha_scores_hold = df_with_alpha_hold['Alpha_Score'].values
         
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
@@ -713,8 +721,8 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
 
         # --- 進場邏輯：基於 Alpha Score（僅在空手時執行）---
         if position == 0:
-            # 使用預計算的 Alpha Score（空手狀態）
-            current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
+            # 使用空手狀態的 Alpha Score（用於進場判斷）
+            current_alpha_score = alpha_scores_wait[i] if i < len(alpha_scores_wait) else 0
             
             # Alpha Score > 0 則買入（確保空手時才能買入）
             if current_alpha_score > 0:
@@ -749,8 +757,9 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             adjusted_current_value = close[i] + cum_div
             drawdown = (adjusted_current_value - entry_price) / entry_price
             
-            # 使用預計算的 Alpha Score（性能優化：不在循環中重新計算）
-            current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
+            # 使用持有狀態的 Alpha Score（用於出場判斷）
+            # 持有時，震盪洗盤會加分，避免被洗出，因此要用 alpha_scores_hold
+            current_alpha_score = alpha_scores_hold[i] if i < len(alpha_scores_hold) else 0
             
             is_sell = False
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
@@ -2798,7 +2807,10 @@ elif page == "📊 單股深度分析":
                         labels = []
                         for idx, row in sub_df.iterrows():
                             ret = row['Return_Label']
-                            reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
+                            # 清洗 Reason 字串，移除裡面可能包含的 "分數:..." 資訊，避免重複顯示
+                            raw_reason = row['Reason'].replace("觸發", "").replace("操作", "")
+                            import re
+                            reason_str = re.sub(r'\(分數:.*?\)', '', raw_reason).strip()
                             
                             # 確保從 final_df 中獲取正確的 Alpha_Score（與柱狀圖一致）
                             # 使用日期匹配，確保分數正確
