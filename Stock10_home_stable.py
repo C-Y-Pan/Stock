@@ -261,7 +261,7 @@ def get_master_stock_data():
                 c = row.get('Code')
                 if c in stock_map:
                     stock_map[c]['本益比'] = row.get('PEratio', '-')
-                    stock_map[c]['殖利率(%)'] = row.get('DividendYield', '-')
+                    stock_map[c]['殖利率(%)'] = row.get('DividendYield', '-')
                     stock_map[c]['股價淨值比'] = row.get('PBratio', '-')
     except: pass
 
@@ -669,7 +669,7 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
 
     for i in range(len(df)):
-        signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
+        signal = position; reason_str = "" if position == 1 else "Wait"
         this_target = entry_price * 1.15 if position == 1 else np.nan
         ret_label = ""; conf_score = 0
 
@@ -1010,7 +1010,6 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         score = 0
         neg_accumulator = 0 # [新增] 負分累計器，用來記錄被扣了多少分
         reasons = []
-        rsi_deduction_today = 0 # [新增] 專門追蹤RSI的扣分
 
         # ==========================================
         # A. 趨勢面 (Trend)
@@ -1052,18 +1051,15 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             score += 10; reasons.append(f"RSI 強勢區 ({int(rsi)}) (+10)")
         elif 50 <= rsi < 60:
             score += 5; reasons.append(f"RSI 多方區 ({int(rsi)}) (+5)")
-        elif 40 <= rsi < 50: # 新增弱勢區間1
-            deduction = -5
-            score += deduction; neg_accumulator += deduction; rsi_deduction_today = deduction
-            reasons.append(f"RSI 弱勢區 ({int(rsi)}) ({deduction})")
-        elif 30 <= rsi < 40: # 新增弱勢區間2
+        elif rsi < 30:
+            # 超賣通常扣分
             deduction = -10
-            score += deduction; neg_accumulator += deduction; rsi_deduction_today = deduction
-            reasons.append(f"RSI 更弱勢區 ({int(rsi)}) ({deduction})")
-        else: # rsi < 30 (超賣區, 扣分更重)
-            deduction = -15
-            score += deduction; neg_accumulator += deduction; rsi_deduction_today = deduction
-            reasons.append(f"RSI 超賣弱勢 ({int(rsi)}) ({deduction})")
+            score += deduction; neg_accumulator += deduction
+            reasons.append(f"RSI 超賣弱勢 ({int(rsi)}) (-10)")
+        else:
+            deduction = -5
+            score += deduction; neg_accumulator += deduction
+            reasons.append(f"RSI 弱勢區 ({int(rsi)}) (-5)")
 
         if i > 0 and rsi > prev_row['RSI']:
             score += 5; reasons.append("動能增強 (+5)")
@@ -1101,20 +1097,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             # 判斷年線趨勢 (Slope > 0 代表牛市)
             is_bull_trend = row['MA240_Slope'] > 0
 
-            # 若為恐慌抄底，則忽略 RSI 的扣分 (將其加回)
-            if is_panic_buy and rsi_deduction_today < 0:
-                score -= rsi_deduction_today # 將RSI扣分加回來
-                neg_accumulator -= rsi_deduction_today # 從累積扣分中移除
-                # 更新原因說明，更清楚地表示RSI扣分被忽略
-                for k, r in enumerate(reasons):
-                    if f"RSI 弱勢區 ({int(rsi)})" in r or f"RSI 更弱勢區 ({int(rsi)})" in r or f"RSI 超賣弱勢 ({int(rsi)})" in r:
-                        reasons[k] = f"<span style='color:#ffeb3b'>⚡ 恐慌抄底忽略RSI扣分 ({int(rsi)})</span>"
-
             if is_panic_buy and is_bull_trend:
                 # === [情境 A: 牛市黃金坑] ===
                 # 邏輯：雖然破線、超賣導致上面被扣了很多分，但因為年線向上，這些都是假跌破
                 # 動作：1. 加回所有扣分 (Ignored Penalties)
-                #       2. 給予強力加權 (原本+20不夠，改+40)
+                #       2. 給予強力加分 (原本+20不夠，改+40)
 
                 penalty_restore = abs(neg_accumulator) # 取絕對值加回來
                 score += penalty_restore
@@ -1145,9 +1132,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         html_str += "<span style='color:#666; font-size:10px'>─── Technical Analysis ───</span><br>"
 
         # 顯示理由
-        pos_reasons = [r for r in reasons if "(+" in r and "⚡ 恐慌抄底忽略RSI扣分" not in r]
-        neg_reasons = [r for r in reasons if "(-" in r and "⚡ 恐慌抄底忽略RSI扣分" not in r] # 這裡不顯示被忽略的扣分
-        ignored_rsi_reason = [r for r in reasons if "⚡ 恐慌抄底忽略RSI扣分" in r]
+        pos_reasons = [r for r in reasons if "(+" in r]
+        neg_reasons = [r for r in reasons if "(-" in r] # 這裡不顯示被忽略的扣分
 
         if pos_reasons:
             html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
@@ -1155,8 +1141,6 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             # 如果是黃金坑模式，其實 neg_accumulator 已經被加回來了，但在列表裡還是會顯示
             # 為了讓使用者困惑，我們標註一下
             html_str += f"<span style='color:#b9f6ca'>{'<br>'.join(neg_reasons)}</span>"
-        if ignored_rsi_reason:
-            html_str += f"<span style='color:#ffeb3b'>{'<br>'.join(ignored_rsi_reason)}</span><br>"
 
         score_details.append(html_str)
 
@@ -2048,7 +2032,6 @@ elif page == "📊 單股深度分析":
                         final_df['Score_Detail'] = ""
 
                     final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
-                    final_df['Alpha_Slope_MA5'] = final_df['Alpha_Slope'].rolling(window=5, min_periods=1).mean().fillna(0)
 
                     # 確保長均線存在
                     if 'MA120' not in final_df.columns: final_df['MA120'] = final_df['Close'].rolling(120).mean()
@@ -2086,7 +2069,7 @@ elif page == "📊 單股深度分析":
                             "成交量",
                             "法人籌碼 (OBV)",
                             "相對強弱指標 (RSI)",
-                            "均線糾結指數 (20MA Gap%)",
+                            "均線糾結指數 (60日)",
                             "糾結度變化 (Slope)" # [新增標題]
                         )
                     )
@@ -2154,8 +2137,7 @@ elif page == "📊 單股深度分析":
 
                     # --- Row 3: Alpha Slope ---
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope, opacity=0.4), row=3, col=1)
-                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Alpha_Slope_MA5'], mode='lines', line=dict(color='white', width=2), name='Alpha Slope MA5'), row=3, col=1)
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope), row=3, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
 
                     # --- Row 4: 成交量 ---
@@ -2524,7 +2506,8 @@ elif page == "🚀 科技股掃描":
                             st.session_state['scan_temp_results'].append(res_item)
 
                     except Exception as e:
-                        pass
+                        print(f"Error analyzing {ticker}: {e}")
+                        continue
 
                     # 更新斷點
                     st.session_state['scan_current_index'] = current_real_idx + 1
@@ -2543,7 +2526,7 @@ elif page == "🚀 科技股掃描":
                 flush_results_to_dataframe() # <--- 完成時轉正
 
                 if not st.session_state['scan_temp_results']:
-                     if not st.session_state.get('stop_scan', False):
+                     if not st.session_state.get('stop_scan'):
                         st.warning("未發現有效標的。")
                 else:
                     st.success(f"✅ 掃描完成！")
@@ -2613,8 +2596,8 @@ elif page == "🚀 科技股掃描":
 
             # 加入象限註解 (幫助使用者判讀)
             fig_scatter.add_annotation(x=90, y=9, text="🚀 強勢動能", showarrow=False, font=dict(color="#ff5252", size=14))
-            fig_scatter.add_annotation(x=90, y=-9, text="💎 低檔佈局 (高潛力)", showarrow=False, font(color="#ffecb3", size=14))
-            fig_scatter.add_annotation(x=-90, y=-9, text="💀 空頭修正", showarrow=False, font(color="#00e676", size=14))
+            fig_scatter.add_annotation(x=90, y=-9, text="💎 低檔佈局 (高潛力)", showarrow=False, font=dict(color="#ffecb3", size=14))
+            fig_scatter.add_annotation(x=-90, y=-9, text="💀 空頭修正", showarrow=False, font=dict(color="#00e676", size=14))
 
             st.plotly_chart(fig_scatter, use_container_width=True)
 
@@ -3085,7 +3068,7 @@ elif page == "💼 持股健診與建議":
                 res_df.style
                 .map(highlight_advice, subset=['AI 建議'])
                 .map(highlight_score, subset=['綜合評分'])
-                .format({"權重%": "{:.1f}%", "收盤價": "{:.2f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
+                .format({"權重%": "{:.1f}%", "收盤價": "{:.2f}", "市值": "{:, .0f}", "持有股數": "{:.0f}"}),
                 use_container_width=True
             )
 
