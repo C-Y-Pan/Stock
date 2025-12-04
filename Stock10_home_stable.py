@@ -625,13 +625,20 @@ def calculate_indicators(df, atr_period, multiplier, market_df):
 # ==========================================
 def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
     """
-    執行策略回測 v9 (Squeeze Ban):
-    - [新增] 禁買令: 若均線糾結度 < 3% (極度壓縮)，強制禁止買入，防止遇到盤整後崩盤。
+    執行策略回測 v10 (Alpha Score Based):
+    - 買賣時機完全基於 Alpha Score：正值則買入，負值則賣出
+    - 保留停損機制作為風險控制
     """
     df = data.copy()
     
     if 'Dividends' not in df.columns: df['Dividends'] = 0.0
     df['Dividends'] = df['Dividends'].fillna(0.0)
+    
+    # 先計算 Alpha Score（不依賴 Action）
+    df['Action'] = 'Hold'  # 臨時設置，用於計算 Alpha Score
+    df['Reason'] = ''
+    df_with_alpha = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
+    alpha_scores = df_with_alpha['Alpha_Score'].values
         
     positions = []; reasons = []; actions = []; target_prices = []
     return_labels = []; confidences = []
@@ -688,76 +695,66 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
         # 若糾結指數 < 3% (0.03)，禁止買入
         is_squeeze_ban = congestion_index[i] < 0.03
 
-        # --- 進場邏輯 ---
+        # --- 進場邏輯：基於 Alpha Score ---
         if position == 0:
-            is_buy = False
-            rsi_threshold_A = 60 if is_strict_bear else 55
+            # 獲取當日的 Alpha Score
+            current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
             
-            # 只有在「非禁買」狀態下才檢查策略
-            if not is_squeeze_ban:
-                # 策略 A
-                if (trend[i]==1 and (i>0 and trend[i-1]==-1) and volume[i]>vol_ma20[i] and close[i]>ma60[i] and rsi[i]>rsi_threshold_A and obv[i]>obv_ma20[i]):
-                    is_buy=True; trade_type=1; reason_str="動能突破"
-                # 策略 B
-                elif not is_strict_bear and trend[i]==1 and close[i]>ma60[i] and (df['Low'].iloc[i]<=ma20[i]*1.02) and close[i]>ma20[i] and volume[i]<vol_ma20[i] and rsi[i]>45:
-                    is_buy=True; trade_type=1; reason_str="均線回測"
-                # 策略 C
-                elif use_chip_strategy and not is_strict_bear and close[i]>ma60[i] and obv[i]>obv_ma20[i] and volume[i]<vol_ma20[i] and (close[i]<ma20[i] or rsi[i]<55) and close[i]>bb_lower[i]:
-                    is_buy=True; trade_type=3; reason_str="籌碼佈局"
-                # 策略 D (超賣反彈也需避開極度壓縮後的崩盤)
-                elif rsi[i]<rsi_buy_thresh and close[i]<bb_lower[i] and market_panic[i] and volume[i]>vol_ma20[i]*0.5:
-                    is_buy=True; trade_type=2; reason_str="超賣反彈"
-            
-            if is_buy:
-                signal=1; days_held=0; entry_price=close[i]; action_code="Buy"
+            # Alpha Score > 0 則買入
+            if current_alpha_score > 0:
+                # 判斷買入類型（用於後續出場邏輯）
+                if rsi[i] < 30 or (rsi[i] < rsi_buy_thresh and close[i] < bb_lower[i] and market_panic[i]):
+                    trade_type = 2  # 恐慌抄底
+                    reason_str = f"Alpha買進(恐慌抄底, 分數:{current_alpha_score:.0f})"
+                elif trend[i] == 1 and close[i] > ma60[i]:
+                    trade_type = 1  # 趨勢突破
+                    reason_str = f"Alpha買進(趨勢突破, 分數:{current_alpha_score:.0f})"
+                else:
+                    trade_type = 1  # 一般買進
+                    reason_str = f"Alpha買進(分數:{current_alpha_score:.0f})"
+                
+                signal = 1
+                days_held = 0
+                entry_price = close[i]
+                action_code = "Buy"
                 cum_div = 0.0
-                
-                base_score = 60
-                if is_strict_bear: base_score -= 10
-                if is_ma240_down and is_ma60_up: base_score += 5
-                if volume[i] > vol_ma20[i] * 1.5: base_score += 15
-                elif volume[i] > vol_ma20[i]: base_score += 8
-                if i > 5 and ma60[i] > ma60[i-5] and close[i] > ma60[i]: base_score += 10
-                if trade_type == 1 and 60 <= rsi[i] <= 75: base_score += 10
-                elif trade_type == 2 and rsi[i] <= 25: base_score += 10
-                if i > 3 and bb_width_vals[i-1] < 0.15: base_score += 5
-                if close[i] > ma30[i] * 1.04: base_score += 5
-                
-                weekly_ratio = close[i] / close_lag5[i] if close_lag5[i] > 0 else 1.0
-                if close[i] >= high_100d[i] and weekly_ratio < 1.27: base_score += 15
-                
-                conf_score = min(base_score, 99)
+                conf_score = min(abs(current_alpha_score), 99)
         
-        # --- 出場邏輯 ---
+        # --- 出場邏輯：基於 Alpha Score + 停損保護 ---
         elif position == 1:
-            days_held+=1
+            days_held += 1
             if dividends[i] > 0: cum_div += dividends[i]
             adjusted_current_value = close[i] + cum_div
             drawdown = (adjusted_current_value - entry_price) / entry_price
             
-            if trade_type==2 and trend[i]==1: trade_type=1; reason_str="反彈轉波段"
-            if trade_type==3 and volume[i]>vol_ma20[i]*1.2: trade_type=1; reason_str="佈局完成發動"
+            # 獲取當日的 Alpha Score
+            current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
             
             is_sell = False
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
             
+            # 優先檢查停損（風險控制）
             if drawdown < stop_loss_limit:
-                is_sell=True; reason_str=f"觸發停損({stop_loss_limit*100:.0f}%)"; action_code="Sell"
+                is_sell = True
+                reason_str = f"觸發停損({stop_loss_limit*100:.0f}%)"
+                action_code = "Sell"
+            # Alpha Score < 0 則賣出
+            elif current_alpha_score < 0:
+                is_sell = True
+                reason_str = f"Alpha賣出(分數:{current_alpha_score:.0f})"
+                action_code = "Sell"
+            # 鎖倉觀察期（避免頻繁交易）
             elif days_held <= (2 if is_strict_bear else 3):
-                action_code="Hold"; reason_str="鎖倉觀察"
+                action_code = "Hold"
+                reason_str = "鎖倉觀察"
             else:
-                if trade_type==1 and trend[i]==-1: 
-                    if close[i] < ma20[i]:
-                        is_sell=True; reason_str="趨勢轉弱且破月線"
-                    else:
-                        action_code="Hold"; reason_str="轉弱(守月線)"
-                elif use_strict_bear_exit and is_strict_bear and close[i] < ma20[i]:
-                    is_sell=True; reason_str="長空破月線"
-                elif trade_type==2 and days_held>10 and drawdown<0: is_sell=True; reason_str="逆勢操作超時"
-                elif trade_type==3 and close[i]<bb_lower[i]: is_sell=True; reason_str="支撐確認失敗"
-                
+                # 持有中，繼續觀察
+                action_code = "Hold"
+                reason_str = f"持有中(分數:{current_alpha_score:.0f})"
+            
             if is_sell:
-                signal=0; action_code="Sell"
+                signal = 0
+                action_code = "Sell"
                 final_pnl_value = (close[i] + cum_div) - entry_price
                 pnl = final_pnl_value / entry_price * 100
                 sign = "+" if pnl > 0 else ""
@@ -1655,6 +1652,28 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 核心評分：自適應均線分數
         trend_score = adaptive_ma_score(close, ma_dict)
+        
+        # 先計算恐慌抄底信號（用於判斷是否豁免趨勢偏空扣分）
+        ma60 = row['MA60'] if 'MA60' in row and row['MA60'] > 0 else close
+        bias_60 = (close - ma60) / ma60
+        rsi = row['RSI']
+        prev_rsi = prev_row['RSI'] if i > 0 else rsi
+        vol = row['Volume']
+        vol_ma = row['Vol_MA20']
+        price_change = row['Price_Change'] if not np.isnan(row['Price_Change']) else 0
+        momentum = row['Momentum'] if not np.isnan(row['Momentum']) else 0
+        price_position = row['Price_Position'] if not np.isnan(row['Price_Position']) else 0.5
+        
+        # 判斷是否為恐慌抄底（RSI < 30 或 深度下跌 + 超賣）
+        is_panic_bottom = (rsi < 30) or (bias_60 < -0.10 and rsi < 40)
+        
+        # 恐慌抄底時，豁免趨勢偏空的扣分
+        if is_panic_bottom and trend_score < 0:
+            trend_penalty_restore = abs(trend_score)  # 加回被扣的分數
+            score += trend_penalty_restore
+            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (+{trend_penalty_restore:.0f})</span>")
+            trend_score = 0  # 設為0，表示已豁免
+        
         score += trend_score
         
         if abs(trend_score) > 5:
@@ -1672,8 +1691,6 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # B. 動能評分 (Continuous RSI)
         # ==========================================
         
-        rsi = row['RSI']
-        prev_rsi = prev_row['RSI'] if i > 0 else rsi
         rsi_score = rsi_continuous_score(rsi)
         score += rsi_score
         
@@ -1691,10 +1708,6 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # C. 量價配合度
         # ==========================================
         
-        vol = row['Volume']
-        vol_ma = row['Vol_MA20']
-        price_change = row['Price_Change'] if not np.isnan(row['Price_Change']) else 0
-        
         vol_score = volume_momentum_score(vol, vol_ma, price_change)
         if abs(vol_score) > 2:
             score += vol_score
@@ -1704,10 +1717,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # ==========================================
         
         # 獲取額外指標
-        momentum = row['Momentum'] if not np.isnan(row['Momentum']) else 0
         momentum_accel = row['Momentum_Accel'] if not np.isnan(row['Momentum_Accel']) else 0
         volatility = row['Volatility'] if not np.isnan(row['Volatility']) else 0.02
-        price_position = row['Price_Position'] if not np.isnan(row['Price_Position']) else 0.5
         
         # 1. 起漲點識別
         breakout_score = detect_breakout_signal(close, ma_dict, vol, vol_ma, price_change, momentum, momentum_accel, rsi, prev_rsi)
@@ -1728,8 +1739,6 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             reasons.append(f"震盪洗盤 ({consolidation_penalty:.0f})")
         
         # 4. 恐慌抄底識別
-        ma60 = row['MA60'] if 'MA60' in row and row['MA60'] > 0 else close
-        bias_60 = (close - ma60) / ma60
         panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum)
         score += panic_bottom_score
         if panic_bottom_score > 10:
@@ -2683,7 +2692,8 @@ elif page == "📊 單股深度分析":
                         for idx, row in sub_df.iterrows():
                             ret = row['Return_Label']
                             reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
-                            labels.append(f"{ret}<br>({reason_str})")
+                            alpha_score = int(row['Alpha_Score']) if 'Alpha_Score' in row else 0
+                            labels.append(f"{ret}<br>({reason_str})<br><b>分數: {alpha_score}</b>")
                         return labels
 
                     buy_trend = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('突破|回測|動能'))]
