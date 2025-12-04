@@ -1405,6 +1405,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         prev_row = df.iloc[i - 1] if i > 0 else row
         
         score = 0
+        neg_accumulator = 0  # 負分累計器，用來記錄被扣了多少分
         reasons = []
         
         close = row['Close']
@@ -1426,6 +1427,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 核心評分：自適應均線分數
         trend_score = adaptive_ma_score(close, ma_dict)
         score += trend_score
+        if trend_score < 0:
+            neg_accumulator += trend_score  # 累計扣分
         
         if trend_score > 30:
             reasons.append(f"價格結構極佳 (+{trend_score:.0f})")
@@ -1442,6 +1445,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         alignment = ma_alignment_score(ma_dict)
         alignment_score = alignment * 15  # -15 ~ +15
         score += alignment_score
+        if alignment_score < 0:
+            neg_accumulator += alignment_score  # 累計扣分
         
         if alignment > 0.7:
             reasons.append(f"均線完美多排 (+{alignment_score:.0f})")
@@ -1452,6 +1457,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         convergence_penalty = ma_convergence_penalty(ma_dict, close)
         if convergence_penalty < -5:
             score += convergence_penalty
+            neg_accumulator += convergence_penalty  # 累計扣分
             reasons.append(f"均線糾結警戒 ({convergence_penalty:.0f})")
         
         # ==========================================
@@ -1461,6 +1467,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         rsi = row['RSI']
         rsi_score = rsi_continuous_score(rsi)
         score += rsi_score
+        if rsi_score < 0:
+            neg_accumulator += rsi_score  # 累計扣分
         
         if rsi_score > 5:
             reasons.append(f"RSI 健康多頭 ({int(rsi)}) (+{rsi_score:.0f})")
@@ -1473,6 +1481,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             momentum_score = smooth_sigmoid(rsi_momentum, inflection=0, steepness=0.5) * 5
             if abs(momentum_score) > 2:
                 score += momentum_score
+                if momentum_score < 0:
+                    neg_accumulator += momentum_score  # 累計扣分
                 reasons.append(f"動能{'增強' if momentum_score > 0 else '減弱'} ({momentum_score:+.0f})")
         
         # ==========================================
@@ -1486,6 +1496,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         vol_score = volume_momentum_score(vol, vol_ma, price_change)
         if abs(vol_score) > 3:
             score += vol_score
+            if vol_score < 0:
+                neg_accumulator += vol_score  # 累計扣分
             if vol_score > 0:
                 reasons.append(f"量價配合良好 (+{vol_score:.0f})")
             else:
@@ -1508,7 +1520,25 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             else:
                 is_bull_trend = False
             
-            if is_panic_buy and is_bull_trend:
+            if is_panic_buy:
+                # === [恐慌超底訊號：忽略所有扣分] ===
+                # 邏輯：在恐慌超底時，技術面的扣分都是假訊號，應該忽略
+                # 動作：1. 加回所有扣分 (Ignored Penalties)
+                #       2. 給予強力加分
+                
+                penalty_restore = abs(neg_accumulator)  # 取絕對值加回來
+                score += penalty_restore
+                
+                if is_bull_trend:
+                    score += 40
+                    reasons.insert(0, "<b>💎 牛市黃金坑 (+40)</b>")
+                else:
+                    score += 20
+                    reasons.insert(0, f"<b>🚀 恐慌超底訊號 ({reason_str}) (+20)</b>")
+                
+                if penalty_restore > 0:
+                    reasons.insert(1, f"<span style='color:#ffeb3b'>⚡ 忽略技術扣分 (+{penalty_restore:.0f})</span>")
+            elif is_bull_trend:
                 score += 40
                 reasons.insert(0, "<b>💎 牛市黃金坑 (+40)</b>")
             else:
