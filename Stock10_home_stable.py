@@ -678,9 +678,24 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     congestion_index = pd.Series(raw_gap_ratio).rolling(60, min_periods=1).mean().fillna(1.0).values
 
     for i in range(len(df)):
-        signal = position; reason_str = ""; action_code = "Hold" if position == 1 else "Wait"
-        this_target = entry_price * 1.15 if position == 1 else np.nan
-        ret_label = ""; conf_score = 0
+        # 初始化：根據當前持倉狀態設置默認值
+        # 確保狀態轉換正確：空手時不能賣出，持有時不能買入
+        if position == 0:
+            # 空手狀態：只能買入或等待
+            signal = 0  # 默認保持空手
+            reason_str = ""
+            action_code = "Wait"
+            this_target = np.nan
+            ret_label = ""
+            conf_score = 0
+        else:
+            # 持有狀態：只能賣出或持有
+            signal = 1  # 默認保持持有
+            reason_str = ""
+            action_code = "Hold"
+            this_target = entry_price * 1.15
+            ret_label = ""
+            conf_score = 0
 
         # 趨勢狀態
         is_ma240_down = False
@@ -696,12 +711,12 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
         # 若糾結指數 < 3% (0.03)，禁止買入
         is_squeeze_ban = congestion_index[i] < 0.03
 
-        # --- 進場邏輯：基於 Alpha Score ---
+        # --- 進場邏輯：基於 Alpha Score（僅在空手時執行）---
         if position == 0:
             # 使用預計算的 Alpha Score（空手狀態）
             current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
             
-            # Alpha Score > 0 則買入
+            # Alpha Score > 0 則買入（確保空手時才能買入）
             if current_alpha_score > 0:
                 # 判斷買入類型（用於後續出場邏輯）
                 if rsi[i] < 30 or (rsi[i] < rsi_buy_thresh and close[i] < bb_lower[i] and market_panic[i]):
@@ -714,14 +729,20 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                     trade_type = 1  # 一般買進
                     reason_str = f"Alpha買進(分數:{current_alpha_score:.0f})"
                 
-                signal = 1
+                # 買入：更新狀態
+                signal = 1  # 變為持有
                 days_held = 0
                 entry_price = close[i]
                 action_code = "Buy"
                 cum_div = 0.0
                 conf_score = min(abs(current_alpha_score), 99)
+            else:
+                # 不買入：保持空手
+                signal = 0
+                action_code = "Wait"
+                reason_str = f"空手觀望(分數:{current_alpha_score:.0f})"
         
-        # --- 出場邏輯：基於 Alpha Score + 停損保護 ---
+        # --- 出場邏輯：基於 Alpha Score + 停損保護（僅在持有時執行）---
         elif position == 1:
             days_held += 1
             if dividends[i] > 0: cum_div += dividends[i]
@@ -729,8 +750,6 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             drawdown = (adjusted_current_value - entry_price) / entry_price
             
             # 使用預計算的 Alpha Score（性能優化：不在循環中重新計算）
-            # 注意：預計算的 alpha score 是基於空手狀態，但對於賣出判斷已經足夠
-            # 因為我們主要關心的是分數的正負號，而不是精確值
             current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
             
             is_sell = False
@@ -740,30 +759,36 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             if drawdown < stop_loss_limit:
                 is_sell = True
                 reason_str = f"觸發停損({stop_loss_limit*100:.0f}%)"
-                action_code = "Sell"
             # Alpha Score < 0 則賣出
             elif current_alpha_score < 0:
                 is_sell = True
                 reason_str = f"Alpha賣出(分數:{current_alpha_score:.0f})"
-                action_code = "Sell"
             # 鎖倉觀察期（避免頻繁交易）
             elif days_held <= (2 if is_strict_bear else 3):
-                action_code = "Hold"
+                is_sell = False
                 reason_str = "鎖倉觀察"
             else:
                 # 持有中，繼續觀察
-                action_code = "Hold"
+                is_sell = False
                 reason_str = f"持有中(分數:{current_alpha_score:.0f})"
             
+            # 根據是否賣出更新狀態
             if is_sell:
+                # 賣出：變為空手
                 signal = 0
                 action_code = "Sell"
                 final_pnl_value = (close[i] + cum_div) - entry_price
                 pnl = final_pnl_value / entry_price * 100
                 sign = "+" if pnl > 0 else ""
                 ret_label = f"{sign}{pnl:.1f}%"
+            else:
+                # 不賣出：保持持有
+                signal = 1
+                action_code = "Hold"
+                this_target = entry_price * 1.15
 
-        position=signal
+        # 更新持倉狀態（確保狀態正確轉換）
+        position = signal
         positions.append(signal); reasons.append(reason_str); actions.append(action_code)
         target_prices.append(this_target); return_labels.append(ret_label)
         confidences.append(conf_score if action_code == "Buy" else 0)
