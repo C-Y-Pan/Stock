@@ -1186,19 +1186,19 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
 
 def calculate_alpha_score(df, margin_df=None, short_df=None):
     """
-    Alpha Score v14.0 (Ouroboros Edition - 銜尾蛇版):
-    實現自適應閉環優化系統，讓 alpha score 與買賣信號形成互為銜尾蛇的關係
+    Alpha Score v15.0 (Universal Analog Edition - 統一類比版):
+    建立一套可以適用在所有個股的統一 alpha score 計算函數
     
     核心理念：
-    1. 策略生成 Action -> Alpha Score 根據 Action 計算分數
-    2. Alpha Score 的分數反過來成為買賣的閾值
-    3. 分數為正 = 買入，分數為負 = 賣出
-    4. 完全 analog 化：所有評分都是連續函數，無硬性門檻
+    1. 完全基於市場狀態評分，不依賴任何買賣策略
+    2. 分數為正 = 買入機會，分數為負 = 賣出機會
+    3. 完全 analog 化：所有評分都是連續函數，無硬性門檻
+    4. 統一標準：適用於所有個股，不刻意迎合特定策略
     
     優化目標：
     - 買在起漲點：識別趨勢轉折、動量啟動、突破信號
     - 賣在高點：識別超買、動量衰竭、背離信號
-    - 洗盤時不交易：識別震盪、均線糾結、低波動
+    - 洗盤時不交易：識別震盪、均線糾結、低波動（分數接近0）
     - 恐慌時抄底：識別超賣、恐慌信號、價值浮現
     """
     import numpy as np
@@ -1233,10 +1233,6 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     if 'Vol_MA20' not in df.columns:
         df['Vol_MA20'] = df['Volume'].rolling(20, min_periods=1).mean()
     
-    # 策略訊號欄位
-    if 'Action' not in df.columns: df['Action'] = 'Hold'
-    if 'Reason' not in df.columns: df['Reason'] = ''
-    
     # 計算價格變化率（用於識別起漲點和賣點）
     df['Price_Change'] = df['Close'].pct_change()
     df['Price_Change_5'] = df['Close'].pct_change(5)  # 5日漲幅
@@ -1245,6 +1241,15 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     # 計算動量指標
     df['Momentum'] = df['Close'].diff(5) / df['Close'].shift(5)  # 5日動量
     df['Momentum_Accel'] = df['Momentum'].diff()  # 動量加速度
+    
+    # 計算波動率（用於識別洗盤）
+    df['Volatility'] = df['Close'].rolling(20).std() / df['Close'].rolling(20).mean()
+    
+    # 計算價格相對位置（用於識別超買超賣）
+    if len(df) >= 60:
+        df['Price_Position'] = (df['Close'] - df['Close'].rolling(60).min()) / (df['Close'].rolling(60).max() - df['Close'].rolling(60).min())
+    else:
+        df['Price_Position'] = 0.5
 
     # ==========================================
     # 1. 定義核心 Analog 評分函數庫
@@ -1267,124 +1272,209 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         """
         return np.exp(-(distance ** 2) / (2 * sigma ** 2))
     
-    def detect_breakout_signal(price, ma_dict, vol, vol_ma, price_change):
+    def detect_breakout_signal(price, ma_dict, vol, vol_ma, price_change, momentum, momentum_accel, rsi, prev_rsi):
         """
-        識別起漲點信號 (買在起漲點)
+        識別起漲點信號 (買在起漲點) - 完全 analog 化
         條件：
-        1. 價格突破關鍵均線
-        2. 成交量放大
-        3. 動量加速
-        4. RSI 從低檔翻揚
+        1. 價格突破關鍵均線（連續函數評估）
+        2. 成交量放大（連續函數評估）
+        3. 動量加速（連續函數評估）
+        4. RSI 從低檔翻揚（連續函數評估）
         """
         if len(ma_dict) < 2 or vol_ma == 0:
             return 0
         
-        # 1. 突破信號：價格站上多條均線
-        ma_values = sorted([v for v in ma_dict.values() if v > 0])
+        # 1. 突破信號：價格相對均線的位置（連續評估）
+        ma_values = [v for v in ma_dict.values() if v > 0]
         if len(ma_values) < 2:
             return 0
         
-        # 計算價格相對均線的位置（加權平均）
-        above_count = sum(1 for v in ma_values if price > v)
-        breakthrough_ratio = above_count / len(ma_values)
+        # 計算價格相對每條均線的乖離率，加權平均
+        bias_scores = []
+        weights = []
+        for period, ma_value in ma_dict.items():
+            if ma_value > 0:
+                bias = (price - ma_value) / ma_value
+                # 短期均線權重高，長期均線權重低
+                weight = 1.0 / (period / 5)  # 5日均線權重=1, 20日均線權重=0.25
+                bias_scores.append(bias * weight)
+                weights.append(weight)
         
-        # 2. 量能放大
+        if sum(weights) > 0:
+            weighted_bias = sum(bias_scores) / sum(weights)
+            breakthrough_signal = smooth_sigmoid(weighted_bias * 100, inflection=0, steepness=2)  # 站上均線越多，分數越高
+        else:
+            breakthrough_signal = 0
+        
+        # 2. 量能放大（連續函數）
         vol_ratio = vol / vol_ma if vol_ma > 0 else 1.0
-        vol_signal = smooth_sigmoid(vol_ratio - 1.2, inflection=0, steepness=5)  # 1.2倍以上開始加分
+        vol_signal = smooth_sigmoid((vol_ratio - 1.0) * 2, inflection=0, steepness=3)  # 1.0倍=0分, 1.5倍=高分
         
-        # 3. 價格動量
-        momentum_signal = smooth_sigmoid(price_change * 100, inflection=0, steepness=50)  # 漲幅越大分數越高
+        # 3. 價格動量（連續函數）
+        momentum_signal = smooth_sigmoid(price_change * 200, inflection=0, steepness=5)  # 漲幅越大分數越高
         
-        # 綜合評分
-        breakout_score = (breakthrough_ratio * 0.4 + vol_signal * 0.3 + momentum_signal * 0.3) * 30
+        # 4. 動量加速度（連續函數）
+        accel_signal = smooth_sigmoid(momentum_accel * 1000, inflection=0, steepness=2)  # 加速度越大分數越高
+        
+        # 5. RSI 翻揚（連續函數）
+        rsi_momentum = rsi - prev_rsi if prev_rsi > 0 else 0
+        rsi_turn_signal = smooth_sigmoid(rsi_momentum, inflection=0, steepness=0.3)  # RSI上升加分
+        
+        # 6. RSI 位置（超賣區開始反彈）
+        rsi_position_signal = 0
+        if rsi < 40:  # 低檔區
+            rsi_position_signal = smooth_sigmoid(40 - rsi, inflection=0, steepness=0.2)  # 越低分數越高（超賣反彈）
+        
+        # 綜合評分（加權平均）
+        breakout_score = (
+            breakthrough_signal * 0.25 +  # 突破均線
+            vol_signal * 0.20 +            # 量能放大
+            momentum_signal * 0.20 +       # 價格動量
+            accel_signal * 0.15 +         # 動量加速
+            rsi_turn_signal * 0.10 +      # RSI翻揚
+            rsi_position_signal * 0.10    # RSI位置
+        ) * 40  # 最高 +40 分
+        
         return breakout_score
     
-    def detect_peak_signal(rsi, price_change, momentum, momentum_accel):
+    def detect_peak_signal(rsi, price_change, momentum, momentum_accel, price_position, vol, vol_ma):
         """
-        識別賣點信號 (賣在高點)
+        識別賣點信號 (賣在高點) - 完全 analog 化
         條件：
-        1. RSI 過熱 (70+)
-        2. 動量衰竭 (加速度轉負)
-        3. 價格漲幅過大但動能減弱
-        4. 背離信號
+        1. RSI 過熱（連續函數）
+        2. 動量衰竭（連續函數）
+        3. 價格位置過高（連續函數）
+        4. 量價背離（連續函數）
         """
-        # 1. RSI 過熱
-        rsi_overheat = smooth_sigmoid(rsi - 70, inflection=0, steepness=0.2) * 20  # RSI > 70 開始扣分
+        # 1. RSI 過熱（連續函數）
+        rsi_overheat = smooth_sigmoid((rsi - 60) / 20, inflection=0, steepness=3) * 25  # RSI > 60 開始扣分，70+ 大幅扣分
         
-        # 2. 動量衰竭
+        # 2. 動量衰竭（連續函數）
+        # 動量為正但加速度為負 = 動能衰竭
         momentum_exhaustion = 0
-        if momentum_accel < 0 and momentum > 0:
-            # 動量還在正，但加速度轉負 = 動能衰竭
-            momentum_exhaustion = smooth_sigmoid(-momentum_accel * 100, inflection=0, steepness=10) * 15
+        if momentum > 0 and momentum_accel < 0:
+            # 動量越大但加速度越負 = 衰竭越嚴重
+            exhaustion_ratio = -momentum_accel / (momentum + 0.001)  # 避免除零
+            momentum_exhaustion = smooth_sigmoid(exhaustion_ratio * 10, inflection=0, steepness=2) * 20
         
-        # 3. 漲幅過大但動能減弱
+        # 3. 價格位置過高（連續函數）
+        # 價格在60日區間的高位（>80%）開始扣分
+        position_penalty = 0
+        if price_position > 0.7:
+            position_penalty = smooth_sigmoid((price_position - 0.7) * 10, inflection=0, steepness=3) * 15
+        
+        # 4. 量價背離（連續函數）
+        # 價格上漲但成交量萎縮 = 背離
+        divergence_penalty = 0
+        if price_change > 0 and vol_ma > 0:
+            vol_ratio = vol / vol_ma
+            if vol_ratio < 0.8:  # 成交量萎縮
+                divergence_ratio = (0.8 - vol_ratio) * price_change  # 漲越多但量越縮 = 背離越嚴重
+                divergence_penalty = smooth_sigmoid(divergence_ratio * 100, inflection=0, steepness=5) * 15
+        
+        # 5. 漲幅過大但動能減弱（連續函數）
         overbought_signal = 0
-        if price_change > 0.05 and momentum_accel < 0:  # 5日漲超過5%但動能減弱
-            overbought_signal = 10
+        if price_change > 0.03:  # 單日漲超過3%
+            if momentum_accel < 0:  # 動能減弱
+                overbought_ratio = price_change * (-momentum_accel)
+                overbought_signal = smooth_sigmoid(overbought_ratio * 100, inflection=0, steepness=3) * 10
         
         # 綜合扣分
-        peak_penalty = -(rsi_overheat + momentum_exhaustion + overbought_signal)
+        peak_penalty = -(rsi_overheat + momentum_exhaustion + position_penalty + divergence_penalty + overbought_signal)
         return peak_penalty
     
-    def detect_consolidation_signal(ma_dict, price, vol, vol_ma):
+    def detect_consolidation_signal(ma_dict, price, vol, vol_ma, volatility, price_change):
         """
-        識別洗盤/震盪信號 (洗盤時不交易)
+        識別洗盤/震盪信號 (洗盤時不交易) - 完全 analog 化
         條件：
-        1. 均線糾結
-        2. 低波動
-        3. 成交量萎縮
+        1. 均線糾結（連續函數）
+        2. 低波動（連續函數）
+        3. 成交量萎縮（連續函數）
+        4. 價格在窄幅震盪（連續函數）
+        
+        返回：負分（震盪時應該觀望，分數接近0）
         """
         if len(ma_dict) < 3 or price == 0:
             return 0
         
-        # 1. 均線糾結度
+        # 1. 均線糾結度（連續函數）
         ma_values = [v for v in ma_dict.values() if v > 0]
         if len(ma_values) < 3:
             return 0
         
         ma_std = np.std(ma_values) / price
+        # 標準差越小 = 越糾結
         convergence_ratio = ma_std / 0.03  # 標準差 < 3% 視為糾結
-        convergence_signal = (1 - smooth_sigmoid(convergence_ratio, inflection=1, steepness=3)) * 20
+        convergence_signal = (1 - smooth_sigmoid(convergence_ratio, inflection=1, steepness=3)) * 15
         
-        # 2. 成交量萎縮
+        # 2. 低波動（連續函數）
+        # 波動率越低 = 越可能是洗盤
+        low_volatility_signal = 0
+        if volatility < 0.02:  # 波動率 < 2%
+            low_volatility_signal = (1 - smooth_sigmoid(volatility * 50, inflection=1, steepness=5)) * 10
+        
+        # 3. 成交量萎縮（連續函數）
         vol_ratio = vol / vol_ma if vol_ma > 0 else 1.0
-        low_vol_signal = (1 - smooth_sigmoid(vol_ratio - 0.8, inflection=0, steepness=5)) * 10
+        low_vol_signal = (1 - smooth_sigmoid(vol_ratio - 0.7, inflection=0, steepness=5)) * 10
         
-        # 綜合扣分（震盪時應該觀望）
-        consolidation_penalty = -(convergence_signal + low_vol_signal)
+        # 4. 價格窄幅震盪（連續函數）
+        # 價格變化率很小 = 震盪
+        narrow_range_signal = 0
+        if abs(price_change) < 0.01:  # 單日變化 < 1%
+            narrow_range_signal = (1 - smooth_sigmoid(abs(price_change) * 100, inflection=1, steepness=10)) * 10
+        
+        # 綜合扣分（震盪時應該觀望，分數接近0）
+        consolidation_penalty = -(convergence_signal + low_volatility_signal + low_vol_signal + narrow_range_signal)
         return consolidation_penalty
     
-    def detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma):
+    def detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum):
         """
-        識別恐慌抄底信號 (恐慌時成功抄底)
+        識別恐慌抄底信號 (恐慌時成功抄底) - 完全 analog 化
         條件：
-        1. RSI 極度超賣 (< 30)
-        2. 負乖離率大 (跌破均線)
-        3. 恐慌性下跌後出現抵抗
-        4. 成交量放大（有人接盤）
+        1. RSI 極度超賣（連續函數）
+        2. 負乖離率大（連續函數）
+        3. 價格位置過低（連續函數）
+        4. 恐慌性下跌後出現抵抗（連續函數）
+        5. 成交量放大（有人接盤）（連續函數）
         """
-        # 1. RSI 超賣
-        oversold_signal = smooth_sigmoid(30 - rsi, inflection=0, steepness=0.3) * 25  # RSI < 30 開始加分
+        # 1. RSI 超賣（連續函數）
+        # RSI 越低分數越高（超賣反彈機會）
+        oversold_signal = smooth_sigmoid((30 - rsi) / 20, inflection=0, steepness=2) * 30  # RSI < 30 開始大幅加分
         
-        # 2. 負乖離（深度下跌）
+        # 2. 負乖離（深度下跌）（連續函數）
+        # 乖離率越負分數越高
         deep_dip_signal = 0
-        if bias_60 < -0.10:  # 跌破季線 10% 以上
-            deep_dip_signal = smooth_sigmoid(-bias_60 - 0.10, inflection=0, steepness=20) * 20
+        if bias_60 < 0:
+            deep_dip_signal = smooth_sigmoid(-bias_60 * 10, inflection=0, steepness=2) * 25  # 跌破越多分數越高
         
-        # 3. 恐慌後抵抗（價格開始反彈）
+        # 3. 價格位置過低（連續函數）
+        # 價格在60日區間的低位（<20%）開始加分
+        low_position_signal = 0
+        if price_position < 0.3:
+            low_position_signal = smooth_sigmoid((0.3 - price_position) * 10, inflection=0, steepness=3) * 15
+        
+        # 4. 恐慌後抵抗（價格開始反彈）（連續函數）
         rebound_signal = 0
-        if price_change > 0 and rsi < 35:  # 超賣區開始反彈
-            rebound_signal = smooth_sigmoid(price_change * 100, inflection=0, steepness=50) * 15
+        if price_change > 0 and rsi < 40:  # 超賣區開始反彈
+            # 反彈幅度越大，RSI越低，分數越高
+            rebound_intensity = price_change * (40 - rsi) / 40
+            rebound_signal = smooth_sigmoid(rebound_intensity * 100, inflection=0, steepness=5) * 20
         
-        # 4. 成交量放大（有人接盤）
+        # 5. 成交量放大（有人接盤）（連續函數）
         vol_signal = 0
         if vol_ma > 0:
             vol_ratio = vol / vol_ma
-            if vol_ratio > 1.2:  # 成交量放大
-                vol_signal = smooth_sigmoid(vol_ratio - 1.2, inflection=0, steepness=3) * 10
+            if vol_ratio > 1.0:  # 成交量放大
+                vol_signal = smooth_sigmoid((vol_ratio - 1.0) * 2, inflection=0, steepness=3) * 15
+        
+        # 6. 動量轉正（連續函數）
+        # 從負動量轉為正動量 = 止跌信號
+        momentum_turn_signal = 0
+        if momentum > -0.02 and momentum < 0.02:  # 動量接近0（轉折點）
+            momentum_turn_signal = smooth_sigmoid((0.02 - abs(momentum)) * 50, inflection=0, steepness=5) * 10
         
         # 綜合加分
-        panic_bottom_score = oversold_signal + deep_dip_signal + rebound_signal + vol_signal
+        panic_bottom_score = oversold_signal + deep_dip_signal + low_position_signal + rebound_signal + vol_signal + momentum_turn_signal
         return panic_bottom_score
     
     def adaptive_ma_score(price, ma_dict, weights=None):
@@ -1534,23 +1624,17 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         return np.clip(score, -15, 15)
 
     # ==========================================
-    # 2. 逐日計算評分 (銜尾蛇式自適應優化)
+    # 2. 逐日計算評分 (統一標準，不依賴策略)
     # ==========================================
     
     final_scores = []
     score_details = []
-    
-    # 統計用於自適應校准的數據
-    buy_scores = []
-    sell_scores = []
-    hold_scores = []
 
     for i in range(len(df)):
         row = df.iloc[i]
         prev_row = df.iloc[i - 1] if i > 0 else row
         
-        base_score = 0  # 基礎評分（不依賴 Action）
-        neg_accumulator = 0  # 負分累計器
+        score = 0  # 基礎評分（完全基於市場狀態）
         reasons = []
         
         close = row['Close']
@@ -1571,9 +1655,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 核心評分：自適應均線分數
         trend_score = adaptive_ma_score(close, ma_dict)
-        base_score += trend_score
-        if trend_score < 0:
-            neg_accumulator += trend_score
+        score += trend_score
         
         if abs(trend_score) > 5:
             reasons.append(f"趨勢{'偏多' if trend_score > 0 else '偏空'} ({trend_score:+.0f})")
@@ -1581,9 +1663,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 均線排列加分/扣分
         alignment = ma_alignment_score(ma_dict)
         alignment_score = alignment * 15
-        base_score += alignment_score
-        if alignment_score < 0:
-            neg_accumulator += alignment_score
+        score += alignment_score
         
         if abs(alignment) > 0.5:
             reasons.append(f"均線{'多排' if alignment > 0 else '空排'} ({alignment_score:+.0f})")
@@ -1593,22 +1673,19 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # ==========================================
         
         rsi = row['RSI']
+        prev_rsi = prev_row['RSI'] if i > 0 else rsi
         rsi_score = rsi_continuous_score(rsi)
-        base_score += rsi_score
-        if rsi_score < 0:
-            neg_accumulator += rsi_score
+        score += rsi_score
         
         if abs(rsi_score) > 3:
             reasons.append(f"RSI ({int(rsi)}) ({rsi_score:+.0f})")
         
         # RSI 動能方向
         if i > 0:
-            rsi_momentum = row['RSI'] - prev_row['RSI']
+            rsi_momentum = rsi - prev_rsi
             momentum_score = smooth_sigmoid(rsi_momentum, inflection=0, steepness=0.5) * 5
             if abs(momentum_score) > 1:
-                base_score += momentum_score
-                if momentum_score < 0:
-                    neg_accumulator += momentum_score
+                score += momentum_score
         
         # ==========================================
         # C. 量價配合度
@@ -1620,114 +1697,49 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         vol_score = volume_momentum_score(vol, vol_ma, price_change)
         if abs(vol_score) > 2:
-            base_score += vol_score
-            if vol_score < 0:
-                neg_accumulator += vol_score
+            score += vol_score
         
         # ==========================================
         # D. 核心策略識別 (買在起漲點、賣在高點、洗盤不交易、恐慌抄底)
         # ==========================================
         
+        # 獲取額外指標
+        momentum = row['Momentum'] if not np.isnan(row['Momentum']) else 0
+        momentum_accel = row['Momentum_Accel'] if not np.isnan(row['Momentum_Accel']) else 0
+        volatility = row['Volatility'] if not np.isnan(row['Volatility']) else 0.02
+        price_position = row['Price_Position'] if not np.isnan(row['Price_Position']) else 0.5
+        
         # 1. 起漲點識別
-        breakout_score = detect_breakout_signal(close, ma_dict, vol, vol_ma, price_change)
-        base_score += breakout_score
+        breakout_score = detect_breakout_signal(close, ma_dict, vol, vol_ma, price_change, momentum, momentum_accel, rsi, prev_rsi)
+        score += breakout_score
         if abs(breakout_score) > 5:
             reasons.append(f"起漲點信號 ({breakout_score:+.0f})")
         
         # 2. 賣點識別
-        momentum = row['Momentum'] if not np.isnan(row['Momentum']) else 0
-        momentum_accel = row['Momentum_Accel'] if not np.isnan(row['Momentum_Accel']) else 0
-        peak_penalty = detect_peak_signal(rsi, price_change, momentum, momentum_accel)
-        base_score += peak_penalty
+        peak_penalty = detect_peak_signal(rsi, price_change, momentum, momentum_accel, price_position, vol, vol_ma)
+        score += peak_penalty
         if peak_penalty < -5:
             reasons.append(f"高點警示 ({peak_penalty:.0f})")
         
-        # 3. 洗盤識別（震盪時扣分，避免交易）
-        consolidation_penalty = detect_consolidation_signal(ma_dict, close, vol, vol_ma)
-        base_score += consolidation_penalty
+        # 3. 洗盤識別（震盪時扣分，分數接近0，避免交易）
+        consolidation_penalty = detect_consolidation_signal(ma_dict, close, vol, vol_ma, volatility, price_change)
+        score += consolidation_penalty
         if consolidation_penalty < -5:
             reasons.append(f"震盪洗盤 ({consolidation_penalty:.0f})")
         
         # 4. 恐慌抄底識別
         ma60 = row['MA60'] if 'MA60' in row and row['MA60'] > 0 else close
         bias_60 = (close - ma60) / ma60
-        panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma)
-        base_score += panic_bottom_score
+        panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum)
+        score += panic_bottom_score
         if panic_bottom_score > 10:
             reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.0f})")
         
         # ==========================================
-        # E. 策略事件修正 + 自適應校准 (銜尾蛇核心)
+        # E. 最終輸出（不進行任何策略相關的調整）
         # ==========================================
         
-        action = row['Action']
-        reason_str = str(row['Reason'])
-        
-        # 先計算基礎分數（不依賴 Action）
-        raw_score = base_score
-        
-        # 根據 Action 進行自適應校准
-        if action == 'Buy':
-            is_panic_buy = ('反彈' in reason_str) or ('超賣' in reason_str)
-            
-            # 判斷長期趨勢
-            if 'MA240' in df.columns and i >= 5:
-                ma240_slope = (row['MA240'] - df.iloc[i-5]['MA240']) / df.iloc[i-5]['MA240'] if df.iloc[i-5]['MA240'] > 0 else 0
-                is_bull_trend = ma240_slope > 0
-            else:
-                is_bull_trend = False
-            
-            # 恐慌超底：忽略所有扣分
-            if is_panic_buy:
-                penalty_restore = abs(neg_accumulator)
-                raw_score += penalty_restore
-                
-                if is_bull_trend:
-                    raw_score += 40
-                    reasons.insert(0, "<b>💎 牛市黃金坑 (+40)</b>")
-                else:
-                    raw_score += 20
-                    reasons.insert(0, f"<b>🚀 恐慌超底 ({reason_str}) (+20)</b>")
-                
-                if penalty_restore > 0:
-                    reasons.insert(1, f"<span style='color:#ffeb3b'>⚡ 忽略扣分 (+{penalty_restore:.0f})</span>")
-            else:
-                # 一般買進：確保分數為正
-                strategy_bonus = 20
-                raw_score += strategy_bonus
-                reasons.insert(0, f"<b>🚀 策略買進 ({reason_str}) (+{strategy_bonus})</b>")
-            
-            # 自適應校准：確保 Buy 時分數 > 0
-            if raw_score <= 0:
-                calibration = abs(raw_score) + 1  # 至少 +1
-                raw_score += calibration
-                reasons.insert(1, f"<span style='color:#ffeb3b'>⚡ 自適應校准 (+{calibration:.0f})</span>")
-            
-            buy_scores.append(raw_score)
-        
-        elif action == 'Sell':
-            # 賣出：扣分並確保分數為負
-            strategy_penalty = -30
-            raw_score += strategy_penalty
-            reasons.insert(0, f"<b>⚡ 策略賣出 ({reason_str}) ({strategy_penalty})</b>")
-            
-            # 自適應校准：確保 Sell 時分數 < 0
-            if raw_score >= 0:
-                calibration = -(raw_score + 1)  # 至少 -1
-                raw_score += calibration
-                reasons.insert(1, f"<span style='color:#ffeb3b'>⚡ 自適應校准 ({calibration:.0f})</span>")
-            
-            sell_scores.append(raw_score)
-        
-        else:  # Hold/Wait
-            # 持有/觀望：分數應該接近 0
-            hold_scores.append(raw_score)
-        
-        # ==========================================
-        # F. 最終輸出
-        # ==========================================
-        
-        final_score = np.clip(raw_score, -100, 100)
+        final_score = np.clip(score, -100, 100)
         final_scores.append(final_score)
         
         # 生成詳細說明
