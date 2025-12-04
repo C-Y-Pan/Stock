@@ -2491,6 +2491,8 @@ elif page == "📊 單股深度分析":
                 # 只要替換上方這段輸入控制邏輯即可
                 
                 # [以下為原本的代碼接續點，請確認您的代碼中有這部分]
+                # 計算 Alpha Score（確保賣出當日視為持有狀態）
+                # 注意：calculate_alpha_score 內部已經處理了賣出當日視為持有狀態的邏輯
                 stock_alpha_df = calculate_alpha_score(final_df, pd.DataFrame(), pd.DataFrame())
                 base_score = stock_alpha_df['Alpha_Score'].iloc[-1]
                 base_log = stock_alpha_df['Score_Log'].iloc[-1]
@@ -2711,10 +2713,12 @@ elif page == "📊 單股深度分析":
                 # [Tab 1: K線圖]
                 with tab1:
                     # 1. 準備數據
-                    final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
+                    # 確保 Alpha_Score 與柱狀圖一致（基於 calculate_alpha_score 的結果）
+                    # 注意：calculate_alpha_score 已經處理了賣出當日視為持有狀態的邏輯
+                    final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score'].values
 
                     if 'Score_Detail' in stock_alpha_df.columns:
-                        final_df['Score_Detail'] = stock_alpha_df['Score_Detail']
+                        final_df['Score_Detail'] = stock_alpha_df['Score_Detail'].values
                     else:
                         # 防呆：萬一上游沒算出來，填入空字串避免報錯
                         final_df['Score_Detail'] = ""
@@ -2787,11 +2791,29 @@ elif page == "📊 單股深度分析":
                     
                     def get_buy_text(sub_df): return [f"<b>{int(score)}</b>" for score in sub_df['Alpha_Score']]
                     def get_sell_text(sub_df):
+                        """
+                        生成賣出標記的文本
+                        確保顯示的分數與 Alpha Score 柱狀圖一致（基於 calculate_alpha_score 的結果）
+                        """
                         labels = []
                         for idx, row in sub_df.iterrows():
                             ret = row['Return_Label']
                             reason_str = row['Reason'].replace("觸發", "").replace("操作", "")
-                            alpha_score = int(row['Alpha_Score']) if 'Alpha_Score' in row else 0
+                            
+                            # 確保從 final_df 中獲取正確的 Alpha_Score（與柱狀圖一致）
+                            # 使用日期匹配，確保分數正確
+                            date_val = row['Date']
+                            matching_row = final_df[final_df['Date'] == date_val]
+                            
+                            if not matching_row.empty and 'Alpha_Score' in matching_row.columns:
+                                # 使用匹配行的 Alpha_Score（與柱狀圖一致）
+                                alpha_score = int(matching_row['Alpha_Score'].iloc[0])
+                            elif 'Alpha_Score' in row:
+                                # 備用：直接從 row 讀取
+                                alpha_score = int(row['Alpha_Score'])
+                            else:
+                                alpha_score = 0
+                            
                             labels.append(f"{ret}<br>({reason_str})<br><b>分數: {alpha_score}</b>")
                         return labels
 
