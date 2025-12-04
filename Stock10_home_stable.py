@@ -2025,14 +2025,19 @@ elif page == "📊 單股深度分析":
                 with tab1:
                     # 1. 準備數據
                     final_df['Alpha_Score'] = stock_alpha_df['Alpha_Score']
-                    
+
                     if 'Score_Detail' in stock_alpha_df.columns:
                         final_df['Score_Detail'] = stock_alpha_df['Score_Detail']
                     else:
                         # 防呆：萬一上游沒算出來，填入空字串避免報錯
                         final_df['Score_Detail'] = ""
 
-                    final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
+                    # [修正] 計算 Alpha Slope 並加入平滑處理
+                    # 方法 1: 使用移動平均 (MA)
+                    # final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().rolling(5, min_periods=1).mean().fillna(0)
+
+                    # 方法 2 (可選): 使用指數移動平均 (EMA) - 更平滑且更即時
+                    final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().ewm(span=5, adjust=False).mean().fillna(0)
                     
                     # 確保長均線存在
                     if 'MA120' not in final_df.columns: final_df['MA120'] = final_df['Close'].rolling(120).mean()
