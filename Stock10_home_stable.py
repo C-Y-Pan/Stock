@@ -35,12 +35,9 @@ SENDER_EMAIL = "cypan2000@gmail.com"
 SENDER_PASSWORD = "amds ieiu wgqk exir" 
 RECEIVER_EMAIL = "cypan2000@gmail.com"
 
-# Cookie Manager
-@st.cache_resource
-def get_cookie_manager():
-    return stx.CookieManager(key="invest_cookie_manager")
+import extra_streamlit_components as stx
 
-cookie_manager = get_cookie_manager()
+cookie_manager = stx.CookieManager(key="invest_cookie_manager")
 
 # CSS 優化
 st.markdown("""
