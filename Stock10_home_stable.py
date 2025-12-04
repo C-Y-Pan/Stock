@@ -653,8 +653,8 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     # 確保有 MA120 (若上游沒算，這裡需防呆)
     if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
     
-    ma120 = df['MA120'].fillna(method='bfill').values
-    ma240 = df['MA240'].fillna(method='bfill').values
+    ma120 = df['MA120'].bfill().values
+    ma240 = df['MA240'].bfill().values
     ma30 = df['MA30'].ffill().values
     high_100d = df['High_100d'].fillna(0).values
     close_lag5 = df['Close_Lag5'].fillna(close[0]).values
@@ -2095,7 +2095,7 @@ def draw_market_dashboard(market_df, start_date, end_date):
     fig.update_yaxes(range=[0, 100], row=6, col=1, side='right')
     fig.update_layout(height=1600, template="plotly_dark", margin=dict(l=50, r=50, t=60, b=40), hovermode="x unified", showlegend=False)
     
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width='stretch')
 
 
 def send_analysis_email(df, market_analysis_text):
@@ -2367,7 +2367,7 @@ elif page == "📊 單股深度分析":
             )
             
         with col_run:
-            if st.button("Go", type="primary", use_container_width=True):
+            if st.button("Go", type="primary", width='stretch'):
                 # 強制重跑
                 st.session_state['last_ticker'] = st.session_state['stock_selector'].split(" ")[0]
                 st.rerun()
@@ -2376,10 +2376,10 @@ elif page == "📊 單股深度分析":
     col_prev, col_next = st.columns([1, 1])
     
     with col_prev:
-        st.button("◀ 上一檔", use_container_width=True, on_click=on_button_click, args=(-1,))
+        st.button("◀ 上一檔", width='stretch', on_click=on_button_click, args=(-1,))
 
     with col_next:
-        st.button("下一檔 ▶", use_container_width=True, on_click=on_button_click, args=(1,))
+        st.button("下一檔 ▶", width='stretch', on_click=on_button_click, args=(1,))
 
     # 取得最終要分析的代號
     ticker_input = st.session_state['last_ticker']
@@ -2811,7 +2811,7 @@ elif page == "📊 單股深度分析":
                     fig.update_layout(height=1600, template="plotly_dark", xaxis_rangeslider_visible=False, margin=dict(l=20, r=40, t=30, b=20),
                                                     legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1))
                     fig.update_yaxes(side='right')
-                    st.plotly_chart(fig, use_container_width=True)
+                    st.plotly_chart(fig, width='stretch')
 
 
                 # [Tab 2: 權益曲線] (保持不變)
@@ -2828,7 +2828,7 @@ elif page == "📊 單股深度分析":
                         fig_c.add_trace(go.Scatter(x=sell_pts['Date'], y=sell_pts['Cum_Strategy'], mode='markers', marker=dict(symbol='triangle-down', size=10, color='#FF00FF'), name='賣出'))
                         
                     fig_c.update_layout(template="plotly_dark", height=450, title="策略 vs 買持 績效對決", margin=dict(l=10, r=10, t=40, b=10))
-                    st.plotly_chart(fig_c, use_container_width=True)
+                    st.plotly_chart(fig_c, width='stretch')
                     
                 # [Tab 3: 因子有效性驗證] (原 Tab 4 移至此)
                 with tab3:
@@ -2885,7 +2885,7 @@ elif page == "📊 單股深度分析":
                         fig_bucket.update_yaxes(title_text="平均漲跌幅 (%)", secondary_y=False)
                         fig_bucket.update_yaxes(title_text="上漲機率 (%)", range=[0, 100], secondary_y=True)
                         fig_bucket.update_layout(template="plotly_dark", height=400, legend=dict(orientation="h", y=1.1), margin=dict(l=20, r=20, t=40, b=20))
-                        st.plotly_chart(fig_bucket, use_container_width=True)
+                        st.plotly_chart(fig_bucket, width='stretch')
                         
                         st.markdown("#### 📋 詳細統計數據")
                         display_table = pd.DataFrame({
@@ -2894,7 +2894,7 @@ elif page == "📊 單股深度分析":
                             '上漲機率': win_rates.map('{:.1f}%'.format),
                             '期望值': (group_stats['Avg_Ret_5d'] * 100).map('{:+.2f}%'.format)
                         })
-                        st.dataframe(display_table.T, use_container_width=True)
+                        st.dataframe(display_table.T, width='stretch')
                     else:
                         st.warning("數據不足，無法進行統計驗證。")
 
@@ -2961,10 +2961,10 @@ elif page == "🚀 科技股掃描":
         st.session_state['stop_scan'] = True
 
     with col_go:
-        st.button("🔥 啟動戰略掃描", type="primary", use_container_width=True, on_click=start_scan_callback)
+        st.button("🔥 啟動戰略掃描", type="primary", width='stretch', on_click=start_scan_callback)
         
     with col_stop:
-        st.button("🛑 強制停止", use_container_width=True, on_click=stop_scan_callback)
+        st.button("🛑 強制停止", width='stretch', on_click=stop_scan_callback)
 
     if 'is_scanning' not in st.session_state:
         st.session_state['is_scanning'] = False
@@ -3231,7 +3231,7 @@ elif page == "🚀 科技股掃描":
             fig_scatter.add_annotation(x=90, y=-9, text="💎 低檔佈局 (高潛力)", showarrow=False, font=dict(color="#ffecb3", size=14))
             fig_scatter.add_annotation(x=-90, y=-9, text="💀 空頭修正", showarrow=False, font=dict(color="#00e676", size=14))
             
-            st.plotly_chart(fig_scatter, use_container_width=True)
+            st.plotly_chart(fig_scatter, width='stretch')
             
             # 提供判讀指南
             with st.expander("📖 如何解讀這張戰略地圖？", expanded=False):
@@ -3272,7 +3272,7 @@ elif page == "🚀 科技股掃描":
                 top10.style
                 .format({"收盤價": "{:.1f}", "回測報酬": "{:.1%}", "漲跌幅": "{:.2%}"})
                 .applymap(highlight_top_score, subset=['Alpha_Score']),
-                use_container_width=True,
+                width='stretch',
                 column_order=["代號", "名稱", "Alpha_Score", "建議", "收盤價", "漲跌幅", "回測報酬", "計算過程"]
             )
             
@@ -3281,7 +3281,7 @@ elif page == "🚀 科技股掃描":
                     df_res.sort_values(by='Alpha_Score', ascending=False)
                     .style.format({"收盤價": "{:.1f}", "回測報酬": "{:.1%}", "漲跌幅": "{:.2%}"})
                     .background_gradient(subset=['Alpha_Score'], cmap='Reds'),
-                    use_container_width=True
+                    width='stretch'
                 )
             
     elif 'scan_results_df' in st.session_state:
@@ -3307,7 +3307,7 @@ elif page == "📋 全台股清單":
         search_term = st.text_input("🔍 搜尋代號或名稱")
         if search_term:
             df_show = df_show[df_show['代號'].str.contains(search_term) | df_show['名稱'].str.contains(search_term)]
-        st.dataframe(df_show, use_container_width=True, hide_index=True)
+        st.dataframe(df_show, width='stretch', hide_index=True)
 
 # --- 頁面 3.5 (局部無感刷新版): 持股健診 ---
 elif page == "💼 持股健診與建議":
@@ -3390,7 +3390,7 @@ elif page == "💼 持股健診與建議":
             edited_df = st.data_editor(
                 st.session_state['portfolio_data'], 
                 num_rows="dynamic", 
-                use_container_width=True, 
+                width='stretch', 
                 key="portfolio_editor_widget", 
                 column_order=["代號", "名稱", "持有股數"],
                 column_config={
@@ -3401,7 +3401,7 @@ elif page == "💼 持股健診與建議":
             )
             
             # 表單提交按鈕
-            submit_btn = st.form_submit_button("💾 確認儲存並分析", type="primary", use_container_width=True)
+            submit_btn = st.form_submit_button("💾 確認儲存並分析", type="primary", width='stretch')
 
         # [處理邏輯] 只有在按下按鈕後才執行資料處理與存檔
         if submit_btn:
@@ -3673,7 +3673,7 @@ elif page == "💼 持股健診與建議":
                     gauge = {'axis': {'range': [-100, 100]}, 'bar': {'color': "#00e676" if health > 0 else "#ef5350"}}
                 ))
                 fig_g.update_layout(height=200, margin=dict(t=30, b=10, l=20, r=20), paper_bgcolor='rgba(0,0,0,0)', font={'color': "white"})
-                st.plotly_chart(fig_g, use_container_width=True)
+                st.plotly_chart(fig_g, width='stretch')
             
             with c_info:
                 st.metric("💰 總資產估值", f"NT$ {int(total_val):,}", delta=None)
@@ -3701,7 +3701,7 @@ elif page == "💼 持股健診與建議":
                 .map(highlight_advice, subset=['AI 建議']) 
                 .map(highlight_score, subset=['綜合評分']) 
                 .format({"權重%": "{:.1f}%", "收盤價": "{:.2f}", "市值": "{:,.0f}", "持有股數": "{:.0f}"}),
-                use_container_width=True
+                width='stretch'
             )
 
     # ==========================================
@@ -3754,16 +3754,16 @@ elif page == "🧪 策略實驗室":
     # 控制按鈕
     c_run, c_stop, c_clear = st.columns([1, 1, 1])
     with c_run:
-        if st.button("🚀 開始全遍歷驗證", type="primary", use_container_width=True):
+        if st.button("🚀 開始全遍歷驗證", type="primary", width='stretch'):
             st.session_state['lab_running'] = True
             st.session_state['lab_stop'] = False
             st.session_state['lab_results'] = [] # 重置
     with c_stop:
-        if st.button("🛑 強制停止", use_container_width=True):
+        if st.button("🛑 強制停止", width='stretch'):
             st.session_state['lab_running'] = False
             st.session_state['lab_stop'] = True
     with c_clear:
-        if st.button("🗑️ 清除結果", use_container_width=True):
+        if st.button("🗑️ 清除結果", width='stretch'):
             st.session_state['lab_results'] = []
 
     # ==========================================
@@ -3898,7 +3898,7 @@ elif page == "🧪 策略實驗室":
             fig_dist.add_trace(go.Histogram(x=df_res['策略報酬'], name='策略報酬', opacity=0.75, marker_color='#ef5350'))
             fig_dist.add_trace(go.Histogram(x=df_res['買持報酬'], name='買持報酬', opacity=0.75, marker_color='gray'))
             fig_dist.update_layout(barmode='overlay', template="plotly_dark", xaxis_tickformat='.0%')
-            st.plotly_chart(fig_dist, use_container_width=True)
+            st.plotly_chart(fig_dist, width='stretch')
             
             st.caption("說明：紅色分佈若整體位於灰色右側，代表策略具有普遍的正期望值。")
 
@@ -3917,7 +3917,7 @@ elif page == "🧪 策略實驗室":
             fig_regime.add_vline(x=0.3, line_dash="dash", line_color="gray")
             
             fig_regime.update_layout(template="plotly_dark", xaxis_tickformat='.0%', yaxis_tickformat='.0%')
-            st.plotly_chart(fig_regime, use_container_width=True)
+            st.plotly_chart(fig_regime, width='stretch')
 
         with tab_v3:
             st.markdown("#### 恐慌抄底 (Panic Rebound) 有效性驗證")
@@ -3925,7 +3925,7 @@ elif page == "🧪 策略實驗室":
             if not df_panic.empty:
                 fig_panic = px.box(df_panic, y="抄底勝率", points="all", title="抄底策略勝率分佈")
                 fig_panic.update_layout(template="plotly_dark", yaxis_tickformat='.0%', yaxis_range=[0, 1.1])
-                st.plotly_chart(fig_panic, use_container_width=True)
+                st.plotly_chart(fig_panic, width='stretch')
                 st.metric("平均抄底勝率", f"{df_panic['抄底勝率'].mean():.1%}", f"樣本數: {len(df_panic)} 檔")
             else:
                 st.info("選定樣本中無觸發抄底訊號。")
@@ -3944,5 +3944,5 @@ elif page == "🧪 策略實驗室":
                 "勝率": "{:.1%}", "MDD": "{:.1f}%", 
                 "多頭捕捉率": "{:.1%}", "空頭曝險率": "{:.1%}", "抄底勝率": "{:.1%}"
             }).applymap(color_alpha, subset=['Alpha']),
-            use_container_width=True
+            width='stretch'
         )
