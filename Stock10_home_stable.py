@@ -3535,14 +3535,23 @@ elif page == "🧬 參數普適性研究":
     # 3. 顯示目前進度
     existing_df = load_dna_results_from_db()
     tickers_all = [t.strip().split(" ")[0] for t in tickers_input.split('\n') if t.strip()]
-    analyzed_list = get_analyzed_tickers()
+    analyzed_list = get_analyzed_tickers() # 這是資料庫裡所有已分析的清單
     
-    # 計算剩餘工作
+    # 計算剩餘工作 (只看輸入清單中還沒做的)
     tickers_to_run = [t for t in tickers_all if t not in analyzed_list]
     
-    progress_val = len(analyzed_list) / len(tickers_all) if tickers_all else 0
-    st.progress(progress_val, text=f"總進度: {len(analyzed_list)} / {len(tickers_all)} (剩餘 {len(tickers_to_run)} 檔)")
+    # [修正] 計算進度條數值
+    # 進度 = (總數 - 剩餘數) / 總數
+    # 這樣保證永遠不會超過 1.0
+    if len(tickers_all) > 0:
+        done_count = len(tickers_all) - len(tickers_to_run)
+        progress_val = done_count / len(tickers_all)
+        # 雙重保險：限制在 0.0 ~ 1.0 之間
+        progress_val = min(1.0, max(0.0, progress_val))
+    else:
+        progress_val = 0.0
 
+    st.progress(progress_val, text=f"總進度: {len(tickers_all) - len(tickers_to_run)} / {len(tickers_all)} (剩餘 {len(tickers_to_run)} 檔)")
     # 4. 自動執行邏輯 (核心引擎)
     if st.session_state['dna_auto_run']:
         if not tickers_to_run:
@@ -3650,6 +3659,6 @@ elif page == "🧬 參數普適性研究":
                 if len(existing_df) > 50:
                     st.caption("⚠️ 為保持頁面效能，熱力圖僅顯示最近 50 筆資料。完整數據請見資料庫。")
 
-                    
+
 
             
