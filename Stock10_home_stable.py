@@ -1807,9 +1807,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 3. 洗盤識別（根據持倉狀態調整）
         # 判斷是否持有中（通過 Action 字段判斷）
-        # 注意：賣出當日應視為持有狀態（因為當日還在持有中）
+        # [修正] 買入當日應視為空手（因為買入決策是在當天開盤或盤中做的，當時是空手）
+        # 只有 Action='Hold' 或 'Sell' (賣出當日還在持有) 才視為持有
         action = row['Action'] if 'Action' in row else 'Hold'
-        is_holding = (action == 'Hold' or action == 'Buy' or action == 'Sell')
+        is_holding = (action == 'Hold' or action == 'Sell')
         
         consolidation_score = detect_consolidation_signal(ma_dict, close, vol, vol_ma, volatility, price_change, is_holding)
         score += consolidation_score
@@ -2840,6 +2841,13 @@ elif page == "📊 單股深度分析":
                     buy_chip = final_df[(final_df['Action'] == 'Buy') & (final_df['Reason'].str.contains('籌碼|佈局'))]
                     if not buy_chip.empty:
                         fig.add_trace(go.Scatter(x=buy_chip['Date'], y=buy_chip['Buy_Y'], mode='markers+text', text=get_buy_text(buy_chip), textposition="bottom center", textfont=dict(color='#DDA0DD', size=11), marker=dict(symbol='triangle-up', size=14, color='#DDA0DD', line=dict(width=1, color='black')), name='買進 (籌碼)', hovertext=buy_chip['Reason']), row=1, col=1)
+
+                    # [新增] 捕捉所有其他買入信號 (避免遺漏)
+                    # 排除已經畫過的類別
+                    known_types = '突破|回測|動能|反彈|超賣|籌碼|佈局'
+                    buy_other = final_df[(final_df['Action'] == 'Buy') & (~final_df['Reason'].str.contains(known_types))]
+                    if not buy_other.empty:
+                        fig.add_trace(go.Scatter(x=buy_other['Date'], y=buy_other['Buy_Y'], mode='markers+text', text=get_buy_text(buy_other), textposition="bottom center", textfont=dict(color='#FFFFFF', size=11), marker=dict(symbol='triangle-up', size=14, color='#FFFFFF', line=dict(width=1, color='black')), name='買進 (其他)', hovertext=buy_other['Reason']), row=1, col=1)
 
                     sell_all = final_df[final_df['Action'] == 'Sell']
                     if not sell_all.empty:
