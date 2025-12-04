@@ -261,7 +261,7 @@ def get_master_stock_data():
                 c = row.get('Code')
                 if c in stock_map:
                     stock_map[c]['本益比'] = row.get('PEratio', '-')
-                    stock_map[c]['殖利率(%)'] = row.get('DividendYield', '-')
+                    stock_map[c]['殖利率(%)'] = row.get('DividendYield', '-')
                     stock_map[c]['股價淨值比'] = row.get('PBratio', '-')
     except: pass
 
@@ -2031,7 +2031,8 @@ elif page == "📊 單股深度分析":
                         # 防呆：萬一上游沒算出來，填入空字串避免報錯
                         final_df['Score_Detail'] = ""
 
-                    final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().rolling(window=3, center=True).mean().fillna(0)
+                    final_df['Alpha_Slope'] = final_df['Alpha_Score'].diff().fillna(0)
+                    final_df['Alpha_Slope_MA5'] = final_df['Alpha_Slope'].rolling(window=5, min_periods=1).mean().fillna(0)
 
                     # 確保長均線存在
                     if 'MA120' not in final_df.columns: final_df['MA120'] = final_df['Close'].rolling(120).mean()
@@ -2137,7 +2138,8 @@ elif page == "📊 單股深度分析":
 
                     # --- Row 3: Alpha Slope ---
                     colors_slope = ['#ef5350' if v > 0 else ('#26a69a' if v < 0 else 'gray') for v in final_df['Alpha_Slope']]
-                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope), row=3, col=1)
+                    fig.add_trace(go.Bar(x=final_df['Date'], y=final_df['Alpha_Slope'], name='Alpha Slope', marker_color=colors_slope, opacity=0.4), row=3, col=1)
+                    fig.add_trace(go.Scatter(x=final_df['Date'], y=final_df['Alpha_Slope_MA5'], mode='lines', line=dict(color='white', width=2), name='Alpha Slope MA5'), row=3, col=1)
                     fig.add_hline(y=0, line_width=1, line_color="gray", row=3, col=1)
 
                     # --- Row 4: 成交量 ---
@@ -2525,7 +2527,7 @@ elif page == "🚀 科技股掃描":
                 flush_results_to_dataframe() # <--- 完成時轉正
 
                 if not st.session_state['scan_temp_results']:
-                     if not st.session_state.get('stop_scan'):
+                     if not st.session_state.get('stop_scan', False):
                         st.warning("未發現有效標的。")
                 else:
                     st.success(f"✅ 掃描完成！")
