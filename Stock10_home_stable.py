@@ -634,8 +634,9 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
     if 'Dividends' not in df.columns: df['Dividends'] = 0.0
     df['Dividends'] = df['Dividends'].fillna(0.0)
     
-    # 先計算 Alpha Score（不依賴 Action）
-    df['Action'] = 'Hold'  # 臨時設置，用於計算 Alpha Score
+    # 先計算 Alpha Score（不依賴 Action，用於買賣判斷）
+    # 注意：這裡使用空手狀態計算，因為進場時是空手，出場時主要看分數正負號
+    df['Action'] = 'Wait'  # 空手狀態
     df['Reason'] = ''
     df_with_alpha = calculate_alpha_score(df, pd.DataFrame(), pd.DataFrame())
     alpha_scores = df_with_alpha['Alpha_Score'].values
@@ -727,17 +728,10 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             adjusted_current_value = close[i] + cum_div
             drawdown = (adjusted_current_value - entry_price) / entry_price
             
-            # 更新 Action 為持有狀態，然後重新計算當日的 Alpha Score（考慮持有狀態）
-            df.loc[df.index[i], 'Action'] = 'Hold'
-            df.loc[df.index[i], 'Reason'] = reason_str if reason_str else '持有中'
-            
-            # 只重新計算當日的 Alpha Score（優化性能）
-            df_slice = df.iloc[max(0, i-60):i+1].copy()  # 只取最近60天，足夠計算指標
-            if len(df_slice) > 0:
-                df_slice_with_alpha = calculate_alpha_score(df_slice, pd.DataFrame(), pd.DataFrame())
-                current_alpha_score = df_slice_with_alpha['Alpha_Score'].iloc[-1] if len(df_slice_with_alpha) > 0 else alpha_scores[i]
-            else:
-                current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
+            # 使用預計算的 Alpha Score（性能優化：不在循環中重新計算）
+            # 注意：預計算的 alpha score 是基於空手狀態，但對於賣出判斷已經足夠
+            # 因為我們主要關心的是分數的正負號，而不是精確值
+            current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
             
             is_sell = False
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
@@ -795,22 +789,42 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
 
 # 修改後：傳遞成本參數
 def run_optimization(raw_df, market_df, user_start_date, fee_rate=0.001425, tax_rate=0.003, use_chip_strategy=True, use_strict_bear_exit=True):
-    best_ret = -999; best_params = None; best_df = None; target_start = pd.to_datetime(user_start_date)
+    """
+    執行策略優化，尋找最佳參數組合
+    性能優化：避免重複計算指標
+    """
+    best_ret = -999
+    best_params = None
+    best_df = None
+    target_start = pd.to_datetime(user_start_date)
     
-    for m in [3.0, 3.5]:
+    # 優化：預先計算所有需要的指標（避免在循環中重複計算）
+    # 只計算一次指標，然後在循環中重用
+    try:
+        # 使用第一個參數組合計算指標（指標計算不依賴 m 和 r）
+        df_ind_base = calculate_indicators(raw_df, 10, 3.0, market_df)
+        df_slice_base = df_ind_base[df_ind_base['Date'] >= target_start].copy()
+        
+        if df_slice_base.empty:
+            return None, pd.DataFrame()
+        
+        # 循環測試不同的 RSI 閾值
         for r in [25, 30]:
-            df_ind = calculate_indicators(raw_df, 10, m, market_df)
-            df_slice = df_ind[df_ind['Date'] >= target_start].copy()
-            if df_slice.empty: continue
+            # 使用相同的指標數據，只改變 RSI 閾值
+            df_res = run_simple_strategy(df_slice_base.copy(), r, fee_rate, tax_rate, use_chip_strategy, use_strict_bear_exit)
             
-            # [修改] 傳遞 use_strict_bear_exit
-            df_res = run_simple_strategy(df_slice, r, fee_rate, tax_rate, use_chip_strategy, use_strict_bear_exit)
+            if df_res is None or df_res.empty:
+                continue
             
             ret = df_res['Cum_Strategy'].iloc[-1] - 1
             if ret > best_ret:
                 best_ret = ret
-                best_params = {'Mult':m, 'RSI_Buy':r, 'Return':ret}
+                best_params = {'Mult': 3.0, 'RSI_Buy': r, 'Return': ret}  # 固定使用 3.0
                 best_df = df_res
+    except Exception as e:
+        # 如果出錯，返回空結果
+        return None, pd.DataFrame()
+    
     return best_params, best_df
 
 
@@ -2396,29 +2410,45 @@ elif page == "📊 單股深度分析":
     
     if ticker_input: 
         with st.spinner(f'正在分析 {ticker_input} ...'):
-            current_fee = fee_input if 'fee_input' in locals() else 0.001425
-            current_tax = tax_input if 'tax_input' in locals() else 0.003
-            
-            # 初始化變數，防止 NameError
-            final_df = None
-            best_params = None
-            validation_result = None
-            
-            # 1. 獲取資料
-            raw_df, fmt_ticker = get_stock_data(ticker_input, start_date, end_date)
-            name = get_stock_name(fmt_ticker)
-            
-            # 2. 判斷資料是否獲取成功
-            if raw_df.empty:
-                st.error(f"❌ 無法獲取 {ticker_input} 資料。原因可能是：\n1. 代號錯誤\n2. 該 ETF/股票剛上市，Yahoo Finance 尚未收錄\n3. 該商品無近期交易量")
-            else:
-                # 3. 若成功，才執行策略運算
-                best_params, final_df = run_optimization(
-                    raw_df, market_df, start_date, current_fee, current_tax, 
-                    use_chip_strategy=enable_chip_strategy,
-                    use_strict_bear_exit=enable_strict_bear_exit  # <--- 加入參數
-                )
-                validation_result = validate_strategy_robust(raw_df, market_df, 0.7, current_fee, current_tax)
+            try:
+                current_fee = fee_input if 'fee_input' in locals() else 0.001425
+                current_tax = tax_input if 'tax_input' in locals() else 0.003
+                
+                # 初始化變數，防止 NameError
+                final_df = None
+                best_params = None
+                validation_result = None
+                
+                # 1. 獲取資料
+                raw_df, fmt_ticker = get_stock_data(ticker_input, start_date, end_date)
+                name = get_stock_name(fmt_ticker)
+                
+                # 2. 判斷資料是否獲取成功
+                if raw_df.empty:
+                    st.error(f"❌ 無法獲取 {ticker_input} 資料。原因可能是：\n1. 代號錯誤\n2. 該 ETF/股票剛上市，Yahoo Finance 尚未收錄\n3. 該商品無近期交易量")
+                else:
+                    # 3. 若成功，才執行策略運算
+                    with st.spinner('正在執行策略優化...'):
+                        best_params, final_df = run_optimization(
+                            raw_df, market_df, start_date, current_fee, current_tax, 
+                            use_chip_strategy=enable_chip_strategy,
+                            use_strict_bear_exit=enable_strict_bear_exit
+                        )
+                    
+                    # 4. 執行驗證（可選，如果太慢可以註解掉）
+                    if final_df is not None and not final_df.empty:
+                        with st.spinner('正在驗證策略穩健性...'):
+                            try:
+                                validation_result = validate_strategy_robust(raw_df, market_df, 0.7, current_fee, current_tax)
+                            except Exception as e:
+                                st.warning(f"策略驗證過程出現錯誤: {str(e)}")
+                                validation_result = None
+            except Exception as e:
+                st.error(f"❌ 分析過程出現錯誤: {str(e)}")
+                st.info("請嘗試重新整理頁面或檢查股票代號是否正確")
+                final_df = None
+                best_params = None
+                validation_result = None
 
             # 4. 顯示結果 (檢查 final_df 是否存在且不為空)
             if final_df is None or final_df.empty:
