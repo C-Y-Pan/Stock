@@ -1213,8 +1213,31 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         html_str += "<span style='color:#666; font-size:10px'>─── Technical Analysis ───</span><br>"
         
         # 顯示理由
-        pos_reasons = [r for r in reasons if "(+" in r]
-        neg_reasons = [r for r in reasons if "(-" in r or "(" in r and "+" not in r]
+        # [修正] 顯示所有正分和負分項目，確保計算過程完整
+        # 使用正則表達式提取分數，確保即使格式不標準也能正確分類
+        import re
+        
+        pos_reasons = []
+        neg_reasons = []
+        
+        for r in reasons:
+            # 嘗試提取分數 (例如 (+15) 或 (-5))
+            match = re.search(r'\(([+-]?\d+)\)', r)
+            if match:
+                score_val = int(match.group(1))
+                if score_val > 0:
+                    pos_reasons.append(r)
+                elif score_val < 0:
+                    neg_reasons.append(r)
+            else:
+                # 如果沒有分數標記，根據內容猜測 (通常包含文字描述)
+                if "(+" in r:
+                    pos_reasons.append(r)
+                elif "(-" in r:
+                    neg_reasons.append(r)
+                else:
+                    # 如果完全沒有正負號，當作中性或提示信息
+                    pos_reasons.append(r) # 默認放在上面
         
         if pos_reasons:
             html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
@@ -1757,7 +1780,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         alignment_score = alignment * 15
         score += alignment_score
         
-        if abs(alignment) > 0.5:
+        if abs(alignment_score) > 1:
             reasons.append(f"均線{'多排' if alignment > 0 else '空排'} ({alignment_score:+.0f})")
         
         # ==========================================
@@ -1767,23 +1790,25 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         rsi_score = rsi_continuous_score(rsi)
         score += rsi_score
         
-        if abs(rsi_score) > 3:
+        if abs(rsi_score) > 1:
             reasons.append(f"RSI ({int(rsi)}) ({rsi_score:+.0f})")
         
         # RSI 動能方向
         if i > 0:
             rsi_momentum = rsi - prev_rsi
             momentum_score = smooth_sigmoid(rsi_momentum, inflection=0, steepness=0.5) * 5
-            if abs(momentum_score) > 1:
+            if abs(momentum_score) > 0.5:
                 score += momentum_score
+                reasons.append(f"動能{'增強' if momentum_score > 0 else '減弱'} ({momentum_score:+.0f})")
         
         # ==========================================
         # C. 量價配合度
         # ==========================================
         
         vol_score = volume_momentum_score(vol, vol_ma, price_change)
-        if abs(vol_score) > 2:
+        if abs(vol_score) > 1:
             score += vol_score
+            reasons.append(f"量價{'配合' if vol_score > 0 else '背離'} ({vol_score:+.0f})")
         
         # ==========================================
         # D. 核心策略識別 (買在起漲點、賣在高點、洗盤不交易、恐慌抄底)
@@ -1796,13 +1821,13 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 1. 起漲點識別
         breakout_score = detect_breakout_signal(close, ma_dict, vol, vol_ma, price_change, momentum, momentum_accel, rsi, prev_rsi)
         score += breakout_score
-        if abs(breakout_score) > 5:
+        if abs(breakout_score) > 1:
             reasons.append(f"起漲點信號 ({breakout_score:+.0f})")
         
         # 2. 賣點識別
         peak_penalty = detect_peak_signal(rsi, price_change, momentum, momentum_accel, price_position, vol, vol_ma)
         score += peak_penalty
-        if peak_penalty < -5:
+        if peak_penalty < -1:
             reasons.append(f"高點警示 ({peak_penalty:.0f})")
         
         # 3. 洗盤識別（根據持倉狀態調整）
@@ -1815,7 +1840,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         consolidation_score = detect_consolidation_signal(ma_dict, close, vol, vol_ma, volatility, price_change, is_holding)
         score += consolidation_score
         
-        if abs(consolidation_score) > 5:
+        if abs(consolidation_score) > 1:
             if is_holding:
                 reasons.append(f"震盪洗盤(持有加分) ({consolidation_score:+.0f})")
             else:
@@ -1824,7 +1849,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 4. 恐慌抄底識別
         panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum)
         score += panic_bottom_score
-        if panic_bottom_score > 10:
+        if panic_bottom_score > 1:
             reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.0f})")
         
         # ==========================================
