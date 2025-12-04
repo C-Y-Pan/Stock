@@ -1956,6 +1956,16 @@ def draw_market_dashboard(market_df, start_date, end_date):
     繪製總體市場儀表板：Metrics、HTML 前瞻分析、Plotly 圖表
     """
     st.markdown("### 🌍 總體市場戰情 (Macro)")
+    
+    # 檢查 market_df 是否為空或缺少必要欄位
+    if market_df.empty:
+        st.error("無大盤數據")
+        return
+    
+    if 'Date' not in market_df.columns:
+        st.error("大盤數據缺少 Date 欄位")
+        return
+    
     target_start = pd.to_datetime(start_date)
     plot_df = market_df[market_df['Date'] >= target_start].copy()
     
