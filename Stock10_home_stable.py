@@ -697,7 +697,7 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
 
         # --- 進場邏輯：基於 Alpha Score ---
         if position == 0:
-            # 獲取當日的 Alpha Score
+            # 使用預計算的 Alpha Score（空手狀態）
             current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
             
             # Alpha Score > 0 則買入
@@ -727,8 +727,17 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             adjusted_current_value = close[i] + cum_div
             drawdown = (adjusted_current_value - entry_price) / entry_price
             
-            # 獲取當日的 Alpha Score
-            current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
+            # 更新 Action 為持有狀態，然後重新計算當日的 Alpha Score（考慮持有狀態）
+            df.loc[df.index[i], 'Action'] = 'Hold'
+            df.loc[df.index[i], 'Reason'] = reason_str if reason_str else '持有中'
+            
+            # 只重新計算當日的 Alpha Score（優化性能）
+            df_slice = df.iloc[max(0, i-60):i+1].copy()  # 只取最近60天，足夠計算指標
+            if len(df_slice) > 0:
+                df_slice_with_alpha = calculate_alpha_score(df_slice, pd.DataFrame(), pd.DataFrame())
+                current_alpha_score = df_slice_with_alpha['Alpha_Score'].iloc[-1] if len(df_slice_with_alpha) > 0 else alpha_scores[i]
+            else:
+                current_alpha_score = alpha_scores[i] if i < len(alpha_scores) else 0
             
             is_sell = False
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
@@ -1380,7 +1389,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         peak_penalty = -(rsi_overheat + momentum_exhaustion + position_penalty + divergence_penalty + overbought_signal)
         return peak_penalty
     
-    def detect_consolidation_signal(ma_dict, price, vol, vol_ma, volatility, price_change):
+    def detect_consolidation_signal(ma_dict, price, vol, vol_ma, volatility, price_change, is_holding=False):
         """
         識別洗盤/震盪信號 (洗盤時不交易) - 完全 analog 化
         條件：
@@ -1389,7 +1398,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         3. 成交量萎縮（連續函數）
         4. 價格在窄幅震盪（連續函數）
         
-        返回：負分（震盪時應該觀望，分數接近0）
+        邏輯：
+        - 空手時：扣分（避免買入）
+        - 持有時：加分（避免賣出）
+        
+        返回：根據持倉狀態調整分數
         """
         if len(ma_dict) < 3 or price == 0:
             return 0
@@ -1420,9 +1433,18 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         if abs(price_change) < 0.01:  # 單日變化 < 1%
             narrow_range_signal = (1 - smooth_sigmoid(abs(price_change) * 100, inflection=1, steepness=10)) * 10
         
-        # 綜合扣分（震盪時應該觀望，分數接近0）
-        consolidation_penalty = -(convergence_signal + low_volatility_signal + low_vol_signal + narrow_range_signal)
-        return consolidation_penalty
+        # 綜合震盪信號強度
+        consolidation_intensity = convergence_signal + low_volatility_signal + low_vol_signal + narrow_range_signal
+        
+        # 根據持倉狀態調整：
+        # 空手時：扣分（避免買入）
+        # 持有時：加分（避免賣出）
+        if is_holding:
+            # 持有時，震盪洗盤是好事（避免被洗出），給予加分
+            return consolidation_intensity
+        else:
+            # 空手時，震盪洗盤應該觀望，給予扣分
+            return -consolidation_intensity
     
     def detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum):
         """
@@ -1667,12 +1689,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 判斷是否為恐慌抄底（RSI < 30 或 深度下跌 + 超賣）
         is_panic_bottom = (rsi < 30) or (bias_60 < -0.10 and rsi < 40)
         
-        # 恐慌抄底時，豁免趨勢偏空的扣分
+        # 恐慌抄底時，豁免趨勢偏空的扣分（只不扣分，不加分）
         if is_panic_bottom and trend_score < 0:
-            trend_penalty_restore = abs(trend_score)  # 加回被扣的分數
-            score += trend_penalty_restore
-            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (+{trend_penalty_restore:.0f})</span>")
-            trend_score = 0  # 設為0，表示已豁免
+            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (原扣{trend_score:.0f}分)</span>")
+            trend_score = 0  # 設為0，表示已豁免（不扣分也不加分）
         
         score += trend_score
         
@@ -1732,11 +1752,19 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         if peak_penalty < -5:
             reasons.append(f"高點警示 ({peak_penalty:.0f})")
         
-        # 3. 洗盤識別（震盪時扣分，分數接近0，避免交易）
-        consolidation_penalty = detect_consolidation_signal(ma_dict, close, vol, vol_ma, volatility, price_change)
-        score += consolidation_penalty
-        if consolidation_penalty < -5:
-            reasons.append(f"震盪洗盤 ({consolidation_penalty:.0f})")
+        # 3. 洗盤識別（根據持倉狀態調整）
+        # 判斷是否持有中（通過 Action 字段判斷）
+        action = row['Action'] if 'Action' in row else 'Hold'
+        is_holding = (action == 'Hold' or action == 'Buy')
+        
+        consolidation_score = detect_consolidation_signal(ma_dict, close, vol, vol_ma, volatility, price_change, is_holding)
+        score += consolidation_score
+        
+        if abs(consolidation_score) > 5:
+            if is_holding:
+                reasons.append(f"震盪洗盤(持有加分) ({consolidation_score:+.0f})")
+            else:
+                reasons.append(f"震盪洗盤(空手扣分) ({consolidation_score:.0f})")
         
         # 4. 恐慌抄底識別
         panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum)
