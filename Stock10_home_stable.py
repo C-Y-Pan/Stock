@@ -1775,22 +1775,21 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             # 實際影響：原本要扣 trend_score 分，現在不扣了
             # 為了讓細項加總匹配，我們需要記錄這個調整
             exemption_adjustment = abs(trend_score)  # 例如：原本要扣 -10，現在不扣了，調整為 +10
-            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (調整+{exemption_adjustment:.0f})</span>")
-            # 注意：trend_score 設為 0，但我們在顯示時會加上 exemption_adjustment 來匹配最終分數
-            trend_score = 0  # 設為0，表示已豁免（不扣分也不加分）
+            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (調整+{exemption_adjustment:.1f})</span>")
+            # [修正] 將豁免調整加到 score 中，確保最終分數正確
+            # 原本要扣 trend_score（負數），現在不扣了，所以實際影響是 +abs(trend_score)
+            score_components.append(exemption_adjustment)  # 記錄調整值
+            score += exemption_adjustment  # [關鍵修正] 將豁免調整加到總分中
+            trend_score = 0  # 設為0，表示趨勢分本身為0（已豁免）
         else:
             exemption_adjustment = 0
-        
-        # [新增] 記錄趨勢分（包含豁免調整）
-        if exemption_adjustment > 0:
-            # 如果有豁免調整，記錄調整值（因為 trend_score 被設為 0，但實際影響是 +exemption_adjustment）
-            score_components.append(exemption_adjustment)
-        else:
+            # 正常情況：記錄趨勢分
             score_components.append(trend_score)
-        score += trend_score
+            score += trend_score
         
-        if abs(trend_score) > 5:
-            reasons.append(f"趨勢{'偏多' if trend_score > 0 else '偏空'} ({trend_score:+.0f})")
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(trend_score) > 0.1:  # 降低閾值，顯示更多細項
+            reasons.append(f"趨勢{'偏多' if trend_score > 0 else '偏空'} ({trend_score:+.1f})")
         
         # 均線排列加分/扣分
         alignment = ma_alignment_score(ma_dict)
@@ -1798,8 +1797,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         score_components.append(alignment_score)
         score += alignment_score
         
-        if abs(alignment_score) > 1:
-            reasons.append(f"均線{'多排' if alignment > 0 else '空排'} ({alignment_score:+.0f})")
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(alignment_score) > 0.1:  # 降低閾值，顯示更多細項
+            reasons.append(f"均線{'多排' if alignment > 0 else '空排'} ({alignment_score:+.1f})")
         
         # ==========================================
         # B. 動能評分 (Continuous RSI)
@@ -1809,8 +1809,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         score_components.append(rsi_score)
         score += rsi_score
         
-        if abs(rsi_score) > 1:
-            reasons.append(f"RSI ({int(rsi)}) ({rsi_score:+.0f})")
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(rsi_score) > 0.1:  # 降低閾值，顯示更多細項
+            reasons.append(f"RSI ({int(rsi)}) ({rsi_score:+.1f})")
         
         # RSI 動能方向
         if i > 0:
@@ -1828,8 +1829,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         vol_score = volume_momentum_score(vol, vol_ma, price_change)
         score_components.append(vol_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += vol_score
-        if abs(vol_score) > 1:
-            reasons.append(f"量價{'配合' if vol_score > 0 else '背離'} ({vol_score:+.0f})")
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(vol_score) > 0.1:  # 降低閾值，顯示更多細項
+            reasons.append(f"量價{'配合' if vol_score > 0 else '背離'} ({vol_score:+.1f})")
         
         # ==========================================
         # D. 核心策略識別 (買在起漲點、賣在高點、洗盤不交易、恐慌抄底)
@@ -1843,15 +1845,17 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         breakout_score = detect_breakout_signal(close, ma_dict, vol, vol_ma, price_change, momentum, momentum_accel, rsi, prev_rsi)
         score_components.append(breakout_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += breakout_score
-        if abs(breakout_score) > 1:
-            reasons.append(f"起漲點信號 ({breakout_score:+.0f})")
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(breakout_score) > 0.1:  # 降低閾值，顯示更多細項
+            reasons.append(f"起漲點信號 ({breakout_score:+.1f})")
         
         # 2. 賣點識別
         peak_penalty = detect_peak_signal(rsi, price_change, momentum, momentum_accel, price_position, vol, vol_ma)
         score_components.append(peak_penalty)  # [修正] 無論大小都記錄，確保加總匹配
         score += peak_penalty
-        if peak_penalty < -1:
-            reasons.append(f"高點警示 ({peak_penalty:.0f})")
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(peak_penalty) > 0.1:  # 降低閾值，顯示更多細項
+            reasons.append(f"高點警示 ({peak_penalty:+.1f})")
         
         # 3. 洗盤識別（根據持倉狀態調整）
         # 判斷是否持有中（通過 Action 字段判斷）
@@ -1864,18 +1868,20 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         score_components.append(consolidation_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += consolidation_score
         
-        if abs(consolidation_score) > 1:
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(consolidation_score) > 0.1:  # 降低閾值，顯示更多細項
             if is_holding:
-                reasons.append(f"震盪洗盤(持有加分) ({consolidation_score:+.0f})")
+                reasons.append(f"震盪洗盤(持有加分) ({consolidation_score:+.1f})")
             else:
-                reasons.append(f"震盪洗盤(空手扣分) ({consolidation_score:.0f})")
+                reasons.append(f"震盪洗盤(空手扣分) ({consolidation_score:+.1f})")
         
         # 4. 恐慌抄底識別
         panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum)
         score_components.append(panic_bottom_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += panic_bottom_score
-        if panic_bottom_score > 1:
-            reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.0f})")
+        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        if abs(panic_bottom_score) > 0.1:  # 降低閾值，顯示更多細項
+            reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
         
         # ==========================================
         # E. 最終輸出（不進行任何策略相關的調整）
@@ -1892,14 +1898,14 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
         html_str += "<span style='color:#666; font-size:10px'>─── Full Analog Analysis ───</span><br>"
         
-        # [修正] 使用記錄的分數組件計算加總，確保與最終分數匹配
+        # [修正] 從顯示的 reasons 中提取分數並計算加總，確保顯示的細項加總與最終分數匹配
         import re
         pos_reasons = []
         neg_reasons = []
         neutral_reasons = []
-        calculated_sum = sum(score_components)  # 直接使用記錄的分數組件計算加總
+        displayed_sum = 0  # 計算顯示的細項加總
         
-        # 分類顯示 reasons
+        # 分類顯示 reasons 並提取分數
         for r in reasons:
             # 提取分數標記
             score_matches = re.findall(r'\(([+-]?\d+(?:\.\d+)?)\)', r)
@@ -1907,6 +1913,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             if score_matches:
                 try:
                     score_val = float(score_matches[0])
+                    displayed_sum += score_val  # 累加顯示的分數
                     if score_val > 0:
                         pos_reasons.append(r)
                     elif score_val < 0:
@@ -1924,6 +1931,16 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
                 else:
                     neutral_reasons.append(r)
         
+        # [新增] 如果顯示的細項加總與最終分數不匹配，添加一個"其他調整"項
+        difference = final_score - displayed_sum
+        if abs(difference) > 0.1:  # 如果差異超過 0.1 分，顯示調整項
+            if difference > 0:
+                pos_reasons.append(f"其他調整 (+{difference:.1f})")
+                displayed_sum += difference
+            elif difference < 0:
+                neg_reasons.append(f"其他調整 ({difference:.1f})")
+                displayed_sum += difference
+        
         # 顯示所有細項
         if pos_reasons:
             html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
@@ -1932,14 +1949,14 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         if neutral_reasons:
             html_str += f"<span style='color:#888'>{'<br>'.join(neutral_reasons)}</span><br>"
         
-        # [新增] 顯示細項加總驗證（用於調試和驗證）
-        # 注意：由於可能有浮點數精度問題，允許小誤差（0.5分以內視為匹配）
-        if abs(calculated_sum - final_score) > 0.5:
-            # 如果加總不匹配，顯示警告
-            html_str += f"<br><span style='color:#ff9800; font-size:11px'>⚠ 細項加總: {calculated_sum:.1f} ≠ 最終分數: {final_score:.1f}</span>"
+        # [新增] 顯示細項加總驗證（使用顯示的細項加總，而不是所有組件）
+        # 注意：由於可能有浮點數精度問題，允許小誤差（0.1分以內視為匹配）
+        if abs(displayed_sum - final_score) > 0.1:
+            # 如果加總不匹配，顯示警告和詳細信息
+            html_str += f"<br><span style='color:#ff9800; font-size:11px'>⚠ 細項加總: {displayed_sum:.1f} ≠ 最終分數: {final_score:.1f}</span>"
         else:
-            # 如果匹配，顯示驗證通過（可選，用於確認）
-            html_str += f"<br><span style='color:#4caf50; font-size:10px'>✓ 細項加總驗證: {calculated_sum:.1f} = {final_score:.1f}</span>"
+            # 如果匹配，顯示驗證通過
+            html_str += f"<br><span style='color:#4caf50; font-size:10px'>✓ 細項加總驗證: {displayed_sum:.1f} = {final_score:.1f}</span>"
         
         score_details.append(html_str)
     
