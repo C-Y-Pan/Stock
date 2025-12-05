@@ -1868,8 +1868,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         score_components.append(peak_penalty)  # [修正] 無論大小都記錄，確保加總匹配
         score += peak_penalty
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        # [修正] 高點警示應為扣分，peak_penalty已經是負數，顯示時保持負號
         if abs(peak_penalty) > 0.1:  # 降低閾值，顯示更多細項
-            reasons.append(f"高點警示 ({peak_penalty:+.1f})")
+            reasons.append(f"高點警示 ({peak_penalty:+.1f})")  # peak_penalty已經是負數，會顯示為 (-X.X)
         
         # 3. 洗盤識別（根據持倉狀態調整）
         # 判斷是否持有中（通過 Action 字段判斷）
@@ -1898,7 +1899,74 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
         
         # ==========================================
-        # E. 最終輸出（不進行任何策略相關的調整）
+        # E. [新增] 持有信心加分 / 觀望扣分 (避免高頻交易)
+        # ==========================================
+        # 根據市場情況動態調整，作為買賣的 buffer
+        # 持有时：根據市場強度給予信心加分（避免輕易賣出）
+        # 空手時：根據市場強度給予觀望扣分（避免輕易買入）
+        
+        # 計算市場強度指標（0-1之間，1表示市場很強）
+        market_strength = 0.0
+        
+        # 1. 趨勢強度（0-0.4）
+        if trend_score > 0:
+            market_strength += min(trend_score / 30.0, 0.4)  # 趨勢分越高，市場越強
+        else:
+            market_strength += max(trend_score / 30.0, -0.2)  # 趨勢分為負時，降低強度
+        
+        # 2. RSI 強度（0-0.3）
+        if rsi > 50:
+            market_strength += min((rsi - 50) / 50.0, 0.3)  # RSI越高，市場越強
+        else:
+            market_strength += max((rsi - 50) / 50.0, -0.15)  # RSI低時，降低強度
+        
+        # 3. 動能強度（0-0.2）
+        if momentum > 0:
+            market_strength += min(momentum * 2.0, 0.2)  # 動能為正時加分
+        else:
+            market_strength += max(momentum * 2.0, -0.1)  # 動能為負時扣分
+        
+        # 4. 量價配合（0-0.1）
+        if vol_score > 0:
+            market_strength += min(vol_score / 15.0, 0.1)
+        else:
+            market_strength += max(vol_score / 15.0, -0.05)
+        
+        # 限制市場強度在合理範圍
+        market_strength = np.clip(market_strength, -0.5, 1.0)
+        
+        # 根據持倉狀態和市場強度計算 buffer 分數
+        if is_holding:
+            # 持有时：市場越強，信心加分越多（避免在強勢時輕易賣出）
+            # 市場強度為正時給予加分，為負時給予扣分（但幅度較小）
+            holding_confidence = market_strength * 8.0  # 最大 ±8 分
+            # 如果市場很弱（market_strength < -0.3），減少信心加分，甚至扣分
+            if market_strength < -0.3:
+                holding_confidence = market_strength * 12.0  # 市場很弱時，扣分更多
+        else:
+            # 空手時：市場越弱，觀望扣分越多（避免在弱勢時輕易買入）
+            # 市場強度為負時給予扣分，為正時給予加分（但幅度較小）
+            waiting_penalty = -market_strength * 6.0  # 最大 ±6 分
+            # 如果市場很強（market_strength > 0.3），減少觀望扣分，甚至加分
+            if market_strength > 0.3:
+                waiting_penalty = -market_strength * 4.0  # 市場很強時，扣分較少
+            holding_confidence = waiting_penalty
+        
+        # 限制 buffer 分數範圍，避免過度影響
+        holding_confidence = np.clip(holding_confidence, -10.0, 10.0)
+        
+        score_components.append(holding_confidence)
+        score += holding_confidence
+        
+        # 顯示 buffer 分數
+        if abs(holding_confidence) > 0.5:
+            if is_holding:
+                reasons.append(f"持有信心 ({holding_confidence:+.1f})")
+            else:
+                reasons.append(f"觀望扣分 ({holding_confidence:+.1f})")
+        
+        # ==========================================
+        # F. 最終輸出（不進行任何策略相關的調整）
         # ==========================================
         
         final_score = np.clip(score, -100, 100)
