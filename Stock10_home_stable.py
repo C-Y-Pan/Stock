@@ -1931,15 +1931,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
                 else:
                     neutral_reasons.append(r)
         
-        # [新增] 如果顯示的細項加總與最終分數不匹配，添加一個"其他調整"項
-        difference = final_score - displayed_sum
-        if abs(difference) > 0.1:  # 如果差異超過 0.1 分，顯示調整項
-            if difference > 0:
-                pos_reasons.append(f"其他調整 (+{difference:.1f})")
-                displayed_sum += difference
-            elif difference < 0:
-                neg_reasons.append(f"其他調整 ({difference:.1f})")
-                displayed_sum += difference
+        # [移除] 不再顯示"其他調整"項，讓顯示的細項更清晰
+        # 如果顯示的細項加總與最終分數不匹配，會在驗證行顯示警告
         
         # 顯示所有細項
         if pos_reasons:
