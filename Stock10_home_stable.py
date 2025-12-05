@@ -1206,6 +1206,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # E. 輸出格式化
         # ==========================================
         final_score = max(min(score, 100), -100)
+        # [修正] 處理 NaN 值，確保可以安全轉換為 int
+        if np.isnan(final_score) or not np.isfinite(final_score):
+            final_score = 0.0
         final_scores.append(final_score)
         
         title_color = "#ff5252" if final_score > 0 else "#00e676"
@@ -1879,6 +1882,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # ==========================================
         
         final_score = np.clip(score, -100, 100)
+        # [修正] 處理 NaN 值，確保可以安全轉換為 int
+        if np.isnan(final_score) or not np.isfinite(final_score):
+            final_score = 0.0
         final_scores.append(final_score)
         
         # 生成詳細說明
@@ -3303,6 +3309,9 @@ elif page == "🚀 科技股掃描":
 
                             # 限制分數範圍
                             final_score = max(min(final_score, 100), -100)
+                            # [修正] 處理 NaN 值，確保可以安全轉換為 int
+                            if np.isnan(final_score) or not np.isfinite(final_score):
+                                final_score = 0.0
                             
                             display_reason = base_log
                             if adjustment_log: display_reason += f" ➜ 修正: {','.join(adjustment_log)}"
@@ -3729,6 +3738,9 @@ elif page == "💼 持股健診與建議":
 
                 # 限制分數範圍
                 final_score = max(min(final_score, 100), -100)
+                # [修正] 處理 NaN 值，確保可以安全轉換為 int
+                if np.isnan(final_score) or not np.isfinite(final_score):
+                    final_score = 0.0
 
                 # 7. 產生 AI 建議
                 final_advice = ""
