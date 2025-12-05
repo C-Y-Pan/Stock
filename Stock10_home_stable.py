@@ -1732,6 +1732,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         score = 0  # 基礎評分（完全基於市場狀態）
         reasons = []
+        score_components = []  # [新增] 記錄每個細項的分數，用於驗證加總
         
         close = row['Close']
         if close == 0 or np.isnan(close):
@@ -1768,9 +1769,21 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 恐慌抄底時，豁免趨勢偏空的扣分（只不扣分，不加分）
         if is_panic_bottom and trend_score < 0:
-            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (原扣{trend_score:.0f}分)</span>")
+            # 實際影響：原本要扣 trend_score 分，現在不扣了
+            # 為了讓細項加總匹配，我們需要記錄這個調整
+            exemption_adjustment = abs(trend_score)  # 例如：原本要扣 -10，現在不扣了，調整為 +10
+            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (調整+{exemption_adjustment:.0f})</span>")
+            # 注意：trend_score 設為 0，但我們在顯示時會加上 exemption_adjustment 來匹配最終分數
             trend_score = 0  # 設為0，表示已豁免（不扣分也不加分）
+        else:
+            exemption_adjustment = 0
         
+        # [新增] 記錄趨勢分（包含豁免調整）
+        if exemption_adjustment > 0:
+            # 如果有豁免調整，記錄調整值（因為 trend_score 被設為 0，但實際影響是 +exemption_adjustment）
+            score_components.append(exemption_adjustment)
+        else:
+            score_components.append(trend_score)
         score += trend_score
         
         if abs(trend_score) > 5:
@@ -1779,6 +1792,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 均線排列加分/扣分
         alignment = ma_alignment_score(ma_dict)
         alignment_score = alignment * 15
+        score_components.append(alignment_score)
         score += alignment_score
         
         if abs(alignment_score) > 1:
@@ -1789,6 +1803,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # ==========================================
         
         rsi_score = rsi_continuous_score(rsi)
+        score_components.append(rsi_score)
         score += rsi_score
         
         if abs(rsi_score) > 1:
@@ -1799,6 +1814,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             rsi_momentum = rsi - prev_rsi
             momentum_score = smooth_sigmoid(rsi_momentum, inflection=0, steepness=0.5) * 5
             if abs(momentum_score) > 0.5:
+                score_components.append(momentum_score)
                 score += momentum_score
                 reasons.append(f"動能{'增強' if momentum_score > 0 else '減弱'} ({momentum_score:+.0f})")
         
@@ -1807,8 +1823,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # ==========================================
         
         vol_score = volume_momentum_score(vol, vol_ma, price_change)
+        score_components.append(vol_score)  # [修正] 無論大小都記錄，確保加總匹配
+        score += vol_score
         if abs(vol_score) > 1:
-            score += vol_score
             reasons.append(f"量價{'配合' if vol_score > 0 else '背離'} ({vol_score:+.0f})")
         
         # ==========================================
@@ -1821,12 +1838,14 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 1. 起漲點識別
         breakout_score = detect_breakout_signal(close, ma_dict, vol, vol_ma, price_change, momentum, momentum_accel, rsi, prev_rsi)
+        score_components.append(breakout_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += breakout_score
         if abs(breakout_score) > 1:
             reasons.append(f"起漲點信號 ({breakout_score:+.0f})")
         
         # 2. 賣點識別
         peak_penalty = detect_peak_signal(rsi, price_change, momentum, momentum_accel, price_position, vol, vol_ma)
+        score_components.append(peak_penalty)  # [修正] 無論大小都記錄，確保加總匹配
         score += peak_penalty
         if peak_penalty < -1:
             reasons.append(f"高點警示 ({peak_penalty:.0f})")
@@ -1839,6 +1858,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         is_holding = (action == 'Hold' or action == 'Sell')
         
         consolidation_score = detect_consolidation_signal(ma_dict, close, vol, vol_ma, volatility, price_change, is_holding)
+        score_components.append(consolidation_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += consolidation_score
         
         if abs(consolidation_score) > 1:
@@ -1849,6 +1869,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 4. 恐慌抄底識別
         panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum)
+        score_components.append(panic_bottom_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += panic_bottom_score
         if panic_bottom_score > 1:
             reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.0f})")
@@ -1865,13 +1886,54 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
         html_str += "<span style='color:#666; font-size:10px'>─── Full Analog Analysis ───</span><br>"
         
-        pos_reasons = [r for r in reasons if "(+" in r]
-        neg_reasons = [r for r in reasons if "(-" in r]
+        # [修正] 使用記錄的分數組件計算加總，確保與最終分數匹配
+        import re
+        pos_reasons = []
+        neg_reasons = []
+        neutral_reasons = []
+        calculated_sum = sum(score_components)  # 直接使用記錄的分數組件計算加總
         
+        # 分類顯示 reasons
+        for r in reasons:
+            # 提取分數標記
+            score_matches = re.findall(r'\(([+-]?\d+(?:\.\d+)?)\)', r)
+            
+            if score_matches:
+                try:
+                    score_val = float(score_matches[0])
+                    if score_val > 0:
+                        pos_reasons.append(r)
+                    elif score_val < 0:
+                        neg_reasons.append(r)
+                    else:
+                        neutral_reasons.append(r)
+                except ValueError:
+                    neutral_reasons.append(r)
+            else:
+                # 如果沒有分數標記，檢查是否包含正負號提示
+                if "(+" in r or "加分" in r or "增強" in r or "調整" in r:
+                    pos_reasons.append(r)
+                elif "(-" in r or "扣分" in r or "減弱" in r or "背離" in r:
+                    neg_reasons.append(r)
+                else:
+                    neutral_reasons.append(r)
+        
+        # 顯示所有細項
         if pos_reasons:
             html_str += f"<span style='color:#ff8a80'>{'<br>'.join(pos_reasons)}</span><br>"
         if neg_reasons:
-            html_str += f"<span style='color:#b9f6ca'>{'<br>'.join(neg_reasons)}</span>"
+            html_str += f"<span style='color:#b9f6ca'>{'<br>'.join(neg_reasons)}</span><br>"
+        if neutral_reasons:
+            html_str += f"<span style='color:#888'>{'<br>'.join(neutral_reasons)}</span><br>"
+        
+        # [新增] 顯示細項加總驗證（用於調試和驗證）
+        # 注意：由於可能有浮點數精度問題，允許小誤差（0.5分以內視為匹配）
+        if abs(calculated_sum - final_score) > 0.5:
+            # 如果加總不匹配，顯示警告
+            html_str += f"<br><span style='color:#ff9800; font-size:11px'>⚠ 細項加總: {calculated_sum:.1f} ≠ 最終分數: {final_score:.1f}</span>"
+        else:
+            # 如果匹配，顯示驗證通過（可選，用於確認）
+            html_str += f"<br><span style='color:#4caf50; font-size:10px'>✓ 細項加總驗證: {calculated_sum:.1f} = {final_score:.1f}</span>"
         
         score_details.append(html_str)
     
