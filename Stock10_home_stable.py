@@ -768,10 +768,18 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             if drawdown < stop_loss_limit:
                 is_sell = True
                 reason_str = f"觸發停損({stop_loss_limit*100:.0f}%)"
-            # Alpha Score < 0 則賣出
+            # [增強] Alpha Score < 0 或接近0且有獲利時賣出（更容易賣在山頂）
             elif current_alpha_score < 0:
                 is_sell = True
                 reason_str = f"Alpha賣出(分數:{current_alpha_score:.0f})"
+            # [新增] 獲利時，即使分數接近0也考慮賣出（避免抱過山頂）
+            elif current_alpha_score < 5 and drawdown > 0.05:  # 有獲利超過5%且分數很低
+                is_sell = True
+                reason_str = f"獲利了結(分數:{current_alpha_score:.0f}, 獲利:{drawdown*100:.1f}%)"
+            # [新增] 獲利超過15%且分數下降時賣出（鎖定獲利，避免回吐）
+            elif drawdown > 0.15 and current_alpha_score < 10:
+                is_sell = True
+                reason_str = f"鎖定獲利(分數:{current_alpha_score:.0f}, 獲利:{drawdown*100:.1f}%)"
             # 鎖倉觀察期（避免頻繁交易）
             elif days_held <= (2 if is_strict_bear else 3):
                 is_sell = False
@@ -1425,48 +1433,54 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     
     def detect_peak_signal(rsi, price_change, momentum, momentum_accel, price_position, vol, vol_ma):
         """
-        識別賣點信號 (賣在高點) - 完全 analog 化
+        識別賣點信號 (賣在高點) - 增強版，更容易識別山頂
         條件：
-        1. RSI 過熱（連續函數）
-        2. 動量衰竭（連續函數）
-        3. 價格位置過高（連續函數）
-        4. 量價背離（連續函數）
+        1. RSI 過熱（降低閾值，更敏感）
+        2. 動量衰竭（增強判斷）
+        3. 價格位置過高（降低閾值，更早識別）
+        4. 量價背離（增強判斷）
+        5. 漲幅過大但動能減弱（增強判斷）
+        6. [新增] 連續上漲後的疲態（新增）
         """
-        # 1. RSI 過熱（連續函數）
-        rsi_overheat = smooth_sigmoid((rsi - 60) / 20, inflection=0, steepness=3) * 25  # RSI > 60 開始扣分，70+ 大幅扣分
+        # 1. RSI 過熱（降低閾值，更敏感）- 從60降到55
+        rsi_overheat = smooth_sigmoid((rsi - 55) / 15, inflection=0, steepness=3) * 30  # RSI > 55 開始扣分，65+ 大幅扣分（增強）
         
-        # 2. 動量衰竭（連續函數）
+        # 2. 動量衰竭（增強判斷）
         # 動量為正但加速度為負 = 動能衰竭
         momentum_exhaustion = 0
         if momentum > 0 and momentum_accel < 0:
-            # 動量越大但加速度越負 = 衰竭越嚴重
+            # 動量越大但加速度越負 = 衰竭越嚴重（增強係數）
             exhaustion_ratio = -momentum_accel / (momentum + 0.001)  # 避免除零
-            momentum_exhaustion = smooth_sigmoid(exhaustion_ratio * 10, inflection=0, steepness=2) * 20
+            momentum_exhaustion = smooth_sigmoid(exhaustion_ratio * 15, inflection=0, steepness=2.5) * 25  # 增強扣分
         
-        # 3. 價格位置過高（連續函數）
-        # 價格在60日區間的高位（>80%）開始扣分
+        # 3. 價格位置過高（降低閾值，更早識別）- 從0.7降到0.65
         position_penalty = 0
-        if price_position > 0.7:
-            position_penalty = smooth_sigmoid((price_position - 0.7) * 10, inflection=0, steepness=3) * 15
+        if price_position > 0.65:  # 降低閾值，更早識別高位
+            position_penalty = smooth_sigmoid((price_position - 0.65) * 12, inflection=0, steepness=3.5) * 20  # 增強扣分
         
-        # 4. 量價背離（連續函數）
-        # 價格上漲但成交量萎縮 = 背離
+        # 4. 量價背離（增強判斷）- 降低成交量萎縮閾值
         divergence_penalty = 0
         if price_change > 0 and vol_ma > 0:
             vol_ratio = vol / vol_ma
-            if vol_ratio < 0.8:  # 成交量萎縮
-                divergence_ratio = (0.8 - vol_ratio) * price_change  # 漲越多但量越縮 = 背離越嚴重
-                divergence_penalty = smooth_sigmoid(divergence_ratio * 100, inflection=0, steepness=5) * 15
+            if vol_ratio < 0.9:  # 降低閾值，從0.8降到0.9，更敏感
+                divergence_ratio = (0.9 - vol_ratio) * price_change  # 漲越多但量越縮 = 背離越嚴重
+                divergence_penalty = smooth_sigmoid(divergence_ratio * 120, inflection=0, steepness=6) * 20  # 增強扣分
         
-        # 5. 漲幅過大但動能減弱（連續函數）
+        # 5. 漲幅過大但動能減弱（降低閾值，增強判斷）
         overbought_signal = 0
-        if price_change > 0.03:  # 單日漲超過3%
+        if price_change > 0.02:  # 降低閾值，從3%降到2%，更敏感
             if momentum_accel < 0:  # 動能減弱
                 overbought_ratio = price_change * (-momentum_accel)
-                overbought_signal = smooth_sigmoid(overbought_ratio * 100, inflection=0, steepness=3) * 10
+                overbought_signal = smooth_sigmoid(overbought_ratio * 120, inflection=0, steepness=4) * 15  # 增強扣分
         
-        # 綜合扣分
-        peak_penalty = -(rsi_overheat + momentum_exhaustion + position_penalty + divergence_penalty + overbought_signal)
+        # 6. [新增] 連續上漲後的疲態（新增判斷）
+        # 如果動量為正但很小，且加速度為負，表示上漲動能已經很弱
+        fatigue_signal = 0
+        if momentum > 0 and momentum < 0.02 and momentum_accel < -0.001:  # 動量很小但還在減弱
+            fatigue_signal = smooth_sigmoid(-momentum_accel * 200, inflection=0, steepness=3) * 12
+        
+        # 綜合扣分（增強總扣分力度）
+        peak_penalty = -(rsi_overheat + momentum_exhaustion + position_penalty + divergence_penalty + overbought_signal + fatigue_signal)
         return peak_penalty
     
     def detect_consolidation_signal(ma_dict, price, vol, vol_ma, volatility, price_change, is_holding=False):
@@ -1942,14 +1956,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         if neutral_reasons:
             html_str += f"<span style='color:#888'>{'<br>'.join(neutral_reasons)}</span><br>"
         
-        # [新增] 顯示細項加總驗證（使用顯示的細項加總，而不是所有組件）
-        # 注意：由於可能有浮點數精度問題，允許小誤差（0.1分以內視為匹配）
-        if abs(displayed_sum - final_score) > 0.1:
-            # 如果加總不匹配，顯示警告和詳細信息
-            html_str += f"<br><span style='color:#ff9800; font-size:11px'>⚠ 細項加總: {displayed_sum:.1f} ≠ 最終分數: {final_score:.1f}</span>"
-        else:
-            # 如果匹配，顯示驗證通過
-            html_str += f"<br><span style='color:#4caf50; font-size:10px'>✓ 細項加總驗證: {displayed_sum:.1f} = {final_score:.1f}</span>"
+        # [移除] 不再顯示細項加總驗證，保持界面簡潔
         
         score_details.append(html_str)
     
