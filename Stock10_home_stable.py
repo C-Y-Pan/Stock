@@ -1644,7 +1644,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         - ma_dict: {天數: 均線值} 字典
         - weights: 各均線權重 (可選)
         
-        返回: 連續評分 (-100 ~ +100)
+        返回: 連續評分 (-50 ~ +50)
         """
         if weights is None:
             # 預設權重：短期影響大，長期影響小
@@ -1680,9 +1680,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             total_score += normalized_score * w
             total_weight += w
         
-        # 歸一化並放大到 -100 ~ +100
+        # 歸一化並放大到 -50 ~ +50（降低影響力）
         if total_weight > 0:
-            return (total_score / total_weight) * 100
+            return (total_score / total_weight) * 50
         return 0
     
     def ma_alignment_score(ma_dict):
