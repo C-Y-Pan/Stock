@@ -1673,6 +1673,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 計算基礎恐慌分數（越恐慌，加分越多）
         base_panic_score = oversold_signal + deep_dip_signal + low_position_signal + rebound_signal + vol_signal + momentum_turn_signal
+        # [調高權重] 恐慌抄底加分整體上調 20%，讓訊號更有存在感
+        base_panic_score *= 1.2
+        ma240_slope_bonus *= 1.2  # 年線斜率加分也同步放大
         
         # 綜合加分：基礎恐慌分數 + 年線斜率加分（僅當年線斜率為正時）
         panic_bottom_score = base_panic_score + ma240_slope_bonus
