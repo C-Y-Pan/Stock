@@ -1429,6 +1429,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 綜合評分（加權平均）
         # 注意：起漲點信號應總是加分或至少不扣分
+        # [降低影響力] 降低起漲點信號的加分幅度，避免假的起漲點信號導致被騙進場
         raw_score = (
             breakthrough_signal * 0.25 +  # 突破均線
             vol_signal * 0.20 +            # 量能放大
@@ -1436,7 +1437,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             accel_signal * 0.15 +         # 動量加速
             rsi_turn_signal * 0.10 +      # RSI翻揚
             rsi_position_signal * 0.10    # RSI位置
-        ) * 40  # 最高 +40 分
+        ) * 20  # 降低從最高 +40 分到 +20 分
         
         # 確保起漲點信號不會扣分（至少為0）
         # 如果計算出來是負分，表示不是起漲點，設為0
@@ -1580,7 +1581,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         4. 恐慌性下跌後出現抵抗（連續函數）
         5. 成交量放大（有人接盤）（連續函數）
         6. 年線斜率：年線斜率为正且越大，恐慌抄底加分越多；年線斜率为负，恐慌抄底不加分
+        7. [新增] 年線下彎時，禁止出現恐慌抄底機會
         """
+        # [嚴格限制] 年線下彎時，禁止出現恐慌抄底機會
+        if ma240_slope < 0:
+            return 0
         # 1. RSI 超賣（連續函數）
         # RSI 越低分數越高（超賣反彈機會）- 越恐慌，加分越多
         oversold_signal = smooth_sigmoid((30 - rsi) / 20, inflection=0, steepness=2) * 30  # RSI < 30 開始大幅加分
