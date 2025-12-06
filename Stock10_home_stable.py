@@ -1312,17 +1312,16 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     # 0. 基礎數據準備 (計算多組均線作為參考基準)
     # ==========================================
     
-    # 短期均線群 (5-30日)
-    for period in [5, 10, 20, 30]:
-        df[f'MA{period}'] = df['Close'].rolling(period, min_periods=1).mean()
-    
-    # 中期均線群 (40-120日)
-    for period in [60, 90, 120]:
-        df[f'MA{period}'] = df['Close'].rolling(period, min_periods=1).mean()
-    
-    # 長期均線 (180-240日)
-    for period in [180, 240]:
+    # [新增] 使用費波納契數列的均線：MA2、MA3、MA5、MA8、MA13、MA21、MA34、MA55、MA89、MA144、MA233
+    # 費波納契數列：2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233
+    fibonacci_periods = [2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233]
+    for period in fibonacci_periods:
         df[f'MA{period}'] = df['Close'].rolling(period, min_periods=max(1, period//2)).mean()
+    
+    # 保留原有的常用均線（向後兼容）
+    for period in [5, 10, 20, 30, 60, 90, 120, 180, 240]:
+        if f'MA{period}' not in df.columns:
+            df[f'MA{period}'] = df['Close'].rolling(period, min_periods=1).mean()
     
     # RSI
     if 'RSI' not in df.columns:
@@ -1810,14 +1809,65 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # A. 基礎趨勢評分 (Adaptive MA Score)
         # ==========================================
         
+        # [新增] 使用費波納契數列的均線進行評估
+        # 費波納契數列：2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233
+        fibonacci_periods = [2, 3, 5, 8, 13, 21, 34, 55, 89, 144, 233]
         ma_dict = {}
-        for period in [5, 10, 20, 30, 60, 90, 120, 180, 240]:
+        for period in fibonacci_periods:
             col_name = f'MA{period}'
-            if col_name in df.columns:
+            if col_name in df.columns and not np.isnan(row[col_name]) and row[col_name] > 0:
                 ma_dict[period] = row[col_name]
         
-        # 核心評分：自適應均線分數
-        trend_score = adaptive_ma_score(close, ma_dict)
+        # 如果費波納契均線不足，補充常用均線（向後兼容）
+        if len(ma_dict) < 3:
+            for period in [5, 10, 20, 30, 60, 90, 120, 180, 240]:
+                col_name = f'MA{period}'
+                if col_name in df.columns and period not in ma_dict:
+                    if not np.isnan(row[col_name]) and row[col_name] > 0:
+                        ma_dict[period] = row[col_name]
+        
+        # [新增] 分別評估短期、中期、長期的多空頭狀態
+        # 短期：2, 3, 5, 8, 13, 21
+        # 中期：34, 55, 89
+        # 長期：144, 233
+        short_periods = [2, 3, 5, 8, 13, 21]
+        mid_periods = [34, 55, 89]
+        long_periods = [144, 233]
+        
+        def evaluate_trend_direction(periods, ma_dict, price):
+            """評估特定週期組的多空頭狀態，返回 -1 到 +1 之間的分數"""
+            if len(periods) == 0:
+                return 0
+            
+            valid_periods = [p for p in periods if p in ma_dict]
+            if len(valid_periods) == 0:
+                return 0
+            
+            # 計算價格相對於每條均線的乖離率
+            bias_scores = []
+            for period in valid_periods:
+                ma_value = ma_dict[period]
+                if ma_value > 0:
+                    bias = (price - ma_value) / ma_value
+                    bias_scores.append(bias)
+            
+            if len(bias_scores) == 0:
+                return 0
+            
+            # 計算平均乖離率，使用 sigmoid 函數平滑處理
+            avg_bias = np.mean(bias_scores)
+            # 使用 sigmoid 將乖離率映射到 -1 到 +1
+            trend_direction = smooth_sigmoid(avg_bias * 50, inflection=0, steepness=2)
+            return trend_direction
+        
+        # 評估短期、中期、長期的多空頭狀態
+        short_trend = evaluate_trend_direction(short_periods, ma_dict, close)
+        mid_trend = evaluate_trend_direction(mid_periods, ma_dict, close)
+        long_trend = evaluate_trend_direction(long_periods, ma_dict, close)
+        
+        # 根據短期、中期、長期的多空頭狀態進行加扣分
+        # 短期權重 0.4，中期權重 0.35，長期權重 0.25
+        trend_score = (short_trend * 0.4 + mid_trend * 0.35 + long_trend * 0.25) * 50  # 映射到 -50 ~ +50
         
         # 獲取用於恐慌抄底判斷的指標
         ma60 = row['MA60'] if 'MA60' in row and row['MA60'] > 0 else close
@@ -1836,7 +1886,19 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
         if abs(trend_score) > 0.1:  # 降低閾值，顯示更多細項
-            reasons.append(f"趨勢{'偏多' if trend_score > 0 else '偏空'} ({trend_score:+.1f})")
+            # [新增] 顯示短期、中期、長期的多空頭評估
+            trend_detail = []
+            if abs(short_trend) > 0.1:
+                trend_detail.append(f"短期{'多' if short_trend > 0 else '空'}({short_trend:+.2f})")
+            if abs(mid_trend) > 0.1:
+                trend_detail.append(f"中期{'多' if mid_trend > 0 else '空'}({mid_trend:+.2f})")
+            if abs(long_trend) > 0.1:
+                trend_detail.append(f"長期{'多' if long_trend > 0 else '空'}({long_trend:+.2f})")
+            
+            if trend_detail:
+                reasons.append(f"趨勢{'偏多' if trend_score > 0 else '偏空'} ({trend_score:+.1f}) [{', '.join(trend_detail)}]")
+            else:
+                reasons.append(f"趨勢{'偏多' if trend_score > 0 else '偏空'} ({trend_score:+.1f})")
         
         # 均線排列加分/扣分
         alignment = ma_alignment_score(ma_dict)
@@ -1988,10 +2050,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         market_strength = 0.0
         
         # 1. 趨勢強度（0-0.4）
+        # 趨勢評分範圍是 -50 ~ +50，所以除數調整為 25.0
         if trend_score > 0:
-            market_strength += min(trend_score / 30.0, 0.4)  # 趨勢分越高，市場越強
+            market_strength += min(trend_score / 25.0, 0.4)  # 趨勢分越高，市場越強
         else:
-            market_strength += max(trend_score / 30.0, -0.2)  # 趨勢分為負時，降低強度
+            market_strength += max(trend_score / 25.0, -0.2)  # 趨勢分為負時，降低強度
         
         # 2. RSI 強度（0-0.3）
         if rsi > 50:
@@ -2014,25 +2077,25 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 限制市場強度在合理範圍
         market_strength = np.clip(market_strength, -0.5, 1.0)
         
-        # 根據持倉狀態和市場強度計算 buffer 分數
+        # 根據持倉狀態和市場強度計算 buffer 分數（增加影響力，避免交易頻率太高）
         if is_holding:
             # 持有时：市場越強，信心加分越多（避免在強勢時輕易賣出）
             # 市場強度為正時給予加分，為負時給予扣分（但幅度較小）
-            holding_confidence = market_strength * 8.0  # 最大 ±8 分
+            holding_confidence = market_strength * 15.0  # 增加從最大 ±8 分到 ±15 分
             # 如果市場很弱（market_strength < -0.3），減少信心加分，甚至扣分
             if market_strength < -0.3:
-                holding_confidence = market_strength * 12.0  # 市場很弱時，扣分更多
+                holding_confidence = market_strength * 20.0  # 市場很弱時，扣分更多（從12增加到20）
         else:
             # 空手時：市場越弱，觀望扣分越多（避免在弱勢時輕易買入）
             # 市場強度為負時給予扣分，為正時給予加分（但幅度較小）
-            waiting_penalty = -market_strength * 6.0  # 最大 ±6 分
+            waiting_penalty = -market_strength * 12.0  # 增加從最大 ±6 分到 ±12 分
             # 如果市場很強（market_strength > 0.3），減少觀望扣分，甚至加分
             if market_strength > 0.3:
-                waiting_penalty = -market_strength * 4.0  # 市場很強時，扣分較少
+                waiting_penalty = -market_strength * 8.0  # 市場很強時，扣分較少（從4增加到8）
             holding_confidence = waiting_penalty
         
-        # 限制 buffer 分數範圍，避免過度影響
-        holding_confidence = np.clip(holding_confidence, -10.0, 10.0)
+        # 限制 buffer 分數範圍（提高上限，增加影響力）
+        holding_confidence = np.clip(holding_confidence, -20.0, 20.0)
         
         score_components.append(holding_confidence)
         score += holding_confidence
