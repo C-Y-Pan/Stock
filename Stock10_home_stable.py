@@ -1906,6 +1906,38 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             else:
                 reasons.append(f"趨勢{'偏多' if trend_score > 0 else '偏空'} ({trend_score:+.1f})")
         
+        # ==========================================
+        # A-2. 費波納契均線評分（新增）
+        # ==========================================
+        # 若股價低於費波納契均線則扣分，高於則加分
+        fibonacci_ma_score = 0
+        if len(ma_dict) > 0:
+            # 計算股價相對於所有費波納契均線的加權平均乖離率
+            total_weight = 0
+            weighted_bias = 0
+            
+            for period, ma_value in ma_dict.items():
+                if ma_value > 0:
+                    # 計算乖離率
+                    bias = (close - ma_value) / ma_value
+                    # 短期均線權重高，長期均線權重低
+                    weight = 1.0 / (period / 5)  # 5日均線權重=1, 20日均線權重=0.25
+                    weighted_bias += bias * weight
+                    total_weight += weight
+            
+            if total_weight > 0:
+                avg_bias = weighted_bias / total_weight
+                # 使用 sigmoid 函數平滑處理，股價高於均線加分，低於均線扣分
+                # 最多 ±20 分
+                fibonacci_ma_score = smooth_sigmoid(avg_bias * 50, inflection=0, steepness=2) * 20
+            
+            score_components.append(fibonacci_ma_score)
+            score += fibonacci_ma_score
+            
+            # 顯示費波納契均線評分
+            if abs(fibonacci_ma_score) > 0.5:
+                reasons.append(f"費波納契均線{'上方' if fibonacci_ma_score > 0 else '下方'} ({fibonacci_ma_score:+.1f})")
+        
         # 均線排列加分/扣分
         alignment = ma_alignment_score(ma_dict)
         alignment_score = alignment * 15
@@ -2015,8 +2047,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         score_components.append(panic_bottom_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += panic_bottom_score
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
-        # 年線下彎時 panic_bottom_score = 0，不會顯示（因為 abs(0) < 0.1）
-        if abs(panic_bottom_score) > 0.1:  # 降低閾值，顯示更多細項
+        # [嚴格限制] 年線下彎時，絕對不顯示任何恐慌抄底相關信息
+        if ma240_slope >= 0 and abs(panic_bottom_score) > 0.1:  # 只有年線不下彎且分數>0.1時才顯示
             reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
         
         # ==========================================
