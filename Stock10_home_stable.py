@@ -2185,24 +2185,18 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 限制市場強度在合理範圍
         market_strength = np.clip(market_strength, -0.5, 1.0)
         
-        # 根據持倉狀態和市場強度計算 buffer 分數（增加影響力，避免交易頻率太高）
+        # 根據持倉狀態和市場強度計算 buffer 分數（加號/減號固定）
         if is_holding:
-            # 持有时：市場越強，信心加分越多（避免在強勢時輕易賣出）
-            # 市場強度為正時給予加分，為負時給予扣分（但幅度較小）
-            holding_confidence = market_strength * 15.0  # 增加從最大 ±8 分到 ±15 分
-            # 如果市場很弱（market_strength < -0.3），減少信心加分，甚至扣分
-            if market_strength < -0.3:
-                holding_confidence = market_strength * 20.0  # 市場很弱時，扣分更多（從12增加到20）
+            # 持有信心：永遠為正，市場越強越高，市場弱時給最低正值
+            strength_scaled = market_strength + 0.5  # 移動到大於零的區間
+            holding_confidence = np.clip(strength_scaled * 15.0, 2.0, 20.0)
         else:
-            # 空手時：市場越弱，觀望扣分越多（避免在弱勢時輕易買入）
-            # 市場強度為負時給予扣分，為正時給予加分（但幅度較小）
-            waiting_penalty = -market_strength * 12.0  # 增加從最大 ±6 分到 ±12 分
-            # 如果市場很強（market_strength > 0.3），減少觀望扣分，甚至加分
-            if market_strength > 0.3:
-                waiting_penalty = -market_strength * 8.0  # 市場很強時，扣分較少（從4增加到8）
-            holding_confidence = waiting_penalty
+            # 觀望扣分：永遠為負，市場越弱扣越多，市場強時仍給少量負值
+            weakness = max(-market_strength, 0.0)
+            waiting_penalty = -(0.3 + weakness) * 12.0  # 基礎 -3.6 分，最弱約 -9.6 分
+            holding_confidence = max(waiting_penalty, -20.0)
         
-        # 限制 buffer 分數範圍（提高上限，增加影響力）
+        # 限制 buffer 分數範圍（保持符號不變）
         holding_confidence = np.clip(holding_confidence, -20.0, 20.0)
         
         score_components.append(holding_confidence)
