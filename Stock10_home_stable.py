@@ -1582,10 +1582,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         6. 年線斜率：年線斜率为正且越大，恐慌抄底加分越多；年線斜率为负，恐慌抄底不加分
         7. [新增] 年線下彎時，禁止出現恐慌抄底機會
         """
-        # [嚴格限制] 年線下彎時，嚴禁對恐慌抄底機會進行加分
-        # 年線斜率 < 0 表示年線下彎，此時無論其他條件如何，都不給予恐慌抄底加分
-        if ma240_slope < 0:
-            return 0  # 年線下彎，嚴禁加分
+        # [嚴格限制] 年線斜率必須 > 0.001 時才能恐慌抄底
+        # 年線斜率 <= 0.001 時（包括下彎和接近水平），嚴禁對恐慌抄底機會進行加分
+        if ma240_slope <= 0.001:
+            return 0  # 年線斜率不足，嚴禁加分
         # 1. RSI 超賣（連續函數）
         # RSI 越低分數越高（超賣反彈機會）- 越恐慌，加分越多
         oversold_signal = smooth_sigmoid((30 - rsi) / 20, inflection=0, steepness=2) * 30  # RSI < 30 開始大幅加分
@@ -2062,21 +2062,22 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             if not np.isnan(slope_value):
                 ma240_slope = float(slope_value)
         
-        # [嚴格限制] 年線下彎時（斜率 < 0），完全跳過恐慌抄底相關的所有計算
+        # [嚴格限制] 年線斜率必須 > 0.001 時才能恐慌抄底
+        # 年線斜率 <= 0.001 時（包括下彎和接近水平），完全跳過恐慌抄底相關的所有計算
         # 絕對不進行任何計算，也不顯示任何恐慌抄底相關信息
-        if ma240_slope < 0:
-            # 年線下彎，不計算恐慌抄底分數，也不顯示任何恐慌抄底相關信息
+        if ma240_slope <= 0.001:
+            # 年線斜率不足，不計算恐慌抄底分數，也不顯示任何恐慌抄底相關信息
             panic_bottom_score = 0
             # 為了保持 score_components 的一致性，添加 0（但不影響總分）
             score_components.append(panic_bottom_score)
             # 不加到 score（因為是0），也不顯示
             # 完全跳過恐慌抄底相關的所有操作
         else:
-            # 只有當年線不下彎時（斜率 >= 0），才進行恐慌抄底相關計算
+            # 只有當年線斜率 > 0.001 時，才進行恐慌抄底相關計算
             panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum, ma240_slope)
-            score_components.append(panic_bottom_score)  # 只有當年線不下彎時才記錄
-            score += panic_bottom_score  # 只有當年線不下彎時才加到總分
-            # 只有當年線不下彎且分數>0.1時才顯示
+            score_components.append(panic_bottom_score)  # 只有當年線斜率足夠時才記錄
+            score += panic_bottom_score  # 只有當年線斜率足夠時才加到總分
+            # 只有當年線斜率足夠且分數>0.1時才顯示
             if abs(panic_bottom_score) > 0.1:
                 reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f}, 年線斜率:{ma240_slope:+.4f})")
         
