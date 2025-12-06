@@ -1540,28 +1540,29 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             # 空手時，震盪洗盤應該觀望，給予扣分
             return -consolidation_intensity
     
-    def detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum):
+    def detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum, ma240_slope):
         """
         識別恐慌抄底信號 (恐慌時成功抄底) - 完全 analog 化
         條件：
-        1. RSI 極度超賣（連續函數）
-        2. 負乖離率大（連續函數）
-        3. 價格位置過低（連續函數）
+        1. RSI 極度超賣（連續函數）- 越恐慌，加分越多
+        2. 負乖離率大（連續函數）- 越恐慌，加分越多
+        3. 價格位置過低（連續函數）- 越恐慌，加分越多
         4. 恐慌性下跌後出現抵抗（連續函數）
         5. 成交量放大（有人接盤）（連續函數）
+        6. 年線斜率：年線斜率为正且越大，恐慌抄底加分越多；年線斜率为负，恐慌抄底不加分
         """
         # 1. RSI 超賣（連續函數）
-        # RSI 越低分數越高（超賣反彈機會）
+        # RSI 越低分數越高（超賣反彈機會）- 越恐慌，加分越多
         oversold_signal = smooth_sigmoid((30 - rsi) / 20, inflection=0, steepness=2) * 30  # RSI < 30 開始大幅加分
         
         # 2. 負乖離（深度下跌）（連續函數）
-        # 乖離率越負分數越高
+        # 乖離率越負分數越高 - 越恐慌，加分越多
         deep_dip_signal = 0
         if bias_60 < 0:
             deep_dip_signal = smooth_sigmoid(-bias_60 * 10, inflection=0, steepness=2) * 25  # 跌破越多分數越高
         
         # 3. 價格位置過低（連續函數）
-        # 價格在60日區間的低位（<20%）開始加分
+        # 價格在60日區間的低位（<20%）開始加分 - 越恐慌，加分越多
         low_position_signal = 0
         if price_position < 0.3:
             low_position_signal = smooth_sigmoid((0.3 - price_position) * 10, inflection=0, steepness=3) * 15
@@ -1586,8 +1587,21 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         if momentum > -0.02 and momentum < 0.02:  # 動量接近0（轉折點）
             momentum_turn_signal = smooth_sigmoid((0.02 - abs(momentum)) * 50, inflection=0, steepness=5) * 10
         
-        # 綜合加分
-        panic_bottom_score = oversold_signal + deep_dip_signal + low_position_signal + rebound_signal + vol_signal + momentum_turn_signal
+        # 7. 年線斜率調整（新增）
+        # 年線斜率为正且越大，恐慌抄底加分越多；年線斜率为负，恐慌抄底不加分
+        ma240_slope_bonus = 0
+        if ma240_slope > 0:
+            # 年線斜率為正，根據斜率大小給予加分（斜率越大，加分越多）
+            # 使用 sigmoid 函數平滑處理，避免過度加分
+            # 假設年線斜率通常在 -1 到 1 之間，我們將其映射到 0-20 分
+            ma240_slope_bonus = smooth_sigmoid(ma240_slope * 100, inflection=0, steepness=2) * 20
+        # 年線斜率為負時，不加分（ma240_slope_bonus 保持為 0）
+        
+        # 計算基礎恐慌分數（越恐慌，加分越多）
+        base_panic_score = oversold_signal + deep_dip_signal + low_position_signal + rebound_signal + vol_signal + momentum_turn_signal
+        
+        # 綜合加分：基礎恐慌分數 + 年線斜率加分（僅當年線斜率為正時）
+        panic_bottom_score = base_panic_score + ma240_slope_bonus
         return panic_bottom_score
     
     def adaptive_ma_score(price, ma_dict, weights=None):
@@ -1770,7 +1784,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 核心評分：自適應均線分數
         trend_score = adaptive_ma_score(close, ma_dict)
         
-        # 先計算恐慌抄底信號（用於判斷是否豁免趨勢偏空扣分）
+        # 獲取用於恐慌抄底判斷的指標
         ma60 = row['MA60'] if 'MA60' in row and row['MA60'] > 0 else close
         bias_60 = (close - ma60) / ma60
         rsi = row['RSI']
@@ -1781,25 +1795,9 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         momentum = row['Momentum'] if not np.isnan(row['Momentum']) else 0
         price_position = row['Price_Position'] if not np.isnan(row['Price_Position']) else 0.5
         
-        # 判斷是否為恐慌抄底（RSI < 30 或 深度下跌 + 超賣）
-        is_panic_bottom = (rsi < 30) or (bias_60 < -0.10 and rsi < 40)
-        
-        # 恐慌抄底時，豁免趨勢偏空的扣分（只不扣分，不加分）
-        if is_panic_bottom and trend_score < 0:
-            # 實際影響：原本要扣 trend_score 分，現在不扣了
-            # 為了讓細項加總匹配，我們需要記錄這個調整
-            exemption_adjustment = abs(trend_score)  # 例如：原本要扣 -10，現在不扣了，調整為 +10
-            reasons.append(f"<span style='color:#ffeb3b'>恐慌抄底豁免趨勢偏空 (調整+{exemption_adjustment:.1f})</span>")
-            # [修正] 將豁免調整加到 score 中，確保最終分數正確
-            # 原本要扣 trend_score（負數），現在不扣了，所以實際影響是 +abs(trend_score)
-            score_components.append(exemption_adjustment)  # 記錄調整值
-            score += exemption_adjustment  # [關鍵修正] 將豁免調整加到總分中
-            trend_score = 0  # 設為0，表示趨勢分本身為0（已豁免）
-        else:
-            exemption_adjustment = 0
-            # 正常情況：記錄趨勢分
-            score_components.append(trend_score)
-            score += trend_score
+        # 正常情況：記錄趨勢分（不再豁免趨勢偏空）
+        score_components.append(trend_score)
+        score += trend_score
         
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
         if abs(trend_score) > 0.1:  # 降低閾值，顯示更多細項
@@ -1891,7 +1889,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
                 reasons.append(f"震盪洗盤(空手扣分) ({consolidation_score:+.1f})")
         
         # 4. 恐慌抄底識別
-        panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum)
+        ma240_slope = row['MA240_Slope'] if 'MA240_Slope' in row and not np.isnan(row['MA240_Slope']) else 0
+        panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum, ma240_slope)
         score_components.append(panic_bottom_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += panic_bottom_score
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
