@@ -724,9 +724,9 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             # 使用空手狀態的 Alpha Score（用於進場判斷）
             current_alpha_score = alpha_scores_wait[i] if i < len(alpha_scores_wait) else 0
             
-            # [嚴格限制] Alpha Score 為負則嚴禁買入
-            # Alpha Score > 0 則買入（確保空手時才能買入）
-            if current_alpha_score > 0:
+            # [嚴格限制] Alpha Score < 10 則嚴禁買入
+            # Alpha Score >= 10 則買入（確保空手時才能買入）
+            if current_alpha_score >= 10:
                 # 判斷買入類型（用於後續出場邏輯）
                 if rsi[i] < 30 or (rsi[i] < rsi_buy_thresh and close[i] < bb_lower[i] and market_panic[i]):
                     trade_type = 2  # 恐慌抄底
@@ -746,13 +746,10 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
                 cum_div = 0.0
                 conf_score = min(abs(current_alpha_score), 99)
             else:
-                # 不買入：保持空手（Alpha Score 為負或為0時嚴禁買入）
+                # 不買入：保持空手（Alpha Score < 10 時嚴禁買入）
                 signal = 0
                 action_code = "Wait"
-                if current_alpha_score <= 0:
-                    reason_str = f"空手觀望(分數:{current_alpha_score:.0f}, Alpha為負嚴禁買入)"
-                else:
-                    reason_str = f"空手觀望(分數:{current_alpha_score:.0f})"
+                reason_str = f"空手觀望(分數:{current_alpha_score:.0f}, Alpha<10嚴禁買入)"
         
         # --- 出場邏輯：基於 Alpha Score + 停損保護（僅在持有時執行）---
         elif position == 1:
@@ -768,24 +765,24 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             is_sell = False
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
             
-            # [嚴格限制] Alpha Score 為正則嚴禁賣出
-            if current_alpha_score > 0:
-                # Alpha Score 為正，嚴禁賣出
+            # [嚴格限制] Alpha Score >= 10 則嚴禁賣出
+            if current_alpha_score >= 10:
+                # Alpha Score >= 10，嚴禁賣出
                 is_sell = False
-                reason_str = f"持有中(分數:{current_alpha_score:.0f}, Alpha為正嚴禁賣出)"
-            # 優先檢查停損（風險控制）- 僅在 Alpha Score <= 0 時執行
+                reason_str = f"持有中(分數:{current_alpha_score:.0f}, Alpha>=10嚴禁賣出)"
+            # 優先檢查停損（風險控制）- 僅在 Alpha Score < 10 時執行
             elif drawdown < stop_loss_limit:
                 is_sell = True
                 reason_str = f"觸發停損({stop_loss_limit*100:.0f}%)"
-            # [增強] Alpha Score < 0 或接近0且有獲利時賣出（更容易賣在山頂）
-            elif current_alpha_score < 0:
+            # [增強] Alpha Score <= -10 時賣出（更容易賣在山頂）
+            elif current_alpha_score <= -10:
                 is_sell = True
                 reason_str = f"Alpha賣出(分數:{current_alpha_score:.0f})"
-            # [新增] 獲利時，即使分數接近0也考慮賣出（避免抱過山頂）- 僅在 Alpha Score <= 0 時執行
+            # [新增] 獲利時，即使分數接近0也考慮賣出（避免抱過山頂）- 僅在 Alpha Score < 10 時執行
             elif current_alpha_score < 5 and drawdown > 0.05:  # 有獲利超過5%且分數很低
                 is_sell = True
                 reason_str = f"獲利了結(分數:{current_alpha_score:.0f}, 獲利:{drawdown*100:.1f}%)"
-            # [新增] 獲利超過15%且分數下降時賣出（鎖定獲利，避免回吐）- 僅在 Alpha Score <= 0 時執行
+            # [新增] 獲利超過15%且分數下降時賣出（鎖定獲利，避免回吐）- 僅在 Alpha Score < 10 時執行
             elif drawdown > 0.15 and current_alpha_score < 10:
                 is_sell = True
                 reason_str = f"鎖定獲利(分數:{current_alpha_score:.0f}, 獲利:{drawdown*100:.1f}%)"
