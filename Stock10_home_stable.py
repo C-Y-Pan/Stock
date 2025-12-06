@@ -1047,6 +1047,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     if 'Action' not in df.columns: df['Action'] = 'Hold'
     if 'Reason' not in df.columns: df['Reason'] = ''
+    # [新增] 停損基準線（SuperTrend）防呆
+    if 'SuperTrend' not in df.columns:
+        # 如果沒有 SuperTrend，使用 MA60 作為替代
+        df['SuperTrend'] = df['MA60'] if 'MA60' in df.columns else df['Close']
     
     # [新增] 計算年線斜率
     df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
@@ -1427,54 +1431,71 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     
     def detect_peak_signal(rsi, price_change, momentum, momentum_accel, price_position, vol, vol_ma):
         """
-        識別賣點信號 (賣在高點) - 增強版，更容易識別山頂
-        條件：
-        1. RSI 過熱（降低閾值，更敏感）
-        2. 動量衰竭（增強判斷）
-        3. 價格位置過高（降低閾值，更早識別）
-        4. 量價背離（增強判斷）
-        5. 漲幅過大但動能減弱（增強判斷）
-        6. [新增] 連續上漲後的疲態（新增）
+        識別賣點信號 (賣在高點) - 優化版，更準確識別真正的高點
+        優化策略：
+        1. 提高閾值，避免在非高點處觸發
+        2. 要求多個條件同時滿足才認為是高點
+        3. 增加價格反轉確認
         """
-        # 1. RSI 過熱（降低閾值，更敏感）- 從60降到55
-        rsi_overheat = smooth_sigmoid((rsi - 55) / 15, inflection=0, steepness=3) * 30  # RSI > 55 開始扣分，65+ 大幅扣分（增強）
-        
-        # 2. 動量衰竭（增強判斷）
-        # 動量為正但加速度為負 = 動能衰竭
+        # 初始化各項信號強度
+        rsi_overheat = 0
         momentum_exhaustion = 0
-        if momentum > 0 and momentum_accel < 0:
-            # 動量越大但加速度越負 = 衰竭越嚴重（增強係數）
-            exhaustion_ratio = -momentum_accel / (momentum + 0.001)  # 避免除零
-            momentum_exhaustion = smooth_sigmoid(exhaustion_ratio * 15, inflection=0, steepness=2.5) * 25  # 增強扣分
-        
-        # 3. 價格位置過高（降低閾值，更早識別）- 從0.7降到0.65
         position_penalty = 0
-        if price_position > 0.65:  # 降低閾值，更早識別高位
-            position_penalty = smooth_sigmoid((price_position - 0.65) * 12, inflection=0, steepness=3.5) * 20  # 增強扣分
-        
-        # 4. 量價背離（增強判斷）- 降低成交量萎縮閾值
         divergence_penalty = 0
-        if price_change > 0 and vol_ma > 0:
-            vol_ratio = vol / vol_ma
-            if vol_ratio < 0.9:  # 降低閾值，從0.8降到0.9，更敏感
-                divergence_ratio = (0.9 - vol_ratio) * price_change  # 漲越多但量越縮 = 背離越嚴重
-                divergence_penalty = smooth_sigmoid(divergence_ratio * 120, inflection=0, steepness=6) * 20  # 增強扣分
-        
-        # 5. 漲幅過大但動能減弱（降低閾值，增強判斷）
         overbought_signal = 0
-        if price_change > 0.02:  # 降低閾值，從3%降到2%，更敏感
-            if momentum_accel < 0:  # 動能減弱
-                overbought_ratio = price_change * (-momentum_accel)
-                overbought_signal = smooth_sigmoid(overbought_ratio * 120, inflection=0, steepness=4) * 15  # 增強扣分
+        reversal_signal = 0
         
-        # 6. [新增] 連續上漲後的疲態（新增判斷）
-        # 如果動量為正但很小，且加速度為負，表示上漲動能已經很弱
-        fatigue_signal = 0
-        if momentum > 0 and momentum < 0.02 and momentum_accel < -0.001:  # 動量很小但還在減弱
-            fatigue_signal = smooth_sigmoid(-momentum_accel * 200, inflection=0, steepness=3) * 12
+        # 1. RSI 過熱（提高閾值，更嚴格）- 從55提高到70
+        # 只有在 RSI 真正過熱時才扣分
+        if rsi > 70:  # 只有 RSI > 70 才認為是過熱
+            rsi_overheat = smooth_sigmoid((rsi - 70) / 10, inflection=0, steepness=3) * 25  # RSI > 70 開始扣分，80+ 大幅扣分
         
-        # 綜合扣分（增強總扣分力度）
-        peak_penalty = -(rsi_overheat + momentum_exhaustion + position_penalty + divergence_penalty + overbought_signal + fatigue_signal)
+        # 2. 動量衰竭（增強判斷，但要求更嚴格）
+        # 動量為正但加速度為負 = 動能衰竭，且需要動量足夠大才認為是衰竭
+        if momentum > 0.01 and momentum_accel < -0.002:  # 要求動量足夠大且加速度明顯為負
+            exhaustion_ratio = -momentum_accel / (momentum + 0.001)  # 避免除零
+            momentum_exhaustion = smooth_sigmoid(exhaustion_ratio * 15, inflection=0, steepness=2.5) * 20  # 降低最大扣分
+        
+        # 3. 價格位置過高（提高閾值，更嚴格）- 從0.65提高到0.80
+        # 只有在價格真正處於高位時才扣分
+        if price_position > 0.80:  # 提高閾值，只有價格在80%以上高位才扣分
+            position_penalty = smooth_sigmoid((price_position - 0.80) * 20, inflection=0, steepness=4) * 20
+        
+        # 4. 量價背離（更嚴格）- 要求明顯的背離
+        if price_change > 0.03 and vol_ma > 0:  # 要求漲幅超過3%且成交量明顯萎縮
+            vol_ratio = vol / vol_ma
+            if vol_ratio < 0.7:  # 提高閾值，要求成交量明顯萎縮（<70%）
+                divergence_ratio = (0.7 - vol_ratio) * price_change  # 漲越多但量越縮 = 背離越嚴重
+                divergence_penalty = smooth_sigmoid(divergence_ratio * 100, inflection=0, steepness=5) * 18
+        
+        # 5. 漲幅過大但動能減弱（更嚴格）
+        # 要求漲幅足夠大（>3%）且動能明顯減弱
+        if price_change > 0.03 and momentum_accel < -0.003:  # 提高閾值，要求更明顯的動能減弱
+            overbought_ratio = price_change * (-momentum_accel)
+            overbought_signal = smooth_sigmoid(overbought_ratio * 100, inflection=0, steepness=4) * 15
+        
+        # 6. [新增] 價格反轉確認（關鍵優化）
+        # 如果價格開始下跌（price_change < 0），且之前處於高位，這是反轉信號
+        if price_change < -0.01 and price_position > 0.75:  # 價格下跌超過1%且處於高位
+            reversal_signal = smooth_sigmoid(-price_change * 50, inflection=0, steepness=3) * 15
+        
+        # 綜合扣分（要求至少2個條件同時滿足才認為是高點）
+        total_signals = sum([
+            rsi_overheat > 5,
+            momentum_exhaustion > 5,
+            position_penalty > 5,
+            divergence_penalty > 5,
+            overbought_signal > 5,
+            reversal_signal > 5
+        ])
+        
+        # 只有當至少2個信號同時觸發時，才給予扣分
+        if total_signals >= 2:
+            peak_penalty = -(rsi_overheat + momentum_exhaustion + position_penalty + divergence_penalty + overbought_signal + reversal_signal)
+        else:
+            # 如果信號不足，只給予輕微扣分（最多-5分）
+            peak_penalty = -min((rsi_overheat + momentum_exhaustion + position_penalty + divergence_penalty + overbought_signal + reversal_signal) * 0.3, 5)
+        
         return peak_penalty
     
     def detect_consolidation_signal(ma_dict, price, vol, vol_ma, volatility, price_change, is_holding=False):
@@ -1838,6 +1859,22 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
         if abs(vol_score) > 0.1:  # 降低閾值，顯示更多細項
             reasons.append(f"量價{'配合' if vol_score > 0 else '背離'} ({vol_score:+.1f})")
+        
+        # ==========================================
+        # C-2. 停損基準線評分（新增）
+        # ==========================================
+        supertrend = row['SuperTrend'] if 'SuperTrend' in row and not np.isnan(row['SuperTrend']) and row['SuperTrend'] > 0 else close
+        if supertrend > 0:
+            # 計算股價相對於停損基準線的乖離率
+            supertrend_bias = (close - supertrend) / supertrend
+            # 股價高於停損基準線時加分，低於時扣分
+            # 使用 sigmoid 函數平滑處理，避免過度反應
+            supertrend_score = smooth_sigmoid(supertrend_bias * 50, inflection=0, steepness=2) * 20  # 最多 ±20 分
+            score_components.append(supertrend_score)
+            score += supertrend_score
+            # 顯示停損基準線評分
+            if abs(supertrend_score) > 0.5:
+                reasons.append(f"停損基準線{'上方' if supertrend_score > 0 else '下方'} (乖離{supertrend_bias*100:+.1f}%) ({supertrend_score:+.1f})")
         
         # ==========================================
         # D. 核心策略識別 (買在起漲點、賣在高點、洗盤不交易、恐慌抄底)
