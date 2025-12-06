@@ -1584,7 +1584,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         """
         # [嚴格限制] 年線斜率必須 > 0.0000 時才能恐慌抄底
         # 年線斜率 <= 0.0000 時（包括下彎和接近水平），嚴禁對恐慌抄底機會進行加分
-        if ma240_slope <= 0.0000:
+        if ma240_slope < 0.0000:
             return 0  # 年線斜率不足，嚴禁加分
         # 1. RSI 超賣（連續函數）
         # RSI 越低分數越高（超賣反彈機會）- 越恐慌，加分越多
@@ -4442,3 +4442,4 @@ elif page == "🧪 策略實驗室":
             }).applymap(color_alpha, subset=['Alpha']),
             width='stretch'
         )
+
