@@ -1053,13 +1053,27 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 如果沒有 SuperTrend，使用 MA60 作為替代
         df['SuperTrend'] = df['MA60'] if 'MA60' in df.columns else df['Close']
     
-    # [新增] 計算年線斜率（使用每日變化率的移動平均，更準確反映趨勢）
-    # 對於240日移動平均，計算每日變化率，然後取20天移動平均
-    # 這樣可以平滑短期波動，更準確反映年線的長期趨勢
-    # 公式：MA240每日變化率 = (MA240_today - MA240_yesterday) / MA240_yesterday
-    # 然後取20天移動平均作為斜率指標
-    ma240_daily_change = df['MA240'].pct_change().fillna(0)  # 每日變化率
-    df['MA240_Slope'] = ma240_daily_change.rolling(window=20, min_periods=10).mean().fillna(0)
+    # [新增] 計算年線斜率（使用滾動線性回歸，更準確反映長期趨勢）
+    # 以 MA240 為基礎，在最近 60 天做線性回歸斜率，並用起始值標準化為變化率
+    # 優點：較不受微小日內波動影響，能反映年線上揚或下彎的方向與幅度
+    def calc_ma240_slope(series):
+        # series 為窗口內的 MA240，含 NaN
+        s = series.dropna()
+        if len(s) < 30:  # 不足資料時回傳 0
+            return 0.0
+        y = s.values
+        x = np.arange(len(y), dtype=float)
+        # 計算集中化後的最小二乘斜率（避免數值飄移）
+        x_mean = x.mean()
+        y_mean = y.mean()
+        denom = np.sum((x - x_mean) ** 2)
+        if denom == 0:
+            return 0.0
+        slope = np.sum((x - x_mean) * (y - y_mean)) / denom  # 單位：每日 MA240 變化量
+        base = y[0] if abs(y[0]) > 1e-9 else y_mean if abs(y_mean) > 1e-9 else 1.0
+        return slope / base  # 標準化為「每日變化率」
+
+    df['MA240_Slope'] = df['MA240'].rolling(window=60, min_periods=30).apply(calc_ma240_slope, raw=False).fillna(0)
     
     # [新增] 計算均線糾結指數（如果沒有）
     if 'Congestion_Index' not in df.columns:
