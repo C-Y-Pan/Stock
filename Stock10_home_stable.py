@@ -1043,6 +1043,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     if 'RSI' not in df.columns: df['RSI'] = 50
     if 'MA20' not in df.columns: df['MA20'] = df['Close'].rolling(20).mean()
     if 'MA60' not in df.columns: df['MA60'] = df['Close'].rolling(60).mean()
+    if 'MA120' not in df.columns: df['MA120'] = df['Close'].rolling(120).mean()
     if 'MA240' not in df.columns: df['MA240'] = df['Close'].rolling(240).mean()
     if 'Vol_MA20' not in df.columns: df['Vol_MA20'] = df['Volume'].rolling(20).mean()
     if 'Action' not in df.columns: df['Action'] = 'Hold'
@@ -1054,6 +1055,20 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     
     # [新增] 計算年線斜率
     df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
+    
+    # [新增] 計算均線糾結指數（如果沒有）
+    if 'Congestion_Index' not in df.columns:
+        # 計算 MA60, MA120, MA240 的差距比例
+        if 'MA60' in df.columns and 'MA120' in df.columns and 'MA240' in df.columns:
+            ma_max = df[['MA60', 'MA120', 'MA240']].max(axis=1)
+            ma_min = df[['MA60', 'MA120', 'MA240']].min(axis=1)
+            # 瞬時差距比例
+            raw_gap_ratio = (ma_max - ma_min) / df['Close'].replace(0, 1)
+            # 60日平均差距（糾結指數）
+            df['Congestion_Index'] = raw_gap_ratio.rolling(60, min_periods=1).mean().fillna(1.0)
+        else:
+            # 如果沒有足夠的均線，使用預設值（表示不糾結）
+            df['Congestion_Index'] = 1.0
 
     # ==========================================
     # [新增] 定義 Analog 輔助函式
@@ -1927,6 +1942,35 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
         if abs(panic_bottom_score) > 0.1:  # 降低閾值，顯示更多細項
             reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
+        
+        # ==========================================
+        # D-2. 均線糾結指數評分（新增）
+        # ==========================================
+        # 均線糾結指數越低，空手觀望狀態扣分越多，持有狀態加分越多
+        # 目的是在均線糾結時，不輕易進行交易
+        congestion_index = row['Congestion_Index'] if 'Congestion_Index' in row and not np.isnan(row['Congestion_Index']) else 1.0
+        # 均線糾結指數通常在 0-1 之間，越低表示越糾結
+        # 使用 sigmoid 函數將糾結指數轉換為評分
+        # 糾結指數越低（越糾結），評分影響越大
+        # 當糾結指數 < 0.05 (5%) 時，認為是高度糾結
+        congestion_intensity = 1.0 - smooth_sigmoid(congestion_index * 20, inflection=0.5, steepness=3)  # 0-1之間，越低越糾結
+        
+        if is_holding:
+            # 持有狀態：均線糾結時加分（避免被洗出）
+            # 糾結指數越低，加分越多（最多+15分）
+            congestion_score = congestion_intensity * 15
+            score_components.append(congestion_score)
+            score += congestion_score
+            if abs(congestion_score) > 0.5:
+                reasons.append(f"均線糾結(持有加分, 指數:{congestion_index*100:.1f}%) ({congestion_score:+.1f})")
+        else:
+            # 空手狀態：均線糾結時扣分（避免輕易買入）
+            # 糾結指數越低，扣分越多（最多-15分）
+            congestion_score = -congestion_intensity * 15
+            score_components.append(congestion_score)
+            score += congestion_score
+            if abs(congestion_score) > 0.5:
+                reasons.append(f"均線糾結(空手扣分, 指數:{congestion_index*100:.1f}%) ({congestion_score:+.1f})")
         
         # ==========================================
         # E. [新增] 持有信心加分 / 觀望扣分 (避免高頻交易)
