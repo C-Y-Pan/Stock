@@ -1932,15 +1932,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
                 reasons.append(f"動能{'增強' if momentum_score > 0 else '減弱'} ({momentum_score:+.0f})")
         
         # ==========================================
-        # C. 量價配合度
+        # C. 量價配合度（已移除）
         # ==========================================
-        
-        vol_score = volume_momentum_score(vol, vol_ma, price_change)
-        score_components.append(vol_score)  # [修正] 無論大小都記錄，確保加總匹配
-        score += vol_score
-        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
-        if abs(vol_score) > 0.1:  # 降低閾值，顯示更多細項
-            reasons.append(f"量價{'配合' if vol_score > 0 else '背離'} ({vol_score:+.1f})")
+        # [移除] 不再考慮成交量的加扣分計算
+        vol_score = 0  # 設為0，不再影響評分
         
         # ==========================================
         # C-2. 停損基準線評分（新增）
@@ -2068,11 +2063,8 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         else:
             market_strength += max(momentum * 2.0, -0.1)  # 動能為負時扣分
         
-        # 4. 量價配合（0-0.1）
-        if vol_score > 0:
-            market_strength += min(vol_score / 15.0, 0.1)
-        else:
-            market_strength += max(vol_score / 15.0, -0.05)
+        # 4. 量價配合（已移除）
+        # [移除] 不再考慮成交量的加扣分計算
         
         # 限制市場強度在合理範圍
         market_strength = np.clip(market_strength, -0.5, 1.0)
