@@ -1976,20 +1976,40 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         vol_score = 0  # 設為0，不再影響評分
         
         # ==========================================
-        # C-2. 停損基準線評分（新增）
+        # C-2. 停損基準線評分（修改：只在穿越當天有效）
         # ==========================================
+        # 只在向上穿越或向下穿越停損基準線的當天才進行加扣分，其他日期則不透過停損基準線進行加扣分
+        supertrend_score = 0
         supertrend = row['SuperTrend'] if 'SuperTrend' in row and not np.isnan(row['SuperTrend']) and row['SuperTrend'] > 0 else close
-        if supertrend > 0:
-            # 計算股價相對於停損基準線的乖離率
-            supertrend_bias = (close - supertrend) / supertrend
-            # 股價高於停損基準線時加分，低於時扣分
-            # 使用 sigmoid 函數平滑處理，避免過度反應
-            supertrend_score = smooth_sigmoid(supertrend_bias * 50, inflection=0, steepness=2) * 20  # 最多 ±20 分
-            score_components.append(supertrend_score)
-            score += supertrend_score
-            # 顯示停損基準線評分
-            if abs(supertrend_score) > 0.5:
-                reasons.append(f"停損基準線{'上方' if supertrend_score > 0 else '下方'} (乖離{supertrend_bias*100:+.1f}%) ({supertrend_score:+.1f})")
+        
+        if supertrend > 0 and i > 0:
+            # 獲取前一日數據
+            prev_close = prev_row['Close'] if 'Close' in prev_row and not np.isnan(prev_row['Close']) else close
+            prev_supertrend = prev_row['SuperTrend'] if 'SuperTrend' in prev_row and not np.isnan(prev_row['SuperTrend']) and prev_row['SuperTrend'] > 0 else prev_close
+            
+            # 判斷是否發生穿越
+            # 向上穿越：前一日股價 <= 停損基準線，今日股價 > 停損基準線
+            # 向下穿越：前一日股價 >= 停損基準線，今日股價 < 停損基準線
+            is_cross_up = (prev_close <= prev_supertrend) and (close > supertrend)
+            is_cross_down = (prev_close >= prev_supertrend) and (close < supertrend)
+            
+            if is_cross_up:
+                # 向上穿越：加分
+                supertrend_bias = (close - supertrend) / supertrend
+                supertrend_score = smooth_sigmoid(supertrend_bias * 50, inflection=0, steepness=2) * 20  # 最多 +20 分
+                score_components.append(supertrend_score)
+                score += supertrend_score
+                if abs(supertrend_score) > 0.5:
+                    reasons.append(f"停損基準線向上穿越 (乖離{supertrend_bias*100:+.1f}%) ({supertrend_score:+.1f})")
+            elif is_cross_down:
+                # 向下穿越：扣分
+                supertrend_bias = (close - supertrend) / supertrend
+                supertrend_score = smooth_sigmoid(supertrend_bias * 50, inflection=0, steepness=2) * 20  # 最多 -20 分（負數）
+                score_components.append(supertrend_score)
+                score += supertrend_score
+                if abs(supertrend_score) > 0.5:
+                    reasons.append(f"停損基準線向下穿越 (乖離{supertrend_bias*100:+.1f}%) ({supertrend_score:+.1f})")
+            # 其他日期：不進行加扣分（supertrend_score = 0）
         
         # ==========================================
         # D. 核心策略識別 (買在起漲點、賣在高點、洗盤不交易、恐慌抄底)
@@ -2035,21 +2055,30 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
                 reasons.append(f"震盪洗盤(空手扣分) ({consolidation_score:+.1f})")
         
         # 4. 恐慌抄底識別
-        ma240_slope = row['MA240_Slope'] if 'MA240_Slope' in row and not np.isnan(row['MA240_Slope']) else 0
-        # [嚴格限制] 年線下彎時，完全跳過恐慌抄底相關的所有計算，不進行任何計算也不顯示任何信息
+        # [徹底檢查] 獲取年線斜率，確保正確處理 NaN 和邊界情況
+        ma240_slope = 0
+        if 'MA240_Slope' in row:
+            slope_value = row['MA240_Slope']
+            if not np.isnan(slope_value):
+                ma240_slope = float(slope_value)
+        
+        # [嚴格限制] 年線下彎時（斜率 < 0），完全跳過恐慌抄底相關的所有計算
+        # 絕對不進行任何計算，也不顯示任何恐慌抄底相關信息
         if ma240_slope < 0:
             # 年線下彎，不計算恐慌抄底分數，也不顯示任何恐慌抄底相關信息
             panic_bottom_score = 0
+            # 為了保持 score_components 的一致性，添加 0（但不影響總分）
+            score_components.append(panic_bottom_score)
+            # 不加到 score（因為是0），也不顯示
+            # 完全跳過恐慌抄底相關的所有操作
         else:
-            # 只有當年線不下彎時，才進行恐慌抄底相關計算
+            # 只有當年線不下彎時（斜率 >= 0），才進行恐慌抄底相關計算
             panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum, ma240_slope)
-        
-        score_components.append(panic_bottom_score)  # [修正] 無論大小都記錄，確保加總匹配
-        score += panic_bottom_score
-        # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
-        # [嚴格限制] 年線下彎時，絕對不顯示任何恐慌抄底相關信息
-        if ma240_slope >= 0 and abs(panic_bottom_score) > 0.1:  # 只有年線不下彎且分數>0.1時才顯示
-            reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
+            score_components.append(panic_bottom_score)  # 只有當年線不下彎時才記錄
+            score += panic_bottom_score  # 只有當年線不下彎時才加到總分
+            # 只有當年線不下彎且分數>0.1時才顯示
+            if abs(panic_bottom_score) > 0.1:
+                reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
         
         # ==========================================
         # D-2. 均線糾結指數評分（新增）
