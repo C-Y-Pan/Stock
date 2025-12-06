@@ -1342,6 +1342,26 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         if f'MA{period}' not in df.columns:
             df[f'MA{period}'] = df['Close'].rolling(period, min_periods=1).mean()
     
+    # 年線斜率：以 MA240 近 60 日做線性回歸並標準化為每日變化率
+    def calc_ma240_slope(series):
+        s = pd.Series(series).dropna()
+        if len(s) < 30:  # 資料不足時回傳 0，避免早期噪音
+            return 0.0
+        y = s.values.astype(float)
+        x = np.arange(len(y), dtype=float)
+        x_mean = x.mean()
+        y_mean = y.mean()
+        denom = np.sum((x - x_mean) ** 2)
+        if denom == 0:
+            return 0.0
+        slope = np.sum((x - x_mean) * (y - y_mean)) / denom  # 單位：每日 MA240 變化量
+        base = y[0] if abs(y[0]) > 1e-9 else y_mean if abs(y_mean) > 1e-9 else 1.0
+        return slope / base  # 標準化為「每日變化率」
+
+    df['MA240_Slope'] = df['MA240'].rolling(window=60, min_periods=30).apply(
+        calc_ma240_slope, raw=False
+    ).fillna(0)
+    
     # RSI
     if 'RSI' not in df.columns:
         delta = df['Close'].diff()
