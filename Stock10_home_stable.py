@@ -765,33 +765,21 @@ def run_simple_strategy(data, rsi_buy_thresh, fee_rate=0.001425, tax_rate=0.003,
             is_sell = False
             stop_loss_limit = -0.10 if is_strict_bear else -0.12
             
-            # [嚴格限制] Alpha Score >= 10 則嚴禁賣出
-            if current_alpha_score >= 10:
-                # Alpha Score >= 10，嚴禁賣出
-                is_sell = False
-                reason_str = f"持有中(分數:{current_alpha_score:.0f}, Alpha>=10嚴禁賣出)"
-            # 優先檢查停損（風險控制）- 僅在 Alpha Score < 10 時執行
-            elif drawdown < stop_loss_limit:
+            # 優先檢查停損（風險控制）- 停損優先於 Alpha Score 限制
+            if drawdown < stop_loss_limit:
                 is_sell = True
                 reason_str = f"觸發停損({stop_loss_limit*100:.0f}%)"
-            # [增強] Alpha Score <= -10 時賣出（更容易賣在山頂）
+            # [嚴格限制] Alpha Score > 0 則嚴禁賣出（除了停損）
+            elif current_alpha_score > 0:
+                # Alpha Score 為正，嚴禁賣出（停損除外）
+                is_sell = False
+                reason_str = f"持有中(分數:{current_alpha_score:.0f}, Alpha為正嚴禁賣出)"
+            # [嚴格限制] Alpha Score <= -10 時賣出（100%由Alpha Score決定）
             elif current_alpha_score <= -10:
                 is_sell = True
                 reason_str = f"Alpha賣出(分數:{current_alpha_score:.0f})"
-            # [新增] 獲利時，即使分數接近0也考慮賣出（避免抱過山頂）- 僅在 Alpha Score < 10 時執行
-            elif current_alpha_score < 5 and drawdown > 0.05:  # 有獲利超過5%且分數很低
-                is_sell = True
-                reason_str = f"獲利了結(分數:{current_alpha_score:.0f}, 獲利:{drawdown*100:.1f}%)"
-            # [新增] 獲利超過15%且分數下降時賣出（鎖定獲利，避免回吐）- 僅在 Alpha Score < 10 時執行
-            elif drawdown > 0.15 and current_alpha_score < 10:
-                is_sell = True
-                reason_str = f"鎖定獲利(分數:{current_alpha_score:.0f}, 獲利:{drawdown*100:.1f}%)"
-            # 鎖倉觀察期（避免頻繁交易）
-            elif days_held <= (2 if is_strict_bear else 3):
-                is_sell = False
-                reason_str = "鎖倉觀察"
             else:
-                # 持有中，繼續觀察
+                # 其他情況（-10 < Alpha Score <= 0）：持有中（100%由Alpha Score決定）
                 is_sell = False
                 reason_str = f"持有中(分數:{current_alpha_score:.0f})"
             
