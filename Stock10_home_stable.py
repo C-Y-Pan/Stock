@@ -1582,9 +1582,10 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         6. 年線斜率：年線斜率为正且越大，恐慌抄底加分越多；年線斜率为负，恐慌抄底不加分
         7. [新增] 年線下彎時，禁止出現恐慌抄底機會
         """
-        # [嚴格限制] 年線下彎時，禁止出現恐慌抄底機會
+        # [嚴格限制] 年線下彎時，嚴禁對恐慌抄底機會進行加分
+        # 年線斜率 < 0 表示年線下彎，此時無論其他條件如何，都不給予恐慌抄底加分
         if ma240_slope < 0:
-            return 0
+            return 0  # 年線下彎，嚴禁加分
         # 1. RSI 超賣（連續函數）
         # RSI 越低分數越高（超賣反彈機會）- 越恐慌，加分越多
         oversold_signal = smooth_sigmoid((30 - rsi) / 20, inflection=0, steepness=2) * 30  # RSI < 30 開始大幅加分
