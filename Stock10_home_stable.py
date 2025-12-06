@@ -2078,7 +2078,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
             score += panic_bottom_score  # 只有當年線不下彎時才加到總分
             # 只有當年線不下彎且分數>0.1時才顯示
             if abs(panic_bottom_score) > 0.1:
-                reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
+                reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f}, 年線斜率:{ma240_slope:+.4f})")
         
         # ==========================================
         # D-2. 均線糾結指數評分（新增）
