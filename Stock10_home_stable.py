@@ -2004,10 +2004,18 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         
         # 4. 恐慌抄底識別
         ma240_slope = row['MA240_Slope'] if 'MA240_Slope' in row and not np.isnan(row['MA240_Slope']) else 0
-        panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum, ma240_slope)
+        # [嚴格限制] 年線下彎時，完全跳過恐慌抄底相關的所有計算，不進行任何計算也不顯示任何信息
+        if ma240_slope < 0:
+            # 年線下彎，不計算恐慌抄底分數，也不顯示任何恐慌抄底相關信息
+            panic_bottom_score = 0
+        else:
+            # 只有當年線不下彎時，才進行恐慌抄底相關計算
+            panic_bottom_score = detect_panic_bottom_signal(rsi, price_change, bias_60, vol, vol_ma, price_position, momentum, ma240_slope)
+        
         score_components.append(panic_bottom_score)  # [修正] 無論大小都記錄，確保加總匹配
         score += panic_bottom_score
         # [修正] 無論大小都顯示，確保顯示的細項加總與最終分數匹配
+        # 年線下彎時 panic_bottom_score = 0，不會顯示（因為 abs(0) < 0.1）
         if abs(panic_bottom_score) > 0.1:  # 降低閾值，顯示更多細項
             reasons.append(f"恐慌抄底機會 ({panic_bottom_score:+.1f})")
         
