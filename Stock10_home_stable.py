@@ -1053,11 +1053,13 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 如果沒有 SuperTrend，使用 MA60 作為替代
         df['SuperTrend'] = df['MA60'] if 'MA60' in df.columns else df['Close']
     
-    # [新增] 計算年線斜率（使用變化率，而非絕對差值）
-    # 計算 MA240 的 5 日變化率（百分比），這樣才能正確反映年線的上揚或下彎
-    # 公式：(MA240_today - MA240_5days_ago) / MA240_5days_ago
-    ma240_5days_ago = df['MA240'].shift(5)
-    df['MA240_Slope'] = ((df['MA240'] - ma240_5days_ago) / ma240_5days_ago.replace(0, 1)).fillna(0)
+    # [新增] 計算年線斜率（使用每日變化率的移動平均，更準確反映趨勢）
+    # 對於240日移動平均，計算每日變化率，然後取20天移動平均
+    # 這樣可以平滑短期波動，更準確反映年線的長期趨勢
+    # 公式：MA240每日變化率 = (MA240_today - MA240_yesterday) / MA240_yesterday
+    # 然後取20天移動平均作為斜率指標
+    ma240_daily_change = df['MA240'].pct_change().fillna(0)  # 每日變化率
+    df['MA240_Slope'] = ma240_daily_change.rolling(window=20, min_periods=10).mean().fillna(0)
     
     # [新增] 計算均線糾結指數（如果沒有）
     if 'Congestion_Index' not in df.columns:
