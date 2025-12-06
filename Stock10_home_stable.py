@@ -1737,23 +1737,28 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
     
     def rsi_continuous_score(rsi_value):
         """
-        RSI 連續評分 (完全拋棄分段邏輯)
-        使用雙峰分佈：30 和 70 是兩個「最佳區域」
+        RSI 評分 (僅在極端情況下進行加扣分)
+        若非極端情況，避免進行RSI加扣分
         """
         # 設計理念：
-        # RSI = 30 附近 (超賣反彈) -> 高分
-        # RSI = 50-65 (健康多頭) -> 高分
-        # RSI = 70+ (過熱) -> 扣分
-        # RSI = 30- (恐慌) -> 視情況給分
+        # 只在極端情況下進行加扣分：
+        # - RSI < 20：極度超賣，可以加分
+        # - RSI > 80：極度超買，可以扣分
+        # - 20 <= RSI <= 80：正常範圍，不加扣分
         
-        if rsi_value >= 50:
-            # 多頭區：50-70 給高分，70+ 開始扣分
-            normalized = (rsi_value - 50) / 50  # 映射到 0-1
-            score = 10 * smooth_sigmoid(normalized, inflection=0.4, steepness=-8)  # 70 以上開始下降
+        if rsi_value > 80:
+            # 極度超買區：RSI > 80 開始扣分
+            # 使用 sigmoid 函數，RSI 越高扣分越多（最多 -15 分）
+            normalized = (rsi_value - 80) / 20  # 映射到 0-1（RSI 80-100）
+            score = -15 * smooth_sigmoid(normalized, inflection=0, steepness=3)  # RSI 越高扣分越多
+        elif rsi_value < 20:
+            # 極度超賣區：RSI < 20 開始加分
+            # 使用 sigmoid 函數，RSI 越低加分越多（最多 +15 分）
+            normalized = (20 - rsi_value) / 20  # 映射到 0-1（RSI 0-20）
+            score = 15 * smooth_sigmoid(normalized, inflection=0, steepness=3)  # RSI 越低加分越多
         else:
-            # 弱勢區：30 以下給「抄底分」，30-50 逐漸扣分
-            normalized = (rsi_value - 30) / 20  # 映射到 -1 ~ 0
-            score = 10 * smooth_sigmoid(normalized, inflection=0, steepness=5)
+            # 正常範圍：20 <= RSI <= 80，不加扣分
+            score = 0
         
         return score
     
