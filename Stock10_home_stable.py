@@ -2191,6 +2191,15 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         html_str = f"<b>Alpha Score: <span style='color:{title_color}; font-size:18px'>{int(final_score)}</span></b><br>"
         html_str += "<span style='color:#666; font-size:10px'>─── Full Analog Analysis ───</span><br>"
         
+        # [新增] 顯示年線斜率*100的值
+        ma240_slope_display = 0
+        if 'MA240_Slope' in row:
+            slope_value = row['MA240_Slope']
+            if not np.isnan(slope_value):
+                ma240_slope_display = float(slope_value) * 100  # 乘以100以顯示百分比
+        slope_color = "#ff5252" if ma240_slope_display > 0.1 else "#00e676" if ma240_slope_display < -0.1 else "#888"
+        html_str += f"<span style='color:{slope_color}; font-size:11px'>年線斜率: {ma240_slope_display:+.2f}%</span><br>"
+        
         # [修正] 從顯示的 reasons 中提取分數並計算加總，確保顯示的細項加總與最終分數匹配
         import re
         pos_reasons = []
