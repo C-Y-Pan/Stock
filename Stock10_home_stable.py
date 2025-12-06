@@ -1053,8 +1053,11 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         # 如果沒有 SuperTrend，使用 MA60 作為替代
         df['SuperTrend'] = df['MA60'] if 'MA60' in df.columns else df['Close']
     
-    # [新增] 計算年線斜率
-    df['MA240_Slope'] = df['MA240'].diff(5).fillna(0)
+    # [新增] 計算年線斜率（使用變化率，而非絕對差值）
+    # 計算 MA240 的 5 日變化率（百分比），這樣才能正確反映年線的上揚或下彎
+    # 公式：(MA240_today - MA240_5days_ago) / MA240_5days_ago
+    ma240_5days_ago = df['MA240'].shift(5)
+    df['MA240_Slope'] = ((df['MA240'] - ma240_5days_ago) / ma240_5days_ago.replace(0, 1)).fillna(0)
     
     # [新增] 計算均線糾結指數（如果沒有）
     if 'Congestion_Index' not in df.columns:
@@ -1584,7 +1587,7 @@ def calculate_alpha_score(df, margin_df=None, short_df=None):
         """
         # [嚴格限制] 年線斜率必須 > 0.0000 時才能恐慌抄底
         # 年線斜率 <= 0.0000 時（包括下彎和接近水平），嚴禁對恐慌抄底機會進行加分
-        if ma240_slope < 0.0000:
+        if ma240_slope <= 0.0000:
             return 0  # 年線斜率不足，嚴禁加分
         # 1. RSI 超賣（連續函數）
         # RSI 越低分數越高（超賣反彈機會）- 越恐慌，加分越多
@@ -4442,4 +4445,3 @@ elif page == "🧪 策略實驗室":
             }).applymap(color_alpha, subset=['Alpha']),
             width='stretch'
         )
-
